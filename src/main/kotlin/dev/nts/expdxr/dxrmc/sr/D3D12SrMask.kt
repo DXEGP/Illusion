@@ -215,7 +215,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
             if (!announced) {
                 announced = true
                 Illusion.LOGGER.info(
-                    "SR mask wavelet reconstruction: {} coefficient attachment(s), {} coefficients, rank {}",
+                    "SR mask wavelet: {} attachments, {} coefficients, rank {}",
                     attachments, COEFF_COUNT, WAVELET_RANK)
             }
         }
@@ -255,7 +255,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         val mean = sum / pixels.size
         val percent = 100.0 * nonZero / pixels.size
         Illusion.LOGGER.info(
-            "SR mask first frame: mean={} peak={} non-zero={}% of {} pixels ({} attachments, scale {})",
+            "SR mask: mean={} peak={} nonzero={}% {}px {}att scale={}",
             fmt(mean), peak, fmt(percent), pixels.size, attachments, MAX_MASK)
     }
 
@@ -267,6 +267,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     fun release() {
+        // compute 管线是原生 Dx12Object*，只能按资源释放；D3D12DestroyPipeline 会按 Dx12Pipeline 析构。
+        if (pipeline != 0L) {
+            MCDR_ABI.ID3D12DestroyResource(pipeline)
+            pipeline = 0L
+        }
         texture?.close()
         texture = null
         width = 0

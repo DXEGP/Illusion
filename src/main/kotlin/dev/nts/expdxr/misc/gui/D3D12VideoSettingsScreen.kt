@@ -215,7 +215,10 @@ class D3D12VideoSettingsScreen @JvmOverloads constructor(
         }
 
         val top = rowsTop()
-        maxScroll = (y - top - (contentBottom - top)).coerceAtLeast(0)
+        // 页签上方那几行固定行太高时，滚动区的视口会被压到 0 甚至负数：夹到 0，
+        // 否则 maxScroll 会凭空变大、且滚轮的区域判据（contentBottom > top）永远不成立。
+        val viewport = (contentBottom - top).coerceAtLeast(0)
+        maxScroll = (y - top - viewport).coerceAtLeast(0)
         scroll = scroll.coerceIn(0.0, maxScroll.toDouble())
         applyScroll()
         layoutScrollBar()
@@ -239,6 +242,16 @@ class D3D12VideoSettingsScreen @JvmOverloads constructor(
                     optionRows += entry.option to row
                     row
                 }
+
+                // 打开子界面的一整行按钮：动作拿到当前屏，才能把它自己当父级传下去。
+                is D3D12VideoSettingsEntry.Action -> D3D12ButtonWidget(
+                    contentLeft,
+                    y,
+                    contentWidth,
+                    D3D12Widget.DEFAULT_HEIGHT,
+                    { entry.label },
+                    { true },
+                ) { entry.onClick(this) }
             }
 
             target += widget to y

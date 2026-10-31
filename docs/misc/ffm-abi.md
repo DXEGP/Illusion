@@ -61,7 +61,7 @@ MCDR_MeshPipelineDesc.kt
 - **调用约定是 `__cdecl`**。`MCDR_CALL` 在 Windows 上展开成 `__cdecl`；`MCDR_API` 在 native 编译时是 `__declspec(dllexport)`，在消费方是 `dllimport`。x64 上只有一种调用约定，但这个宏让头文件在 32 位下也不会错。
 - **MSVC 的 `long` 是 32 位**。头文件为此专门写了一条注释：凡是写成 `int32_t` 的参数，Java 侧必须是 `JAVA_INT`；只有 `int64_t` / `size_t` / 指针才是 `JAVA_LONG` / `JAVA_ADDRESS`。这一条是 §5 里"类型不逐字匹配"坑的根源。
 
-版本号是双份的：宏 `MCDR_ABI_VERSION 4u`，以及运行时函数 `mcdrABIVersion()`。两者相等才算握手成功，防止"Java 常量被编译器内联、DLL 却是旧的"。
+版本号是双份的：宏 `MCDR_ABI_VERSION`（当前 `10u`），以及运行时函数 `mcdrABIVersion()`。两者相等才算握手成功，防止"Java 常量被编译器内联、DLL 却是旧的"。
 
 ### 1.2 布局层：`MCDR_Layout.kt`
 

@@ -8,6 +8,7 @@ import dev.nts.expdxr.d3d12.render.advanced.vrs.D3D12RenderScale
 import dev.nts.expdxr.d3d12.render.advanced.vrs.D3D12VariableShadingRate
 import dev.nts.expdxr.dxrmc.framegen.FrameGeneration
 import dev.nts.expdxr.dxrmc.nvidia.reflex.NvidiaReflex
+import dev.nts.expdxr.dxrmc.rt.D3D12ShaderPacks
 import dev.nts.expdxr.dxrmc.sr.SuperResolution
 import dev.nts.expdxr.dxrmc.sr.dlss.DeepLearningSuperSampling
 import dev.nts.expdxr.misc.settings.D3D12HdrPresentation
@@ -15,6 +16,7 @@ import dev.nts.expdxr.mixin.options.VideoSettingsScreenOptionsAccessor
 import net.minecraft.client.Minecraft
 import net.minecraft.client.OptionInstance
 import net.minecraft.client.Options
+import net.minecraft.client.gui.screens.Screen
 import net.minecraft.network.chat.Component
 import java.util.Optional
 import java.util.concurrent.CopyOnWriteArrayList
@@ -40,6 +42,9 @@ sealed interface D3D12VideoSettingsEntry {
     class Note(val text: Component, val warning: Boolean = false) : D3D12VideoSettingsEntry
 
     class Setting(val option: OptionInstance<*>) : D3D12VideoSettingsEntry
+
+    /** 整行按钮：点开一个子界面（参数是当前屏，子界面把它当父级）。 */
+    class Action(val label: Component, val onClick: (Screen) -> Unit) : D3D12VideoSettingsEntry
 }
 
 /**
@@ -57,6 +62,7 @@ open class D3D12VideoSettingsContent {
         pages += qualityPage()
         pages += preferencesPage()
         pages += illusionPage()
+        pages += shaderPackPage()
         for (provider in providers) {
             pages += provider.pages()
         }
@@ -171,6 +177,37 @@ open class D3D12VideoSettingsContent {
                 D3D12VideoSettingsEntry.Setting(SuperResolution.sharpnessOption()),
                 D3D12VideoSettingsEntry.Note(translatable("dxr_mc.video.sr.framegen_absent")),
                 D3D12VideoSettingsEntry.Note(translatable("dxr_mc.video.sr.latency_absent")),
+            ),
+        )
+    }
+
+    /** 光影包页：一行说明当前用的是哪个包、一个入口打开 Iris 那套包列表、一个入口打开包目录。
+     *  列表界面本身是独立屏（[D3D12ShaderPackScreen]），这里只放跳转与状态，不把包行塞进别的页。 */
+    protected open fun shaderPackPage(): D3D12VideoSettingsPage {
+        val configured = D3D12ShaderPacks.selected()
+        val current = if (configured == D3D12ShaderPacks.NONE) {
+            translatable("dxr_mc.shaderpack.none")
+        } else {
+            Component.literal(D3D12ShaderPacks.activeName())
+        }
+
+        return D3D12VideoSettingsPage(
+            translatable("dxr_mc.video.tab.shaderpack"),
+            listOf(
+                D3D12VideoSettingsEntry.Heading(translatable("dxr_mc.video.group.shaderpack")),
+                D3D12VideoSettingsEntry.Note(Component.translatable("dxr_mc.video.shaderpack.current", current)),
+                D3D12VideoSettingsEntry.Action(translatable("dxr_mc.video.shaderpack.open")) { screen ->
+                    screen.minecraft.setScreenAndShow(D3D12ShaderPackScreen(screen))
+                },
+                // 光追那一组开关属于包：入口在这里，内容由包的 configs.json 决定。
+                D3D12VideoSettingsEntry.Action(translatable("dxr_mc.video.shaderpack.config")) { screen ->
+                    screen.minecraft.setScreenAndShow(D3D12ShaderPackConfigScreen(screen))
+                },
+                D3D12VideoSettingsEntry.Action(translatable("dxr_mc.video.shaderpack.folder")) {
+                    D3D12ShaderPacks.openDirectory()
+                },
+                D3D12VideoSettingsEntry.Heading(Component.empty()),
+                D3D12VideoSettingsEntry.Note(translatable("dxr_mc.video.shaderpack.hint")),
             ),
         )
     }
@@ -372,3 +409,6 @@ open class D3D12VideoSettingsContent {
         private fun translatable(key: String): Component = Component.translatable(key)
     }
 }
+
+
+

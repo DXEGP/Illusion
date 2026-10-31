@@ -374,7 +374,7 @@ object D3D12ShadingRateImage {
             return false
         }
         pipeline = pso
-        LOGGER.info("SRI: compute pipeline ready ({} bytes of DXIL)", dxil.size)
+        LOGGER.info("SRI: compute pipeline ready ({} B DXIL)", dxil.size)
         return true
     }
 

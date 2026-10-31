@@ -145,17 +145,19 @@ object IllusionLogger {
             Configurator.setLevel(name, effective.toLog4j())
         }
         val nativeLevel = if (ENV_VERBOSE || nativeVerbose) NATIVE_DEBUG else effective.nativeLevel
-        pushNative(nativeLevel, shutdownTrace, nativeLogFile)
+        val mirrored = pushNative(nativeLevel, shutdownTrace, nativeLogFile)
         // 打 INFO：默认运行保持安静，verbose 运行才看得出级别来自配置还是残留环境变量。
-        val source = if (ENV_VERBOSE) "D3D12_LOG_VERBOSE" else "config/dxr_mc-client.toml"
-        val banner = "log level = $effective (native $nativeLevel, source: $source)"
+        val source = if (ENV_VERBOSE) "env" else "config"
+        val banner = "log level = $effective (native $nativeLevel, from $source" +
+            (mirrored?.let { ", file $it" } ?: "") + ")"
         if (banner != lastBanner) {
             lastBanner = banner
             LOGGER.info(banner)
         }
     }
 
-    private fun pushNative(level: Int, shutdownTrace: Boolean, nativeLogFile: String) {
+    /** 把级别与日志文件推给 native。@return 已镜像到的文件（没镜像返回 null）。 */
+    private fun pushNative(level: Int, shutdownTrace: Boolean, nativeLogFile: String): String? {
         try {
             // 首次调用在这里 LoadLibrary 是安全的：isAvailable() 报缺失而不抛，且 native 要在建设备前拿到级别。
             if (MCDR_ABI.isAvailable()) {
@@ -164,15 +166,16 @@ object IllusionLogger {
                 MCDR_ABI.D3D12SetShutdownTraceAlways(shutdownTrace)
                 // 旧 DLL 没有这个导出时返回 false，只走 stderr。
                 if (nativeLogFile.isNotBlank() && MCDR_ABI.D3D12SetLogFile(nativeLogFile)) {
-                    LOGGER.info("native log mirrored to {}", nativeLogFile)
+                    return nativeLogFile
                 }
             }
         } catch (t: Throwable) {
             LOGGER.warn(
-                "could not push the native log settings (level {}, shutdownTrace {}, file {})",
+                "native log settings not pushed (level {}, trace {}, file {})",
                 level, shutdownTrace, nativeLogFile, t,
             )
         }
+        return null
     }
 
     const val i18n_LOG_KEY = "dxr_mc.configuration.logging"

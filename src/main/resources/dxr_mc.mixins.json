@@ -28,6 +28,7 @@
     "render.GameRendererSmaaWorldMixin",
     "render.DebugCrosshairRendererMixin",
     "render.LevelRendererMainPassDepthMixin",
+    "render.LevelRendererRtDebugViewMixin",
     "render.ChunkSectionsToRenderSamplerMixin",
     "render.GuiRendererTargetMixin",
     "render.CubeMapTargetMixin",

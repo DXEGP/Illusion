@@ -32,7 +32,7 @@ object D3D12GraphicsApi {
     @JvmStatic
     fun logInstalled(stateCount: Int) {
         LOGGER.info(
-            "graphics API \"{}\" appended; the cycle button now has {} states",
+            "graphics API {} appended, {} states",
             SERIALIZED_NAME,
             stateCount
         )

@@ -73,10 +73,10 @@ object D3D12VariableShadingRate {
             1 -> {
                 nativeRefused = false
                 if (settings == D3D12VRSSettings.OFF) {
-                    Illusion.LOGGER.info("[${Illusion.MODID}] VRS off; the device keeps its default 1X1.")
+                    Illusion.LOGGER.info("VRS off; device keeps default 1X1")
                 } else {
                     Illusion.LOGGER.info(
-                        "[${Illusion.MODID}] VRS auto: terrain ceiling ${rateName(MAX_TERRAIN_RATE)} (0x${MAX_TERRAIN_RATE.toString(16)}).",
+                        "VRS auto terrain ${rateName(MAX_TERRAIN_RATE)} 0x${MAX_TERRAIN_RATE.toString(16)}",
                     )
                 }
             }
@@ -84,21 +84,19 @@ object D3D12VariableShadingRate {
             0 -> {
                 nativeRefused = true
                 Illusion.LOGGER.warn(
-                    "[${Illusion.MODID}] VRS auto refused by the native layer: this device cannot honour " +
-                        "1X1..${rateName(MAX_TERRAIN_RATE)} (see the [MCDR] WARN for the reason); staying at 1X1.",
+                    "VRS auto refused: no ${rateName(MAX_TERRAIN_RATE)}; at 1X1",
                 )
             }
             Int.MIN_VALUE -> {
                 nativeRefused = true
                 Illusion.LOGGER.info(
-                    "[${Illusion.MODID}] VRS unavailable: the loaded MCDR.dll has no mcdrSetShadingRate.",
+                    "VRS unavailable: MCDR.dll lacks mcdrSetShadingRate",
                 )
             }
             else -> {
                 nativeRefused = true
                 Illusion.LOGGER.error(
-                    "[${Illusion.MODID}] VRS rejected by the native layer (status $status); " +
-                        "see the [MCDR] ERROR line for what this device accepts.",
+                    "VRS rejected, status $status",
                 )
             }
         }
@@ -249,11 +247,11 @@ object D3D12VariableShadingRate {
 
     fun pushCombiners() {
         when (val status = MCDR_ABI.D3D12SetShadingRateCombiners(COMBINER_MIN, COMBINER_PASSTHROUGH)) {
-            1 -> Illusion.LOGGER.info("[${Illusion.MODID}] VRS combiners = MIN / PASSTHROUGH.")
+            1 -> Illusion.LOGGER.info("VRS combiners = MIN / PASSTHROUGH")
             Int.MIN_VALUE -> Illusion.LOGGER.info(
-                "[${Illusion.MODID}] VRS combiners unavailable: the loaded MCDR.dll has no mcdr_dx12SetShadingRateCombiners.",
+                "VRS combiners: no mcdr_dx12SetShadingRateCombiners",
             )
-            else -> Illusion.LOGGER.warn("[${Illusion.MODID}] VRS combiners rejected by the native layer (status $status).")
+            else -> Illusion.LOGGER.warn("VRS combiners rejected, status $status")
         }
     }
 
@@ -341,7 +339,7 @@ object D3D12VariableShadingRate {
                 break
             }
         } catch (t: Throwable) {
-            Illusion.LOGGER.warn("[${Illusion.MODID}] could not read $OPTIONS_KEY from $file", t)
+            Illusion.LOGGER.warn("could not read $OPTIONS_KEY from $file", t)
             return
         }
         // 文件里没有这一行（首跑 / 用户删过 / 刚从模组配置迁移过来）也要推一次，保持界面与 native 一致。
@@ -361,7 +359,7 @@ object D3D12VariableShadingRate {
             val text = (kept + ("$OPTIONS_KEY:${OPTION.get().name}")).joinToString(eol) + eol
             file.writeText(text, StandardCharsets.UTF_8)
         } catch (t: Throwable) {
-            Illusion.LOGGER.warn("[${Illusion.MODID}] could not write $OPTIONS_KEY to $file", t)
+            Illusion.LOGGER.warn("could not write $OPTIONS_KEY to $file", t)
         }
     }
 }

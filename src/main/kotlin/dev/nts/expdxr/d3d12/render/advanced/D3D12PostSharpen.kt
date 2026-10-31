@@ -75,7 +75,7 @@ object D3D12PostSharpen {
         if (!announced) {
             announced = true
             LOGGER.info(
-                "post-sharpen active (5-tap unsharp, amount={})",
+                "post-sharpen on, amount={}",
                 amount,
             )
         }
@@ -91,13 +91,12 @@ object D3D12PostSharpen {
         supported = MCDR_ABI.supportsSharpenTextureToTexture()
         if (supported) {
             LOGGER.info(
-                "MCDR.dll exports the post-sharpen pass (amount={})",
+                "post-sharpen available, amount={}",
                 amount,
             )
         } else {
             LOGGER.warn(
-                "this MCDR.dll has no mcdr_dx12SharpenTextureToTexture; " +
-                    "sharpening stays off (falling back to the plain blit)",
+                "mcdr_dx12SharpenTextureToTexture missing; sharpening off",
             )
         }
         return supported
@@ -109,7 +108,7 @@ object D3D12PostSharpen {
         }
         failureLogged = true
         LOGGER.warn(
-            "post-sharpen unavailable ({}); falling back to the plain blit",
+            "post-sharpen unavailable ({}); using plain blit",
             reason,
         )
     }
@@ -141,8 +140,7 @@ object D3D12PostSharpen {
             created
         } catch (t: Throwable) {
             LOGGER.warn(
-                "could not create the {}x{} sharpen scratch ({}) ; DLAA/DLSS " +
-                    "will not be sharpened",
+                "sharpen scratch {}x{} failed ({}); DLSS/DLAA unsharpened",
                 width, height, t,
             )
             null

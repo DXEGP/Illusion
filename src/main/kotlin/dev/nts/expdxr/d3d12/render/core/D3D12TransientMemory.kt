@@ -138,12 +138,11 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
             if (failure == null) {
                 return Result.success(block.slice(offset, written) to written)
             }
-            reportStagingMapFailure(block, offset, total, attempt, failure)
+            reportStagingMapFailure(offset, total, attempt, failure)
             if (attempt >= MAX_STAGING_MAP_RETRIES) {
                 return Result.failure(IllegalStateException(
-                    "staging block 0x${block.handle().toULong().toString(16)} (${block.size()} bytes, "
-                        + "closed=${block.isClosed()}) could not be mapped at $offset+$total after "
-                        + "${attempt + 1} attempt(s)", failure))
+                    "staging block (${block.size()} bytes) could not be mapped at $offset+$total "
+                        + "after ${attempt + 1} attempt(s)", failure))
             }
             attempt++
             discardStagingBlock(block)
@@ -170,17 +169,19 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
         }
     }
 
-    /** 映射失败取证行：每次失败一行，不刷屏。 */
-    private fun reportStagingMapFailure(block: D3D12GpuBuffer, offset: Long, total: Long,
+    /** 连续映射失败的计数：前 3 次逐条，之后每 64 次一行。 */
+    private var stagingMapFailures = 0
+
+    /** 映射失败取证行：前 3 次逐条，之后每 64 次一行（不刷屏）。 */
+    private fun reportStagingMapFailure(offset: Long, total: Long,
         attempt: Int, failure: Throwable) {
+        this.stagingMapFailures++
+        if (this.stagingMapFailures > 3 && (this.stagingMapFailures and 63) != 0) {
+            return
+        }
         IllusionLogger.warnFormat(
-            "transientMemory: staging block 0x%x (%d bytes, closed=%s) could not be "
-                + "mapped at offset=%d length=%d (attempt %d): %s — discarding it and taking a fresh "
-                + "block; the upload continues. This used to crash the frame with "
-                + "'dx12MapBuffer returned null'.%n",
-            block.handle(), block.size(), block.isClosed().toString(), offset, total, attempt + 1,
-            failure.toString())
-        System.err.flush()
+            "staging map failed at %d+%d (attempt %d, total %d): %s",
+            offset, total, attempt + 1, this.stagingMapFailures, failure.toString())
     }
 
     override fun uploadGpu(data: MutableList<ByteBuffer>, alignment: Long,

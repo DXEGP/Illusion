@@ -17,9 +17,11 @@ import dev.nts.expdxr.misc.settings.D3D12Settings
 import dev.nts.expdxr.d3d12.extern.MCDR_ABI
 import dev.nts.expdxr.d3d12.render.adapter.D3D12Device
 import dev.nts.expdxr.d3d12.render.advanced.mesh.D3D12MeshDrawCapture
+import dev.nts.expdxr.dxrmc.rt.D3D12RtGBuffer
 import dev.nts.expdxr.d3d12.render.advanced.taa.D3D12Temporal
 import dev.nts.expdxr.d3d12.render.core.D3D12AsyncContext
 import dev.nts.expdxr.d3d12.render.core.D3D12GpuBuffer
+import dev.nts.expdxr.d3d12.render.core.D3D12GpuTexture
 import dev.nts.expdxr.d3d12.render.core.D3D12GpuQueryPool
 import dev.nts.expdxr.d3d12.render.core.D3D12GpuTextureView
 import dev.nts.expdxr.d3d12.render.core.D3D12TransientMemory
@@ -52,6 +54,8 @@ private var gMeshletLastCull: Boolean? = null
 private var gMeshletSolid = 0L
 private var gMeshletCutout = 0L
 private var gMeshletTranslucent = 0L
+/** 转换器接管的 RAW 缓冲绑定：前几条打一次参数，便于核对 offset/length。 */
+private val gRawBufferLogs = java.util.concurrent.atomic.AtomicInteger()
 
 /**
  * D3D12 render pass 后端（镜像官方 VulkanRenderPass）：uniform/texture 暂存在本类 map，core 之前按需
@@ -112,6 +116,69 @@ class D3D12RenderPassBackend(
     private val textures: MutableMap<String, TextureViewAndSampler> = HashMap()
 
     private data class TextureViewAndSampler(val view: D3D12GpuTextureView, val sampler: D3D12GpuSampler)
+
+    /** 本 pass 里成功派发过的地形批次：G-Buffer pass 要按完全相同的参数重放一遍。 */
+    private val gbufferBatches = ArrayList<D3D12RtGBuffer.Batch>(4)
+
+    fun hasGBufferBatches(): Boolean = this.gbufferBatches.isNotEmpty()
+
+    /** 本帧捕获的 G-Buffer 批次数（诊断用）。 */
+    fun gbufferBatchCount(): Int = this.gbufferBatches.size
+
+    /** 本帧捕获的 G-Buffer meshlet 总数（诊断用）。 */
+    fun gbufferMeshletCount(): Int = this.gbufferBatches.sumOf { it.meshletCount }
+
+    /**
+     * 重放本 pass 捕获的地形批次，写 G-Buffer 的四张附件。
+     *
+     * Begin/End 由调用方（`D3D12CommandEncoderBackend.recordGBufferPass`）负责：主 pass 已经 End，
+     * 这里只往同一份命令列表追加 SetPipeline + DispatchMesh。全局常量必须重建 —— G-Buffer 的 MS 恒不带 AS，
+     * 派发组数是原始 meshlet 数，且 VRS 档位要关掉（G-Buffer 是给光追读的，不能被粗档位抽稀）。
+     */
+    fun replayGBuffer() {
+        if (this.gbufferBatches.isEmpty()) {
+            return
+        }
+        val savedPipeline = this.pipeline
+        try {
+            for (batch in this.gbufferBatches) {
+                val globalsBytes = ByteBuffer.allocate(256).order(ByteOrder.LITTLE_ENDIAN)
+                globalsBytes.putInt(batch.meshletCount)
+                globalsBytes.putInt(0)
+                globalsBytes.putFloat(0.0f)
+                globalsBytes.putFloat(0.0f)
+                globalsBytes.putFloat(0.0f)
+                globalsBytes.putFloat(0.0f)
+                globalsBytes.flip()
+                val globalsSlice = this.transientMemory.uploadStaging(
+                    mutableListOf(globalsBytes), 256L, GpuBuffer.USAGE_COPY_SRC)
+                val globalsHandle = (globalsSlice.buffer() as? D3D12GpuBuffer)?.handle()
+                if (globalsHandle == null) {
+                    IllusionLogger.warnMessage("rt gbuffer: globals upload failed")
+                    continue
+                }
+                if (!MCDR_ABI.D3D12SetPipeline(this.ctx, batch.pso, true)) {
+                    IllusionLogger.warnMessage("rt gbuffer: bind gbuffer PSO failed: " +
+                        MCDR_ABI.D3D12LastError())
+                    continue
+                }
+                // 换 PSO 会清掉根描述符表：必须重新 push（与 tryMeshletDraw 同一套 bindings）。
+                this.pipeline = batch.pipeline
+                this.anyDescriptorDirty = true
+                this.pushDescriptors()
+                if (!MCDR_ABI.D3D12MeshDrawMeshlets(this.ctx,
+                        batch.vertexBuffer, batch.vertexOffset,
+                        batch.sections, batch.sectionsOffset, batch.sectionsLength,
+                        batch.meshlets, batch.meshletsOffset, batch.meshletsLength,
+                        globalsHandle, globalsSlice.offset(), batch.meshletCount)) {
+                    IllusionLogger.warnMessage("rt gbuffer: redispatch failed: ${MCDR_ABI.D3D12LastError()}")
+                }
+            }
+        } finally {
+            this.pipeline = savedPipeline
+            this.anyDescriptorDirty = true
+        }
+    }
 
     /** 当前管线的 location 字符串（如 minecraft:pipeline/animate_sprite_blit）。 */
     fun pipelineLocation(): String? {
@@ -217,7 +284,7 @@ class D3D12RenderPassBackend(
                 val stride = formatBindings.getOrNull(slot)?.vertexSize ?: 0
                 if (stride == 0) {
                     LOGGER.warn(
-                        "vertex buffer slot {} has no format in pipeline {} (dropped)",
+                        "vertex buffer slot {} dropped: no format in {}",
                         slot, base.info().location)
                     continue
                 }
@@ -230,7 +297,7 @@ class D3D12RenderPassBackend(
     override fun setUniform(index: Int, value: Any?) {
         val name = this.uniformNames.getOrNull(index)
         if (name == null) {
-            LOGGER.warn("setUniform({}) ignored: pipeline has {} uniforms",
+            LOGGER.warn("setUniform({}) ignored: {} uniforms only",
                 index, this.uniformNames.size)
             return
         }
@@ -252,7 +319,7 @@ class D3D12RenderPassBackend(
     override fun pushConstants(data: ByteBuffer) {
         if (!this.pushConstantsWarned) {
             this.pushConstantsWarned = true
-            LOGGER.warn("pushConstants({} bytes) ignored: D3D12 backend has no root-constant path",
+            LOGGER.warn("pushConstants ignored ({} bytes): no root constants",
                 data.remaining())
         }
     }
@@ -302,13 +369,13 @@ class D3D12RenderPassBackend(
         this.anyDescriptorDirty = false
         val pipeline = this.pipeline
         if (pipeline == null || !pipeline.isValid()) {
-            LOGGER.warn("pushDescriptors: SKIP (pipeline null or invalid)")
+            LOGGER.warn("pushDescriptors skipped: pipeline null")
             return
         }
         val bindings = pipeline.buildBindings()
         val count = bindings.size
         if (count == 0) {
-            LOGGER.warn("pushDescriptors: SKIP (0 bindings)")
+            LOGGER.warn("pushDescriptors skipped: 0 bindings")
             return
         }
         val types = IntArray(count)
@@ -346,6 +413,19 @@ class D3D12RenderPassBackend(
                     lengths[i] = value.length()
                     // Java 里此处直接解引用 texelBufferFormat()（null 会 NPE），用 !! 保留同样语义。
                     texelFormats[i] = entry.texelBufferFormat!!.ordinal
+                }
+                D3D12BindGroupEntry.Type.RAW_BUFFER -> {
+                    // RAW SRV：HLSL 里是 ByteAddressBuffer，原生按 4 字节寻址建视图，不取 texel 格式。
+                    val value = requireUniform(entry.name)
+                    val buffer = value.buffer()
+                    types[i] = 3
+                    buffers[i] = (buffer as D3D12GpuBuffer).handle()
+                    offsets[i] = value.offset()
+                    lengths[i] = value.length()
+                    if (gRawBufferLogs.incrementAndGet() <= 4) {
+                        LOGGER.debug("raw binding {}: offset={} length={} size={}",
+                            entry.name, value.offset(), value.length(), (buffer as D3D12GpuBuffer).size())
+                    }
                 }
             }
         }
@@ -586,7 +666,7 @@ class D3D12RenderPassBackend(
     /** 地形批次的 mesh 派发失败只记一次（已无 IMR 回退，不会再画一遍原版路径）。 */
     private fun meshTerrainMissing(reason: String) {
         if (gMeshTerrainMissingLog.add(reason)) {
-            LOGGER.error("terrain batch not drawn (mesh path unavailable): {}", reason)
+            LOGGER.error("terrain batch skipped, no mesh path: {}", reason)
         }
     }
 
@@ -673,6 +753,22 @@ class D3D12RenderPassBackend(
         if (failure != null) {
             return meshletSkip("meshlet dispatch failed: $failure")
         }
+        // G-Buffer 只重放不透明地形（半透明归 OIT/S4）。组数按原始 meshlet 数：G-Buffer 的 MS 恒不带 AS。
+        if (compiled.hasGBufferVariant()) {
+            this.gbufferBatches.add(D3D12RtGBuffer.Batch(
+                pipeline = compiled,
+                pso = compiled.gbufferPipeline(),
+                vertexBuffer = vertexBuffer.handle(),
+                vertexOffset = this.lastVertexSliceOffset,
+                sections = sectionsHandle,
+                sectionsOffset = sectionsSlice.offset(),
+                sectionsLength = sectionsSlice.length(),
+                meshlets = meshletsHandle,
+                meshletsOffset = meshletsSlice.offset(),
+                meshletsLength = meshletsSlice.length(),
+                meshletCount = tables.meshletCount,
+            ))
+        }
         when (layer) {
             "SOLID" -> gMeshletSolid++
             "CUTOUT" -> gMeshletCutout++
@@ -680,8 +776,7 @@ class D3D12RenderPassBackend(
         }
         if (System.nanoTime() - gMeshletLogNanos > 2_000_000_000L) {
             gMeshletLogNanos = System.nanoTime()
-            LOGGER.info("meshlet dispatch: draws={} meshlets={} layer={} " +
-                "totals[solid={} cutout={} translucent={}]",
+            LOGGER.info("meshlet: d={} m={} layer={} solid={} cutout={} trans={}",
                 drawCount, tables.meshletCount, layer, gMeshletSolid, gMeshletCutout, gMeshletTranslucent)
         }
         return true
@@ -1008,8 +1103,7 @@ class D3D12RenderPassBackend(
                 // 故改为升级到真正的并行分区（各 worker 独立区域），代价仅 ~0.2ms 调度开销。
                 workerCount = async.workerCount().coerceAtMost(n).coerceAtLeast(2)
                 if (IllusionLogger.debugEnabled()) {
-                    LOGGER.warn("drawMultipleIndexed: single-bundle alloc failed,"
-                        + " escalating to parallel (draws={}, bindings={}, frameSlot={})",
+                    LOGGER.warn("MDI parallel fallback: d={} b={} slot={}",
                         n, bc, frameSlot)
                 }
             } else {
@@ -1091,8 +1185,7 @@ class D3D12RenderPassBackend(
             D3D12AsyncContext.countFallback()
             gProfFallbacks++
             if (IllusionLogger.debugEnabled()) {
-                LOGGER.warn("drawMultipleIndexed: parallel recording failed, falling back to serial"
-                    + " (draws={}, bindings={}, worker={}/{})", n, bc, frameSlot, workerCount)
+                LOGGER.warn("MDI serial fallback: d={} b={} w={}/{}", n, bc, frameSlot, workerCount)
             }
             return false
         }

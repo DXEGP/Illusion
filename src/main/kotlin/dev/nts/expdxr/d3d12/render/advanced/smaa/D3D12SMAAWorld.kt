@@ -38,13 +38,13 @@ object D3D12SMAAWorld {
         if (!loggedHook) {
             loggedHook = true
             Illusion.LOGGER.info(
-                "world-layer SMAA hook is live (world {}x{}); the GUI draws after it and stays unaffected",
+                "world SMAA live ({}x{}); GUI unaffected",
                 texture.getWidth(0), texture.getHeight(0))
         }
         if (encoder.recordSmaaWorldPass(texture) && !loggedApplied) {
             loggedApplied = true
             Illusion.LOGGER.info(
-                "native confirms the world-layer SMAA pass ran (world {}x{})",
+                "native: world SMAA pass ran ({}x{})",
                 texture.getWidth(0), texture.getHeight(0))
         }
     }

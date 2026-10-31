@@ -44,7 +44,7 @@ object ImprovedTransparencyLock {
         }
         try {
             if (enforce()) {
-                logger.info("improvedTransparency forced on (D3D12 has no IMR transparency fallback)")
+                logger.info("improvedTransparency forced: no IMR fallback")
             }
         } catch (t: Throwable) {
             // 首帧还没有 level，选项回调里的 allChanged 可能抛异常；降级成 debug，下一帧再试。

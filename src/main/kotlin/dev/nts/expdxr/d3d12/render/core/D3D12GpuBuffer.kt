@@ -84,9 +84,7 @@ class D3D12GpuBuffer(private val usageFlags: Int, private val bufferSize: Long, 
             }
             deviceLostReported = true
             System.err.println(
-                "the D3D12 device was removed (DXGI_ERROR_DEVICE_REMOVED / 0x887A0005); "
-                    + "every GPU call fails from here on, so the buffer that called Map() first is "
-                    + "not the cause. Check the last GPU work submitted before this line. detail: $detail")
+                "device removed: 0x887A0005 (DXGI_ERROR_DEVICE_REMOVED); detail: $detail")
             System.err.flush()
             return true
         }
@@ -111,10 +109,7 @@ class D3D12GpuBuffer(private val usageFlags: Int, private val bufferSize: Long, 
         }
         // 设备已移除：把「这个 buffer 没问题、整条 GPU 停了」写进异常本身，并且只报一次。
         reportDeviceLostOnce(base)
-        return base + " — this is NOT a problem with this buffer: the D3D12 device has been " +
-            "REMOVED (DXGI_ERROR_DEVICE_REMOVED / 0x887A0005), so every GPU call fails from here " +
-            "on. Check the last GPU work submitted before this line (for 2026-10-17: the DLSS " +
-            "evaluate that first used a real depth snapshot)."
+        return base + " — device removed; check the last GPU work submitted"
     }
 
     override fun close() {

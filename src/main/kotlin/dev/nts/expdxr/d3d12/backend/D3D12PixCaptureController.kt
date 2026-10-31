@@ -98,7 +98,7 @@ internal object D3D12PixCaptureController {
         }
         if (!D3D12Settings.pixTimingCapture) {
             LOGGER.info(
-                "PIX capture key pressed, but [debug] pixTimingCapture is off - nothing started",
+                "PIX capture off: [debug] pixTimingCapture = false",
             )
             return
         }
@@ -124,7 +124,7 @@ internal object D3D12PixCaptureController {
                     ),
                 )
                 LOGGER.info(
-                    "PIX capture started: {} ({} frames, press {} again to stop early)",
+                    "PIX capture started: {} ({} frames, {} again to stop)",
                     path,
                     limit,
                     KEY.translatedKeyMessage.string,
@@ -132,17 +132,17 @@ internal object D3D12PixCaptureController {
             }
 
             0 -> {
-                LOGGER.warn("PIX capture: PIX is already recording; nothing started")
+                LOGGER.warn("PIX capture: already recording, nothing started")
                 postFailure(TRANSLATION_FAIL_RECORDING)
             }
 
             Int.MIN_VALUE -> {
-                LOGGER.warn("PIX capture: the loaded MCDR.dll has no mcdrStartPixTimingCapture")
+                LOGGER.warn("PIX capture: MCDR.dll lacks mcdrStartPixTimingCapture")
                 postFailure(TRANSLATION_FAIL_MISSING)
             }
 
             else -> {
-                LOGGER.error("PIX capture FAILED to start (HRESULT 0x%08X)".format(Locale.ROOT, status))
+                LOGGER.error("PIX capture start failed (HRESULT 0x%08X)".format(Locale.ROOT, status))
                 postHresult(status)
             }
         }
@@ -163,7 +163,7 @@ internal object D3D12PixCaptureController {
             1 -> {
                 postChat(stopMessage(path, capturedFrames, seconds, cause))
                 LOGGER.info(
-                    "PIX capture stopped ({}), {} frames in {} s: {} - PIX writes the file on its own thread",
+                    "PIX capture stopped ({}): {} frames in {} s, {}",
                     cause.name.lowercase(Locale.ROOT),
                     capturedFrames,
                     String.format(Locale.ROOT, "%.1f", seconds),
@@ -171,9 +171,9 @@ internal object D3D12PixCaptureController {
                 )
             }
 
-            0 -> LOGGER.warn("PIX capture: stop requested but nothing was recording")
+            0 -> LOGGER.warn("PIX capture: stop requested, nothing recording")
             else -> {
-                LOGGER.error("PIX capture: stop FAILED (HRESULT 0x%08X)".format(Locale.ROOT, status))
+                LOGGER.error("PIX capture: stop failed (HRESULT 0x%08X)".format(Locale.ROOT, status))
                 postHresult(status)
             }
         }
@@ -214,7 +214,7 @@ internal object D3D12PixCaptureController {
         try {
             Minecraft.getInstance().gui.hud.chat.addClientSystemMessage(message)
         } catch (t: Throwable) {
-            LOGGER.warn("PIX capture: cannot post the capture state to chat: {}", t.toString())
+            LOGGER.warn("PIX capture: chat post failed: {}", t.toString())
         }
     }
 
@@ -270,14 +270,14 @@ internal object D3D12PixCaptureController {
             val next = highest + 1
             if (next > MAX_CAPTURE_INDEX) {
                 LOGGER.error(
-                    "PIX capture: run/pix already holds captures up to number {}; remove some first",
+                    "PIX capture: run/pix has captures to {}; remove some",
                     highest,
                 )
                 return null
             }
             directory.resolve("dxrmc-capture-$next.wpix")
         } catch (t: Throwable) {
-            LOGGER.error("PIX capture: cannot prepare run/pix: {}", t.toString())
+            LOGGER.error("PIX capture: run/pix prepare failed: {}", t.toString())
             null
         }
     }

@@ -92,8 +92,7 @@ object D3D12AntiAliasing {
             if (!dlaaOwnsDlssReported) {
                 dlaaOwnsDlssReported = true
                 Illusion.LOGGER.info(
-                    "DLSS is on, but anti-aliasing is DLAA — DLAA owns the DLSS feature, "
-                        + "so the anti-aliasing option is left untouched")
+                    "DLSS on, AA is DLAA: option left untouched")
             }
             return
         }
@@ -106,7 +105,7 @@ object D3D12AntiAliasing {
                     setModeQuietly(OFF)
                 }
                 dlssLockApplied = true
-                Illusion.LOGGER.info("DLSS is on: the anti-aliasing lock is OFF and this option cannot be changed in the video settings")
+                Illusion.LOGGER.info("DLSS on: AA lock off, option not editable")
             }
             return
         }
@@ -117,7 +116,7 @@ object D3D12AntiAliasing {
             if (restored != OFF && OPTION.get() != restored) {
                 setModeQuietly(restored)
             }
-            Illusion.LOGGER.info("DLSS is off: anti-aliasing is adjustable again (restored to {})", modeName(restored))
+            Illusion.LOGGER.info("DLSS off: AA adjustable, restored {}", modeName(restored))
         }
     }
 
@@ -204,11 +203,11 @@ object D3D12AntiAliasing {
         when {
             status == pushed -> Illusion.LOGGER.info("anti-aliasing = {}", modeName(mode))
             status == 0 -> Illusion.LOGGER.warn(
-                "anti-aliasing {} is not implemented yet; the renderer falls back to OFF",
+                "AA {} not implemented; falling back to OFF",
                 modeName(mode),
             )
             status == Int.MIN_VALUE -> Illusion.LOGGER.info(
-                "the loaded MCDR.dll has no mcdrSetAntiAliasing; anti-aliasing stays off",
+                "MCDR.dll lacks mcdrSetAntiAliasing; AA off",
             )
             else -> Illusion.LOGGER.warn("mcdrSetAntiAliasing({}) returned {}", pushed, status)
         }
@@ -237,7 +236,7 @@ object D3D12AntiAliasing {
                     // DLSS lock is on the line is ignored outright — both injections share one TAIL.
                     if (dlssLock) {
                         Illusion.LOGGER.info(
-                            "DLSS is on; ignoring the anti-aliasing mode {} restored from {}",
+                            "DLSS on; ignoring AA {} from {}",
                             modeName(mode), OPTIONS_KEY,
                         )
                     } else {

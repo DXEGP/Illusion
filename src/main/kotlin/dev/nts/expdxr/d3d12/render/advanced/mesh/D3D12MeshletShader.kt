@@ -19,21 +19,23 @@ object D3D12MeshletShader {
     const val VERTEX_STRIDE = 28
 
     /**
-     * 生成 MS 源码；`vsHlsl` 必须是 spvc 产出的地形 VS（含 `SPIRV_Cross_Input` 与 `main`）。`cull=true` 还需
-     * 解析出 CameraBlockPos/CameraOffset/ModelViewMat/ProjMat 四个 uniform，任一缺失返回 null，调用方必须回退。
+     * 生成 MS 源码。接受两种 VS 形态：旧链的 spvc 产物（`SPIRV_Cross_Input` + `main`）与转换器的 naga
+     * 产物（`XxxOutput main(参数 : LOCn, …)`）。`cull=true` 还需解析出
+     * CameraBlockPos/CameraOffset/ModelViewMat/ProjMat 四个 uniform，任一缺失返回 null，调用方必须回退。
      */
     fun build(vsHlsl: String, format: VertexFormat?, stride: Int = VERTEX_STRIDE,
               cull: Boolean = false): String? {
-        val entry = "SPIRV_Cross_Output main(SPIRV_Cross_Input stage_input)"
-        if (!vsHlsl.contains(entry)) return null
-        val fields = D3D12MeshVertexDecode.parseInputFields(vsHlsl)
+        val shape = vsShape(vsHlsl) ?: return null
+        val fields = shape.fields
         if (fields.isEmpty()) return null
-        val renamed = vsHlsl.replace(entry, "SPIRV_Cross_Output vs_main(SPIRV_Cross_Input stage_input)")
+        val renamed = shape.renamed
         val cu = if (cull) resolveCullUniforms(renamed) ?: return null else null
 
         val decode = buildString {
             for (field in fields) {
-                val element = format?.let { f -> runCatching { f.getElement(field.name) }.getOrNull() }
+                // 转换器的 HLSL 会把 `UV0` 写成 `UV0_`（naga 的标识符去重），查顶点格式前还原。
+                val lookup = field.name.trimEnd('_')
+                val element = format?.let { f -> runCatching { f.getElement(lookup) }.getOrNull() }
                 when {
                     element != null ->
                         append(D3D12MeshVertexDecode.decodeField(field, element.format().name,
@@ -264,12 +266,12 @@ uint4 meshReadUInt16(uint a) {
     return uint4(w.x & 65535u, w.x >> 16, w.y & 65535u, w.y >> 16);
 }
 uint4 meshReadUInt32(uint a) { return meshVertices.Load4(a); }
-$asBlock$vrsPrimStruct
+$asBlock$vrsPrimStruct${shape.preamble}
 // 线程组 = 一个 meshlet：前 quadCount*4 线程各解一个顶点，前 quadCount 线程算术写出一个 quad 的两个三角形；不读索引，带 AS 时 meshlet 号来自 payload。
 [numthreads($THREADS, 1, 1)]
 [outputtopology("triangle")]
 void ms_main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID$msPayloadParam,
-             out vertices SPIRV_Cross_Output verts[$THREADS]$vrsPrimParam,
+             out vertices ${shape.outputStruct} verts[$THREADS]$vrsPrimParam,
              out indices uint3 tris[$MAX_PRIMITIVES])
 {
     MeshletDesc m = loadMeshlet($msMeshletId);
@@ -283,8 +285,8 @@ $vrsRate
     uint vid = tid.x;
     if (vid < vertexCount) {
         uint vertexIndex = s.vertexBase + m.localVertexOffset + vid;
-        SPIRV_Cross_Input vin = (SPIRV_Cross_Input)0;
-$decode        verts[vid] = vs_main(vin);
+        ${shape.inputStruct} vin = (${shape.inputStruct})0;
+$decode        verts[vid] = ${shape.call};
     }
 
     // 算术索引：MC 的每个 quad 固定 4 个顶点、绕序 (0,1,2) / (0,2,3)。
@@ -297,9 +299,77 @@ $vrsStore    }
 """
     }
 
+    /** 一条 VS 的阶段接口形态（旧链 spvc 与转换器 naga 两种）。 */
+    private data class StageShape(
+        val renamed: String,
+        val fields: List<D3D12MeshVertexDecode.Field>,
+        val inputStruct: String,
+        val outputStruct: String,
+        val call: String,
+        val preamble: String,
+    )
+
+    /**
+     * 识别 VS 的阶段接口。spvc 的产物是 `SPIRV_Cross_Output main(SPIRV_Cross_Input)`；转换器的产物是
+     * `<输出结构体> main(float3 Position : LOC0, …)`，输入散在参数上、没有输入结构体，因此要自己拼结构体
+     * 再按位置传参。
+     */
+    private fun vsShape(vsHlsl: String): StageShape? {
+        val legacy = "SPIRV_Cross_Output main(SPIRV_Cross_Input stage_input)"
+        if (vsHlsl.contains(legacy)) {
+            val fields = D3D12MeshVertexDecode.parseInputFields(vsHlsl)
+            return StageShape(
+                renamed = vsHlsl.replace(legacy,
+                    "SPIRV_Cross_Output vs_main(SPIRV_Cross_Input stage_input)"),
+                fields = fields,
+                inputStruct = "SPIRV_Cross_Input",
+                outputStruct = "SPIRV_Cross_Output",
+                call = "vs_main(vin)",
+                preamble = "",
+            )
+        }
+        val signature = Regex("""(\w+)\s+main\(([^)]*)\)""").find(vsHlsl) ?: return null
+        val outputStruct = signature.groupValues[1]
+        val parameters = signature.groupValues[2].split(',').mapNotNull { parameter ->
+            Regex("""^\s*(\w+)\s+(\w+)\s*:\s*LOC(\d+)\s*$""").find(parameter)?.let {
+                D3D12MeshVertexDecode.Field(it.groupValues[1], it.groupValues[2])
+            }
+        }
+        if (parameters.isEmpty() || parameters.size != signature.groupValues[2].split(',').size) {
+            // 参数里有非 LOC 语义（例如 SV_VertexID）：不猜，交给调用方回退旧链。
+            return null
+        }
+        val struct = "DxrVertexInput"
+        val preamble = buildString {
+            appendLine()
+            appendLine("struct $struct {")
+            for (field in parameters) appendLine("    ${field.type} ${field.name};")
+            appendLine("};")
+        }
+        val call = "vs_main(" + parameters.joinToString(", ") { "vin.${it.name}" } + ")"
+        return StageShape(
+            renamed = vsHlsl.replaceFirst(signature.value, "$outputStruct vs_main(${signature.groupValues[2]})"),
+            fields = parameters,
+            inputStruct = struct,
+            outputStruct = outputStruct,
+            call = call,
+            preamble = preamble,
+        )
+    }
+
     /** VS 里 AS 需要的四个 uniform 名（由 spvc 生成，名字随版本可能带前缀）。 */
     private data class CullUniforms(val cameraBlockPos: String, val cameraOffset: String,
                                     val modelViewMat: String, val projMat: String)
+
+    /**
+     * 相机相对坐标要用的两个 uniform 名（段方块坐标 - CameraBlockPos + CameraOffset）。
+     * 解析不到返回 null —— 调用方回退到绝对坐标，不要拿空名拼表达式。
+     */
+    internal fun cameraUniformNames(vsHlsl: String): Pair<String, String>? {
+        val cbp = findUniform(vsHlsl, "CameraBlockPos") ?: return null
+        val coff = findUniform(vsHlsl, "CameraOffset") ?: return null
+        return cbp to coff
+    }
 
     /**
      * 从 VS 源码解析 AS 需要的 uniform；缺任何一个返回 null（判据全 0 的 AS 会把地形成片剔掉）。
@@ -312,13 +382,20 @@ $vrsStore    }
         return CullUniforms(cbp, coff, mvm, proj)
     }
 
-    /** 找成员名：先按名字精确/前缀匹配，矩阵还要求前面确实是 `float4x4` 声明。 */
+    /**
+     * 找成员名：先按名字精确/前缀匹配，矩阵还要求前面确实是 `float4x4` 声明；成员落在 cbuffer 里时
+     * 返回 `global_1.CameraBlockPos` 这样的限定名（转换器的 HLSL 一律经由 cbuffer 实例访问）。
+     */
     private fun findUniform(hlsl: String, needle: String, requireMatrix: Boolean = false): String? {
+        // 名字前缀可空：spvc 会带 `_81_CameraBlockPos` 这类唯一化前缀，转换器产物则是裸名。
         val pattern = if (requireMatrix) {
-            Regex("float4x4\\s+([A-Za-z_][A-Za-z0-9_]*" + Regex.escape(needle) + "[A-Za-z0-9_]*)")
+            Regex("float4x4\\s+(\\w*" + Regex.escape(needle) + "\\w*)")
         } else {
-            Regex("\\b([A-Za-z_][A-Za-z0-9_]*" + Regex.escape(needle) + "[A-Za-z0-9_]*)\\b")
+            Regex("\\b(\\w*" + Regex.escape(needle) + "\\w*)\\b")
         }
-        return pattern.find(hlsl)?.groupValues?.get(1)
+        val member = pattern.find(hlsl)?.groupValues?.get(1) ?: return null
+        val qualified = Regex("([A-Za-z_][A-Za-z0-9_]*)\\." + Regex.escape(member) + "\\b")
+            .find(hlsl)?.groupValues?.get(1)
+        return if (qualified == null) member else "$qualified.$member"
     }
 }

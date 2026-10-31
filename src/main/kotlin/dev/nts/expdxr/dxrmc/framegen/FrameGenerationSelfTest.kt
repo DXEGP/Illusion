@@ -41,11 +41,11 @@ object FrameGenerationSelfTest {
         }
         plan = parse(spec)
         if (plan.isEmpty()) {
-            Illusion.LOGGER.warn("{} self test: could not parse \"{}\" (want act@tick,act@tick)", PREFIX, spec)
+            Illusion.LOGGER.warn("{} self test: cannot parse {} (want act@tick)", PREFIX, spec)
             return
         }
         Illusion.LOGGER.info(
-            "{} self test armed: {} (ticks are counted from the moment the world is loaded)",
+            "{} self test armed: {} (ticks from world load)",
             PREFIX, plan.joinToString(", ") { "${it.action}@${it.atTick}" },
         )
         NeoForge.EVENT_BUS.addListener<ClientTickEvent.Post> { tick() }
@@ -139,7 +139,7 @@ object FrameGenerationSelfTest {
     private fun pickFrameGenBackend(backend: Int) {
         forcedFrameGenBackend = backend
         val status = MCDR_ABI.D3D12FgPick(backend)
-        Illusion.LOGGER.info("{} self test: pick frame-generation backend {} -> status {}", PREFIX, backend, status)
+        Illusion.LOGGER.info("{} self test: backend {} -> status {}", PREFIX, backend, status)
     }
 
     private fun probeFrameGeneration() {
@@ -154,8 +154,7 @@ object FrameGenerationSelfTest {
                 continue
             }
             Illusion.LOGGER.info(
-                "{} probe {}: available={} runtime={} device={} chainCompat={} needsReflex={} " +
-                    "needsUi={} needsHudless={} transitions={} maxGen={} chain={} latency={} note={}",
+                "{} probe {}: av={} rt={} dv={} ch={} rfl={} ui={} hud={} tr={} mx={} own={} lat={} nt={}",
                 PREFIX, name, caps.available, caps.runtimeLoaded, caps.deviceSupported, caps.chainCompatible,
                 caps.needsReflex, caps.needsUiResource, caps.needsHudless, caps.transitionsInputs,
                 caps.maxGeneratedFrames, caps.chainOwner, caps.latencyProvider, caps.note,
@@ -186,7 +185,7 @@ object FrameGenerationSelfTest {
                 MCDR_ABI.D3D12FgSetMode(desc)
             }
         } catch (t: Throwable) {
-            Illusion.LOGGER.warn("self-test could not push frame generation mode directly: {}", t.message)
+            Illusion.LOGGER.warn("could not push frame generation mode: {}", t.message)
         }
     }
 }

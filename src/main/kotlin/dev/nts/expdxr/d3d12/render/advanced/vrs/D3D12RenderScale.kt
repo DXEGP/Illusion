@@ -86,7 +86,7 @@ object D3D12RenderScale {
     @JvmStatic
     fun logSliderResync() {
         Illusion.LOGGER.info(
-            "render-scale slider re-synced to {}% ({} mode, range {}..{}%, step {}%)",
+            "slider resynced to {}% ({} range {}..{}%, step {}%)",
             percent, if (mode == MODE_DLSS) "DLSS" else "plain", minOf(), maxOf(), stepOf(),
         )
     }
@@ -158,7 +158,7 @@ object D3D12RenderScale {
         return true
     }
 
-    /** [setDlssMode] / [setDlaaLock] 里"我们自己改值"的统一入口（P76i）。 */
+    /** [setDlssMode] / [setDlaaLock] 里"我们自己改值"的统一入口。 */
     private fun setProgrammatically(value: Int) {
         val appliesBefore = applyCount
         OPTION.set(value)
@@ -181,8 +181,7 @@ object D3D12RenderScale {
     /** [setDlssMode] 的取证行：两个键与生效值一起打出来。 */
     private fun logModeSwitch() {
         Illusion.LOGGER.info(
-            "renderScale range follows the DLSS mode: {} ({}..{}, step {}%); effective {}%, " +
-                "keys {}={} / {}={}",
+            "mode {}: {}..{} step {}%, effective {}%, {}={} / {}={}",
             if (mode == MODE_DLSS) "DLSS on" else "DLSS off",
             minOf(), maxOf(), stepOf(), percent,
             OPTIONS_KEY, values[MODE_PLAIN], DLSS_OPTIONS_KEY, values[MODE_DLSS],
@@ -258,8 +257,7 @@ object D3D12RenderScale {
         }
         dlaaLock = active
         Illusion.LOGGER.info(
-            "DLAA {} render-scale lock; DLAA needs render == target, so "
-                + "the scale is {}100%",
+            "DLAA {}render-scale lock; scale {}100%",
             if (active) "engaged the" else "released the", if (active) "pinned to " else "free from ")
         if (active) {
             val before = percent
@@ -334,17 +332,15 @@ object D3D12RenderScale {
         if (percent == DEFAULT_PERCENT) {
             if (dlaaLock) {
                 Illusion.LOGGER.info(
-                    "[${Illusion.MODID}] render scale = 100% (DLAA lock: render == target is required, "
-                        + "so the scale stays pinned until DLAA is released)",
+                    "render scale = 100%, DLAA lock",
                 )
             } else {
                 Illusion.LOGGER.info(
-                    "[${Illusion.MODID}] render scale off: the world is shaded at window resolution")
+                    "render scale off: world shaded at window size")
             }
         } else {
             Illusion.LOGGER.info(
-                "[${Illusion.MODID}] render scale = $percent%; the world's render target is created at that " +
-                    "fraction of the window and the GUI keeps a window-sized target of its own",
+                "render scale $percent%, GUI target stays window-sized",
             )
         }
     }
@@ -385,8 +381,7 @@ object D3D12RenderScale {
         }
         if (minecraft == null) {
             Illusion.LOGGER.info(
-                "[${Illusion.MODID}] the client is not up yet; the main render target will be created at " +
-                    "$percent% of the window.",
+                "client not up; main target at $percent% of window",
             )
             return
         }
@@ -398,20 +393,18 @@ object D3D12RenderScale {
                         val window = minecraft.window
                         minecraft.gameRenderer.resize(window.width, window.height)
                         Illusion.LOGGER.info(
-                            "[${Illusion.MODID}] main render target re-created for the new render scale.",
+                            "main target rebuilt for new render scale",
                         )
                     } catch (t: Throwable) {
                         Illusion.LOGGER.warn(
-                            "[${Illusion.MODID}] could not re-create the main render target now ($t); the new render " +
-                                "scale applies on the next window resize or restart.",
+                            "main target rebuild failed ($t); applies on next resize",
                         )
                     }
                 },
             )
         } catch (t: Throwable) {
             Illusion.LOGGER.warn(
-                "[${Illusion.MODID}] could not schedule the main render target refresh ($t); the new render " +
-                    "scale applies on the next window resize or restart.",
+                "main target refresh unscheduled ($t); next resize",
             )
         }
     }
@@ -442,7 +435,7 @@ object D3D12RenderScale {
                 }
             }
         } catch (t: Throwable) {
-            Illusion.LOGGER.warn("[${Illusion.MODID}] could not read $OPTIONS_KEY from $file", t)
+            Illusion.LOGGER.warn("could not read $OPTIONS_KEY from $file", t)
             return
         }
         // 当前模式下记住的值吸附/夹取后生效；DLAA 锁定期间不论文件里是多少都只能是 100。
@@ -475,7 +468,7 @@ object D3D12RenderScale {
             val text = (kept + written).joinToString(eol) + eol
             file.writeText(text, StandardCharsets.UTF_8)
         } catch (t: Throwable) {
-            Illusion.LOGGER.warn("[${Illusion.MODID}] could not write $OPTIONS_KEY to $file", t)
+            Illusion.LOGGER.warn("could not write $OPTIONS_KEY to $file", t)
         }
     }
 
@@ -514,8 +507,7 @@ object D3D12RenderScale {
             if (!warnedScaledWithoutBackend) {
                 warnedScaledWithoutBackend = true
                 Illusion.LOGGER.info(
-                    "renderScale={}% recorded, but the D3D12 backend is not driving rendering this session, so the main render target keeps the window size" +
-                        " (the vanilla present path cannot read a scaled main target); it applies once D3D12 takes over again",
+                    "renderScale={}% saved; backend off, target keeps window size",
                     p,
                 )
             }
@@ -543,8 +535,7 @@ object D3D12RenderScale {
         if (applied != percent && !loggedPendingPercent) {
             loggedPendingPercent = true
             Illusion.LOGGER.info(
-                "the world layer allocates at the already-applied {}% first (the user has asked for {}%); the main target is rebuilt at the frame boundary, "
-                    + "and only then do both switch to the new scale",
+                "world {}% applied, requested {}%; switch at frame end",
                 applied, percent,
             )
         }
@@ -552,8 +543,7 @@ object D3D12RenderScale {
         if (result != value && !loggedWorldLayerSize) {
             loggedWorldLayerSize = true
             Illusion.LOGGER.info(
-                "world-layer auxiliary targets (translucent/particles/weather/clouds plus the post-processing internals) follow the render size" +
-                    " (main target {} -> {}, renderScale={}%); the depth copy and the composite return to one coordinate space",
+                "world-layer targets follow render size ({} -> {}, {}%)",
                 value, result, applied,
             )
         }
@@ -573,11 +563,11 @@ object D3D12RenderScale {
         val result = attachmentDimension(value)
         if (result != value) {
             // 只有真正缩放时才打；主目标每次（重）建纹理最多四行（两个附件 × 宽高）。
-            Illusion.LOGGER.info("main render target attachments {} -> {} (renderScale={}%)", value, result, percent)
+            Illusion.LOGGER.info("main target attachments {} -> {} (renderScale={}%)", value, result, percent)
         } else if (dlaaLock && percent == DEFAULT_PERCENT) {
             // DLAA 的验收条件是"附件尺寸 == 窗口尺寸"，所以 100% 时也要留一行显式读数。
             Illusion.LOGGER.info(
-                "main render target attachments {} -> {} (renderScale=100%, DLAA locked: render == target)",
+                "main target attachments {} -> {} (100%, DLAA lock)",
                 value, result,
             )
         }

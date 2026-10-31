@@ -30,8 +30,7 @@ class D3D12AsyncContext private constructor() : AutoCloseable {
         this.descriptorAlloc = MCDR_ABI.D3D12AsyncDescriptorCreate(requested)
         this.bundlePool = MCDR_ABI.D3D12AsyncBundlePoolCreate(requested)
         if (this.descriptorAlloc == 0L || this.bundlePool == 0L) {
-            LOGGER.warn("async init failed (descriptor=0x{} bundle=0x{}); "
-                    + "falling back to serial recording",
+            LOGGER.warn("async init failed (0x{} 0x{}); serial recording",
                 this.descriptorAlloc.toULong().toString(16), this.bundlePool.toULong().toString(16))
         } else {
             val factory: ThreadFactory = object : ThreadFactory {
@@ -133,7 +132,7 @@ class D3D12AsyncContext private constructor() : AutoCloseable {
         @JvmStatic
         fun init(): Boolean {
             if (!ENABLED) {
-                LOGGER.info("async command lists disabled by config ([renderer] asyncCommandLists = false)")
+                LOGGER.info("async command lists off ([renderer] asyncCommandLists=false)")
                 return false
             }
             if (instance != null) {

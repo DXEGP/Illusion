@@ -346,7 +346,7 @@ int formatLogPrefix(char* out, size_t outSize, const char* level, const char* lo
 | `pixDirectory` | `""` | PIX 安装目录或其中某个 DLL 的路径 | 空 = 自动检测（先找 MCDR.dll 旁边，再找 `%ProgramFiles%\Microsoft PIX\<版本>`）；`gameRestart()` |
 | `pixTimingCapture` | `false` | 启用 F9（`选项 → 控制 → DXRMC`）的 PIX **timing** 抓帧 | 按下才抓，帧数在按下瞬间读配置，**不用重启**；ETW 会话要求当前用户能创建（PIX 文档建议加进 `Performance Log Users` 组，不需要提权） |
 | `pixCaptureFrames` | `600`（60..20000） | 一次按键抓多少帧 | 60 fps 下 600 帧约 10 秒，开内存事件后文件可达数百 MB |
-| `debugLayer` | `false` | 带 D3D12 调试层建设备 | 逐调用校验，帧率代价大；**Agility SDK 的 D3D12Core 生效时会被忽略**（inbox 校验层对不上）；`gameRestart()` |
+| `debugLayer` | `false` | 带 D3D12 调试层建设备 | 逐调用校验，帧率代价大；要求 `D3D12Core.dll` 旁边有**同版本**的 `d3d12SDKLayers.dll`（vcpkg 的 `installed\x64-windows\debug\bin\` 里那份，版本号与 `D3D12Core.dll` 一致才认），缺了只打一行 `dx12 debug layer: <path> not found - validation stays off` 并照常跑；设备创建失败会自动关掉调试层重试；`gameRestart()`。开关经专用 ABI `mcdr_dx12SetDebugLayer` 在设备创建前送达，不依赖环境变量 |
 | `profiling` | `false` | 逐帧/逐批次计时（对应已弃用的 `DX12_PROF=1` 环境变量）：记录、PSO 绑定、pass 提交的 CPU 毫秒 | 每批几次计时读取；`gameRestart()` 类的一次性读取 |
 | `dumpHlsl` | `false` | 把每次翻译出的 HLSL 落盘到游戏目录下 `dxrmc/hlsl/` | 最多 60 对；stage 行为异常时是唯一的现场 |
 | `skipGlSwap` | `false` | 让残留的 GL surface `present()` 变空操作 | 只在 `[renderer] glContext = true` 时才有意义 |

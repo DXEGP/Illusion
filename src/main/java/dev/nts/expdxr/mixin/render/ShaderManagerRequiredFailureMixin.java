@@ -34,9 +34,7 @@ public class ShaderManagerRequiredFailureMixin {
         Operation<RuntimeException> original) {
         RuntimeException thrown = original.call(message);
         if (message != null && message.startsWith(REQUIRED_PREFIX)) {
-            LOGGER.error("A required render pipeline failed to load and no pipeline cache is left for the render thread, which can only end in a black screen, so this is escalated to a crash."
-                + " The usual cause is that the build output is missing its shader resources:"
-                + " delete Illusion\\build\\resources\\main and re-run processResources.\n{}", message);
+            LOGGER.error("required pipeline failed, black screen: run processResources; {}", message);
             Minecraft minecraft = Minecraft.getInstance();
             if (minecraft != null) {
                 minecraft.delayCrash(CrashReport.forThrowable(thrown, "Loading required render pipelines"));

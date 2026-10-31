@@ -119,7 +119,9 @@ class D3D12IntermediaryShaderModule(
                         remainingSamplers.remove(entry.name)
                     }
                 }
-                D3D12BindGroupEntry.Type.TEXEL_BUFFER -> {
+                // RAW_BUFFER 是转换器接管后改写的条目类型，SPIR-V 侧仍是 texel buffer（dimensions=5）。
+                D3D12BindGroupEntry.Type.TEXEL_BUFFER,
+                D3D12BindGroupEntry.Type.RAW_BUFFER -> {
                     val sampler = this.getSampler(entry.name)
                     if (sampler != null) {
                         if (sampler.dimensions() != 5) {

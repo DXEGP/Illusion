@@ -66,9 +66,108 @@ enum class RtMode {
     FULL,
 }
 
-/** `[debug] meshDiagnostics` — one-shot isolation test for "texture write vs read-back". */
-enum class MeshDiagnostics {
+/**
+ * `[raytracing] backend` — which ray-tracing backend the path tracer drives.
+ *
+ * AUTO leaves the choice to the capability string: WG when its probes are green, DXR when inline
+ * ray queries are available, MEGA otherwise. The three backends produce the same image by
+ * contract, so this only picks a cost profile - picking a backend the machine cannot run falls
+ * back to the next one instead of failing.
+ */
+enum class RtBackend {
+    AUTO,
+
+    MEGA,
+
+    DXR,
+
+    WG,
+}
+
+/**
+ * `[raytracing] qualityProfile` — a named bundle of quality knobs.
+ *
+ * VALIDATION is the reproducible profile (1 spp, fixed seed, no temporal accumulation); BALANCED
+ * and QUALITY only change sampling parameters, never which passes run. A profile must never be
+ * able to skip a gate: see rt_plan.md §7.
+ */
+enum class RtQualityProfile {
+    VALIDATION,
+
+    BALANCED,
+
+    QUALITY,
+}
+
+/** `[raytracing] samplingMode` — how the next bounce direction is chosen. */
+enum class RtSamplingMode {
+    BSDF,
+
+    COSINE,
+
+    RESERVOIR,
+}
+
+/**
+ * `[raytracing] debugView` — which intermediate signal replaces the final image.
+ *
+ * The list grows with the passes that produce each signal; a view with no producer renders the
+ * MISSING colour instead of a black frame, so a half-built pipeline is still readable.
+ */
+enum class RtDebugView {
     NONE,
+
+    DEPTH,
+
+    NORMAL,
+
+    ALBEDO,
+
+    ROUGHNESS,
+
+    HIT_DISTANCE,
+
+    DIRECT,
+
+    INDIRECT,
+
+    CACHE_CONFIDENCE,
+
+    REACTIVE_MASK,
+
+    MOTION_VECTORS,
+
+    HISTORY_REJECTION,
+
+    TRAVERSAL_STEPS,
+
+    DUAL_TRACK,
+
+    GEOMETRY,
+
+    /** 加速结构的实例盒线框：确认 BLAS/TLAS 里的盒子就是几何池里的段。见 docs/rt/README.md 14.6 节 */
+    BLAS,
+}
+
+/**
+ * `[raytracing] denoise` — how the noisy path-traced image becomes a presentable one.
+ *
+ * The three named tracks trade coupling for control: `RR` hands denoise and upscale to one
+ * DLSS-D call at render resolution, `NRD_SR` denoises first and lets a separate super-resolution
+ * pass scale up, `MEGAKERNEL` is the un-denoised reference. See docs/rt/README.md §18.
+ */
+enum class RtDenoise {
+    OFF,
+
+    RR,
+
+    NRD_SR,
+
+    MEGAKERNEL,
+}
+
+/** `[debug] meshDiagnostics` — one-shot isolation test for "texture write vs read-back". */
+enum class MeshDiagnostics {    NONE,
 
     CLEAR,
 
@@ -118,6 +217,42 @@ object IllusionConfig {
 
     /** `[raytracing] mode` — see [RtMode]. */
     val RAYTRACING_MODE: ModConfigSpec.EnumValue<RtMode>
+
+    val RAYTRACING_BACKEND: ModConfigSpec.EnumValue<RtBackend>
+
+    /** `[raytracing] denoise` — see [RtDenoise]. */
+    val RAYTRACING_DENOISE: ModConfigSpec.EnumValue<RtDenoise>
+
+    /** `[raytracing] renderScale` — render resolution as a fraction of the display, in percent. */
+    val RAYTRACING_RENDER_SCALE: ModConfigSpec.IntValue
+
+    val RAYTRACING_QUALITY_PROFILE: ModConfigSpec.EnumValue<RtQualityProfile>
+
+    val RAYTRACING_SPP: ModConfigSpec.IntValue
+
+    val RAYTRACING_MAX_BOUNCES: ModConfigSpec.IntValue
+
+    val RAYTRACING_SAMPLING_MODE: ModConfigSpec.EnumValue<RtSamplingMode>
+
+    val RAYTRACING_VOXEL_TRUST_RADIUS: ModConfigSpec.DoubleValue
+
+    val RAYTRACING_HZB: ModConfigSpec.ConfigValue<Boolean>
+    val RAYTRACING_AS_TRACE: ModConfigSpec.ConfigValue<Boolean>
+
+    val RAYTRACING_HISTORY_FRAMES: ModConfigSpec.IntValue
+
+    val RAYTRACING_DEBUG_VIEW: ModConfigSpec.EnumValue<RtDebugView>
+
+    val RAYTRACING_INVALIDATION_LOG: ModConfigSpec.ConfigValue<Boolean>
+
+    /** `[materials] enabled` — 读每张精灵旁边的 labPBR `_s` / `_n` 贴图。 */
+    val MATERIALS_ENABLED: ModConfigSpec.ConfigValue<Boolean>
+
+    /** `[materials] packPath` — 直接读的材质包目录；空 = 用游戏里启用的资源包。 */
+    val MATERIALS_PACK_PATH: ModConfigSpec.ConfigValue<String>
+
+    /** `[shaderpack] active` — 当前生效的光影包名（空 = 无光影，光追保持关闭）。 */
+    val SHADERPACK_ACTIVE: ModConfigSpec.ConfigValue<String>
 
     /** `[renderer] sharpenAmount` — post-sharpen strength for DLAA/DLSS. */
     val SHARPEN_AMOUNT: ModConfigSpec.DoubleValue
@@ -189,6 +324,24 @@ object IllusionConfig {
     val NO_CRASH_POPUP: ModConfigSpec.BooleanValue
 
     val DUMP_HLSL: ModConfigSpec.BooleanValue
+
+    /** `[debug] shaderConverter` — convert every shader with the standalone DLL beside the shaderc chain. */
+    val SHADER_CONVERTER: ModConfigSpec.BooleanValue
+
+    /** `[debug] shaderConverterDll` — location of `illusion_shader.dll`, relative to the game directory. */
+    val SHADER_CONVERTER_DLL: ModConfigSpec.ConfigValue<String>
+
+    /**
+     * `[debug] shaderConverterPrimary` — render with the converter's HLSL where the host can match
+     * its bindings, falling back to the shaderc chain everywhere else.
+     */
+    val SHADER_CONVERTER_PRIMARY: ModConfigSpec.BooleanValue
+
+    /**
+     * `[debug] shaderConverterPipelines` — comma-separated pipeline id fragments that may render
+     * through the converter; empty means every pipeline that passes the binding check.
+     */
+    val SHADER_CONVERTER_PIPELINES: ModConfigSpec.ConfigValue<String>
 
     /** `[mesh] terrain` — the only terrain rasterization path (the IMR fallback was removed). */
     val MESH_TERRAIN: ModConfigSpec.BooleanValue
@@ -467,6 +620,187 @@ object IllusionConfig {
             .translation("dxr_mc.configuration.raytracing.mode")
             .defineEnum("mode", RtMode.OFF)
 
+        RAYTRACING_BACKEND = BUILDER
+            .comment(
+                "Which ray-tracing backend runs the path tracer (AUTO / MEGA / DXR / WG).",
+                "The three backends share one output contract, so this is a cost choice, not a",
+                "feature switch: a backend whose probes are not green is skipped and the next",
+                "one is used. AUTO picks WG when its probes pass, else DXR, else MEGA."
+            )
+            .translation("dxr_mc.configuration.raytracing.backend")
+            .defineEnum("backend", RtBackend.AUTO)
+
+        RAYTRACING_DENOISE = BUILDER
+            .comment(
+                "How the noisy image is denoised and upscaled (OFF / RR / NRD_SR / MEGAKERNEL).",
+                "RR couples denoise and upscale into one DLSS-D call at render resolution;",
+                "NRD_SR denoises first and upscales afterwards with the SR pass; MEGAKERNEL",
+                "keeps the raw path-traced frame as the reference to compare against.",
+                "Off by default: no denoiser is wired in yet, so every value but OFF and",
+                "MEGAKERNEL resolves to the raw frame."
+            )
+            .translation("dxr_mc.configuration.raytracing.denoise")
+            .defineEnum("denoise", RtDenoise.OFF)
+
+        RAYTRACING_RENDER_SCALE = BUILDER
+            .comment(
+                "Path-traced render resolution as a percentage of the display, 25 to 100.",
+                "Below 100 the trace targets and the G-buffer shrink together; the resolve pass",
+                "upscales to the display size. The denoise row of docs/rt/README.md §18 says",
+                "which track allows which value; MEGAKERNEL is the only track that ignores it."
+            )
+            .translation("dxr_mc.configuration.raytracing.render_scale")
+            .defineInRange("renderScale", 100, 25, 100)
+
+        RAYTRACING_QUALITY_PROFILE = BUILDER
+            .comment(
+                "Named bundle of sampling parameters (VALIDATION / BALANCED / QUALITY).",
+                "VALIDATION is the reproducible profile: 1 spp, fixed seed, no temporal",
+                "accumulation - the one CI compares against the CPU reference. The other two",
+                "only change sampling, never which passes run.",
+                "The B-Mega backend ignores this today: one bounce at 1 spp, no profile."
+            )
+            .translation("dxr_mc.configuration.raytracing.quality_profile")
+            .defineEnum("qualityProfile", RtQualityProfile.BALANCED)
+
+        RAYTRACING_SPP = BUILDER
+            .comment(
+                "Samples per pixel for the primary hit, 1 to 16.",
+                "1 is the validation profile; raising it trades frame time for noise. This is an",
+                "architecture limit, not a target: the resolver must stay correct at 1.",
+                "The B-Mega backend ignores this today and always traces 1 sample."
+            )
+            .translation("dxr_mc.configuration.raytracing.spp")
+            .defineInRange("spp", 1, 1, 16)
+
+        RAYTRACING_MAX_BOUNCES = BUILDER
+            .comment(
+                "Maximum path length (1 = direct lighting only, up to 8).",
+                "Bounce count is authored in the shader; this clamps it from the JVM side so a",
+                "lower value also lowers the recursion depth registered for the work graph.",
+                "The B-Mega backend ignores this today: its shader always takes one bounce."
+            )
+            .translation("dxr_mc.configuration.raytracing.max_bounces")
+            .defineInRange("maxBounces", 2, 1, 8)
+
+        RAYTRACING_SAMPLING_MODE = BUILDER
+            .comment(
+                "How the next bounce direction is chosen (BSDF / COSINE / RESERVOIR).",
+                "BSDF is the reference (importance sampled, correct PDF); COSINE trades accuracy",
+                "for cheaper shadowed diffuse; RESERVOIR is the spatiotemporal reuse path.",
+                "The B-Mega backend ignores this today and always samples the cosine lobe."
+            )
+            .translation("dxr_mc.configuration.raytracing.sampling_mode")
+            .defineEnum("samplingMode", RtSamplingMode.BSDF)
+
+        RAYTRACING_VOXEL_TRUST_RADIUS = BUILDER
+            .comment(
+                "How far, in blocks, the voxel track is trusted to be authoritative.",
+                "Only applies to geometry classes the capability matrix marks as expressible in",
+                "both tracks; inside the radius the voxel DDA answers, outside it the triangle",
+                "track does. 0 disables the voxel track entirely.",
+                "The B-Mega backend runs the triangle track only, so this has no effect yet."
+            )
+            .translation("dxr_mc.configuration.raytracing.voxel_trust_radius")
+            .defineInRange("voxelTrustRadius", 8.0, 0.0, 32.0)
+
+        RAYTRACING_AS_TRACE = BUILDER
+            .comment(
+                "Trace the compute path against the acceleration structure instead of the",
+                "mirrored section AABB.",
+                "Same kernel and same shading; only the visibility test changes, so the",
+                "image stays identical while traversal moves to hardware. Off by default:",
+                "the BLAS build costs a few hundred microseconds per frame."
+            )
+            .translation("dxr_mc.configuration.raytracing.as_trace")
+            .define("asTrace", false)
+
+        RAYTRACING_HZB = BUILDER
+            .comment(
+                "Cull ray-traced instances with last frame's depth pyramid.",
+                "Off by default: the first frame after a camera cut has no valid pyramid, and a",
+                "stale one shows up as popping geometry. Costs one pyramid build per frame.",
+                "No backend builds or culls with a depth pyramid yet."
+            )
+            .translation("dxr_mc.configuration.raytracing.hzb")
+            .define("hzb", false)
+
+        RAYTRACING_HISTORY_FRAMES = BUILDER
+            .comment(
+                "Upper bound on temporal history length, 1 to 64 frames.",
+                "The denoiser and the radiance cache both clamp to this; raising it sharpens",
+                "static scenes and lengthens the ghost after a cut. Invalidations ignore it.",
+                "Nothing consumes it yet: there is no denoiser and no radiance cache."
+            )
+            .translation("dxr_mc.configuration.raytracing.history_frames")
+            .defineInRange("historyFrames", 16, 1, 64)
+
+        RAYTRACING_DEBUG_VIEW = BUILDER
+            .comment(
+                "Replace the final image with one intermediate signal (OFF = normal output).",
+                "A view whose producer is not built yet shows the MISSING colour rather than a",
+                "black frame, so a partially built pipeline stays readable."
+            )
+            .translation("dxr_mc.configuration.raytracing.debug_view")
+            .defineEnum("debugView", RtDebugView.NONE)
+
+        RAYTRACING_INVALIDATION_LOG = BUILDER
+            .comment(
+                "Log every history invalidation with its reason and the pass that raised it.",
+                "Off by default: a camera cut floods the log. Turn it on when a ghost or a",
+                "stale frame shows up and the reason is not obvious.",
+                "Nothing produces history yet, so nothing is logged."
+            )
+            .translation("dxr_mc.configuration.raytracing.invalidation_log")
+            .define("invalidationLog", false)
+
+        BUILDER.pop()
+
+        BUILDER.comment(
+            "LabPBR material maps (`_s` smoothness/metal, `_n` normal) for ray-traced materials.",
+            "Empty `packPath` reads them from the resource packs enabled in-game, so a release",
+            "build ships no textures at all. A non-empty `packPath` reads that directory directly",
+            "(`assets/<namespace>/textures/<path>_s.png`), which is how a development checkout",
+            "links the material pack it keeps next to the shader packs instead of copying it."
+        ).translation("dxr_mc.configuration.materials").push("materials")
+
+        MATERIALS_ENABLED = BUILDER
+            .comment(
+                "Read `_s` / `_n` maps beside each texture and use them for roughness and metal.",
+                "Off keeps the built-in table: constant roughness, no metal (`_s` ignored)."
+            )
+            .translation("dxr_mc.configuration.materials.enabled")
+            .define("enabled", true)
+
+        MATERIALS_PACK_PATH = BUILDER
+            .comment(
+                "Directory of a resource pack to read material maps from; empty = enabled packs.",
+                "Absolute, or relative to the game directory. Nothing is copied: the path is read",
+                "as-is, so the development client can point straight at its own pack folder."
+            )
+            .translation("dxr_mc.configuration.materials.pack_path")
+            .define("packPath", "")
+
+        BUILDER.pop()
+
+        BUILDER.comment(
+            "Shader pack selection (the shader pack screen writes this).",
+            "A user pack lives in `dxrmc/shaderpacks/<name>/shaders/`; bundled packs ship inside",
+            "the jar. Only the ray-tracing HLSL comes from the pack, and a pack runs only when it",
+            "carries every entry point the backend builds. Empty means no pack: ray tracing stays",
+            "off."
+        ).translation("dxr_mc.configuration.shaderpack").push("shaderpack")
+
+        SHADERPACK_ACTIVE = BUILDER
+            .comment(
+                "Name of the shader pack that supplies the ray-tracing HLSL.",
+                "Applying a pack also sets `[raytracing] backend` to MEGA; applying `none` puts it",
+                "back to AUTO. Pipelines keep the bytecode they were built with, so the change",
+                "lands on the next world load."
+            )
+            .translation("dxr_mc.configuration.shaderpack.active")
+            .define("active", "B-Mega")
+
         BUILDER.pop()
 
         BUILDER.comment(
@@ -622,8 +956,10 @@ object IllusionConfig {
         DEBUG_LAYER = BUILDER
             .comment(
                 "Create the device with the Direct3D 12 debug layer attached.",
-                "Lets the SDK validate every call at a large frame-rate cost; ignored when the",
-                "Agility SDK's D3D12Core is in use (the inbox validation layer would not match)."
+                "Lets the SDK validate every call at a large frame-rate cost. Needs a",
+                "`d3d12SDKLayers.dll` of the same version as `D3D12Core.dll` next to it",
+                "(vcpkg `installed\\x64-windows\\debug\\bin\\`); without one the log says",
+                "`dx12 debug layer: <path> not found - validation stays off` and the game runs."
             )
             .translation("dxr_mc.configuration.debug.debugLayer")
             .gameRestart()
@@ -646,6 +982,46 @@ object IllusionConfig {
             )
             .translation("dxr_mc.configuration.debug.dumpHlsl")
             .define("dumpHlsl", false)
+
+        SHADER_CONVERTER = BUILDER
+            .comment(
+                "Convert every shader with the standalone GLSL -> HLSL converter (illusion_shader.dll)",
+                "beside the shaderc + SPIRV-Cross chain, and record how each one converts.",
+                "The host keeps rendering through the old chain, so this produces evidence only:",
+                "per-shader success, the manifest resource counts and the HLSL under `dxrmc/converter/`.",
+                "This is the first step of moving the shader pipeline onto that converter."
+            )
+            .translation("dxr_mc.configuration.debug.shaderConverter")
+            .define("shaderConverter", false)
+
+        SHADER_CONVERTER_DLL = BUILDER
+            .comment(
+                "Where `illusion_shader.dll` sits, relative to the game directory.",
+                "Build it with `cargo build --release` in Illusion-shaders-extension and copy",
+                "`target/release/illusion_shader.dll` to `dxrmc/`."
+            )
+            .translation("dxr_mc.configuration.debug.shaderConverterDll")
+            .define("shaderConverterDll", "dxrmc/illusion_shader.dll")
+
+        SHADER_CONVERTER_PRIMARY = BUILDER
+            .comment(
+                "Render with the converter's HLSL instead of SPIRV-Cross output.",
+                "Only pipelines whose resource names and registers line up with the host's binding",
+                "list are switched; everything else - Y-flipped passes, mesh variants, texel",
+                "buffers, unknown resources - keeps using the old chain, so an unsupported",
+                "pipeline degrades to the previous behaviour instead of failing."
+            )
+            .translation("dxr_mc.configuration.debug.shaderConverterPrimary")
+            .define("shaderConverterPrimary", false)
+
+        SHADER_CONVERTER_PIPELINES = BUILDER
+            .comment(
+                "Comma-separated pipeline id fragments allowed to use the converter for rendering",
+                "(for example `position,gui`). Empty means every pipeline that passes the",
+                "resource check. Use it to try one pipeline at a time during visual verification."
+            )
+            .translation("dxr_mc.configuration.debug.shaderConverterPipelines")
+            .define("shaderConverterPipelines", "")
 
         SKIP_GL_SWAP = BUILDER
             .comment(

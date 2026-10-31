@@ -352,7 +352,7 @@ object D3D12Velocity {
             this.depthViewFor = handle
             abandonedSteps = abandonedSteps and STEP_DEPTH_VIEW.inv()
             // SLF4J only understands `{}`; `{:#x}` degrades into a placeholder-count warning.
-            LOGGER.info("velocity: depth SRV view created for texture {} (fmt={})",
+            LOGGER.info("velocity: depth SRV for {} (fmt={})",
                 handle.toULong().toString(16), depth.format)
             true
         } catch (t: Throwable) {
@@ -385,7 +385,7 @@ object D3D12Velocity {
         }
         this.pipeline = handle
         abandonedSteps = abandonedSteps and STEP_PIPELINE.inv()
-        LOGGER.info("velocity: pipeline compiled (handle={})", handle.toULong().toString(16))
+        LOGGER.debug("velocity: pipeline compiled")
         return true
     }
 

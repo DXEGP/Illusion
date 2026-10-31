@@ -417,6 +417,91 @@ sourceSets.named("main") {
 }
 
 // ---------------------------------------------------------------------------
+// stageShaders — 把光影包里的 HLSL 装进 mod resources
+// ---------------------------------------------------------------------------
+// 着色器源码不在 Kotlin 里：每个包在 `Illusion-HPT-Shaders\<包名>\shaders\`，它们 include 的两处公共头
+// 分别在 `Illusion-shaders-extension\shaders\include\`（采样契约）与
+// `Illusion-HPT-Shaders\WorkGraph-Advanced\shaders\include\`（颜色/数学）。这里把每个包摊平拷到
+// `build/generated/shaders/assets/dxr_mc/shaders/<包名>/shaders/` 并挂成资源 srcDir，宿主按
+// `<包名>/shaders/mega_trace.hlsl` 从 classpath 读，包清单写进同级的 `packs.txt`。
+//
+// 只有顶层带 `.hlsl` 的目录才算光影包：纯 include 目录（WorkGraph-Advanced）与 GLSL 参考包会跳过。
+// 和 copyNative 一样 NEVER fails：光影包是独立目录，缺它时构建要能过（运行时建不出光追管线，
+// D3D12RtShaderSources 会列出找过的路径）。运行时还支持 `<工作目录>/dxrmc/shaderpacks/`
+// （整包覆盖）与 `<工作目录>/dxrmc/shaders/`（单文件覆盖）。
+val shaderPacksRoot = file("../Illusion-HPT-Shaders")
+val shaderContractDir = file("../Illusion-shaders-extension/shaders/include")
+val shaderCommonDir = file("../Illusion-HPT-Shaders/WorkGraph-Advanced/shaders/include")
+
+val stageShaders = tasks.register("stageShaders") {
+    group = "build"
+    description = "Stages every shaderpack into assets/dxr_mc/shaders so the mod JAR carries working defaults."
+    // 同 copyNative：动作里要用的值全部按值捕获，避免 configuration cache 序列化脚本对象。
+    val outRoot = layout.buildDirectory.dir("generated/shaders").get().asFile
+    val packsRoot: File = shaderPacksRoot
+    val contractDir: File = shaderContractDir
+    val commonDir: File = shaderCommonDir
+    outputs.dir(outRoot)
+    outputs.upToDateWhen { false }
+    doLast {
+        try {
+            // 整个 outRoot 先清掉：上一轮的旧目录（例如以前的 rt/、已改名的包）不能留在 jar 里。
+            outRoot.deleteRecursively()
+            val staged = File(outRoot, "assets/dxr_mc/shaders")
+            staged.mkdirs()
+            val packs = ArrayList<String>()
+            packsRoot.listFiles().orEmpty()
+                .filter { it.isDirectory && File(it, "shaders").isDirectory }
+                .sortedBy { it.name.lowercase() }
+                .forEach { pack ->
+                    val source = File(pack, "shaders")
+                    val files = source.listFiles().orEmpty()
+                        .filter { it.isFile && it.extension in setOf("hlsl", "hlsli") }
+                    // 判据是顶层有 .hlsl 入口；只有 include 的目录不是光影包。
+                    if (files.none { it.extension == "hlsl" }) {
+                        logger.info("[stageShaders] ${pack.name}: no .hlsl entry, not a shaderpack")
+                        return@forEach
+                    }
+                    val target = File(staged, "${pack.name}/shaders")
+                    target.mkdirs()
+                    files.forEach { it.copyTo(File(target, it.name), overwrite = true) }
+                    // pack.json 是显示名/说明，configs.json 是包自己声明的设置项（界面按它出控件）。
+                    listOf("pack.json", "configs.json").forEach { name ->
+                        File(source, name).takeIf { it.isFile }
+                            ?.copyTo(File(target, name), overwrite = true)
+                    }
+                    // 两处公共头摊平到包自己的 include/：宿主只认同目录与 include/ 两层。
+                    val includeDir = File(target, "include")
+                    includeDir.mkdirs()
+                    listOf(contractDir, commonDir).forEach { dir ->
+                        if (!dir.isDirectory) {
+                            logger.warn("[stageShaders] include dir missing: $dir")
+                            return@forEach
+                        }
+                        dir.listFiles().orEmpty().filter { it.isFile && it.extension == "hlsli" }.forEach {
+                            it.copyTo(File(includeDir, it.name), overwrite = true)
+                        }
+                    }
+                    packs += pack.name
+                    logger.lifecycle("[stageShaders] ${pack.name}: ${files.size} file(s) -> $target")
+                }
+            if (packs.isEmpty()) {
+                logger.warn("[stageShaders] no shaderpack staged; the RT pipeline will report a missing shader source")
+            }
+            // 清单：D3D12ShaderPacks 照它列 jar 内置的包；B-Mega 排在最前（默认包）。
+            val ordered = packs.sortedBy { if (it == "B-Mega") 0 else 1 }
+            File(staged, "packs.txt").writeText(ordered.joinToString("\n", postfix = "\n"))
+            logger.lifecycle("[stageShaders] packs: ${ordered.joinToString()}")
+        } catch (t: Throwable) {
+            logger.warn("[stageShaders] skipped: $t")
+        }
+    }
+}
+sourceSets.named("main") {
+    resources.srcDir(stageShaders)
+}
+
+// ---------------------------------------------------------------------------
 // Third-party SDK runtimes: what ships inside the JAR, and what does not
 // ---------------------------------------------------------------------------
 // MCDR_ABI.extractLibrary() writes MCDR.dll into `<user.dir>/dxrmc/`, and the
@@ -960,3 +1045,5 @@ idea {
     module.isDownloadSources = true
     module.isDownloadJavadoc = true
 }
+
+

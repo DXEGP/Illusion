@@ -274,17 +274,14 @@ object DeepLearningSuperSampling {
             status == value -> Illusion.LOGGER.info(
                 "DLSS quality = {}", QUALITY_NAMES[value])
             status == -1 -> Illusion.LOGGER.warn(
-                "mcdr_dx12SetDlssQuality({}) was rejected (-1: out of range)", value)
+                "mcdr_dx12SetDlssQuality({}) rejected: -1 out of range", value)
             status == Int.MIN_VALUE -> if (!loggedQualityUnsupported) {
                 loggedQualityUnsupported = true
                 Illusion.LOGGER.info(
-                    "the loaded MCDR.dll has no mcdr_dx12SetDlssQuality, so the "
-                        + "Performance/Balanced/Quality button is remembered but native keeps picking "
-                        + "the quality level from the render ratio")
+                    "MCDR.dll lacks mcdr_dx12SetDlssQuality; saved, ignored")
             }
             else -> Illusion.LOGGER.warn(
-                "mcdr_dx12SetDlssQuality({}) returned {} (expected the tier back, "
-                    + "or -1 when out of range)", value, status)
+                "mcdr_dx12SetDlssQuality({}) returned {} (want tier or -1)", value, status)
         }
         // 挡位决定输入比例，渲染缩放跟着走（只在上采样开着时）。
         bindRenderScaleToDlss(value)
@@ -345,18 +342,15 @@ object DeepLearningSuperSampling {
                 "DLSS model preset = {} (NGX render preset {})",
                 PRESET_NAMES[index], value)
             status == -1 -> Illusion.LOGGER.warn(
-                "mcdr_dx12SetDlssRenderPreset({}) was rejected (-1: out of range)",
+                "mcdr_dx12SetDlssRenderPreset({}) rejected: -1 out of range",
                 value)
             status == Int.MIN_VALUE -> if (!loggedPresetUnsupported) {
                 loggedPresetUnsupported = true
                 Illusion.LOGGER.info(
-                    "the loaded MCDR.dll has no mcdr_dx12SetDlssRenderPreset, so "
-                        + "the DLSS model button is remembered but native keeps NGX's own per-tier "
-                        + "preset")
+                    "MCDR.dll lacks mcdr_dx12SetDlssRenderPreset; model ignored")
             }
             else -> Illusion.LOGGER.warn(
-                "mcdr_dx12SetDlssRenderPreset({}) returned {} (expected the preset "
-                    + "back, or -1 when out of range)", value, status)
+                "mcdr_dx12SetDlssRenderPreset({}) returned {} (want preset)", value, status)
         }
     }
 
@@ -420,23 +414,18 @@ object DeepLearningSuperSampling {
             val pinned = D3D12RenderScale.percent()
             if (pinned != 100) {
                 Illusion.LOGGER.warn(
-                    "DLAA lock did not pin the render scale to 100% (got {}%); "
-                        + "native will accept one downgrade and self-heal when the scale reaches 100%",
+                    "DLAA lock missed 100% (got {}%); native self-heals at 100%",
                     pinned,
                 )
             }
             pushForcedQuality(DLAA_QUALITY)
             Illusion.LOGGER.info(
-                "DLAA engaged: anti-aliasing = DLAA, render scale pinned to 100% "
-                    + "(render == target is required), DLSS feature requested at the DLAA tier. "
-                    + "the projection carries the same Halton jitter sequence as TAA now, "
-                    + "so NGX gets real sub-pixel samples (InJitterOffset + MVJittered) instead of "
-                    + "the jitter-free accumulation this path used to fall back to.")
+                "DLAA on: quality tier 3, render scale pinned to 100%")
         } else {
             // 还原用户自己选的挡位；缩放缓条由 setDlaaLock(false) 恢复到锁定前的用户值。
             pushForcedQuality(QUALITY_OPTION.get())
             Illusion.LOGGER.info(
-                "DLAA released: quality back to the user's own tier ({})",
+                "DLAA released: quality back to {}",
                 QUALITY_NAMES[QUALITY_OPTION.get()])
             // 退出 DLAA 后 DLSS 是否该开交回独立开关；DLAA 期间的 100% 会写进记忆键，这里显式按当前挡位重绑一次。
             bindRenderScaleToDlss()
@@ -453,12 +442,11 @@ object DeepLearningSuperSampling {
             // 契约：返回的是**调用后的状态**（1=开 / 0=关），0 不是错误（见 [push] 的说明）。
             when (val status = MCDR_ABI.D3D12SetDlssEnabled(flag)) {
                 1 -> if (!enabled) Illusion.LOGGER.warn(
-                    "asked to open the DLSS gate for DLAA but native reports it is off")
+                    "DLAA gate: asked off, native reports on")
                 0 -> if (enabled) Illusion.LOGGER.warn(
-                    "asked to open the DLSS gate for DLAA but native reports it is off")
+                    "DLAA gate: asked on, native reports off")
                 Int.MIN_VALUE -> Illusion.LOGGER.info(
-                    "the loaded MCDR.dll has no mcdr_dx12SetDlssEnabled; "
-                        + "DLAA relies on the legacy aaMode bridge")
+                    "MCDR.dll lacks mcdr_dx12SetDlssEnabled; aaMode bridge")
                 else -> Illusion.LOGGER.warn(
                     "mcdr_dx12SetDlssEnabled({}) returned {}", flag, status)
             }
@@ -476,13 +464,11 @@ object DeepLearningSuperSampling {
                 status == value -> Illusion.LOGGER.info(
                     "DLSS quality = {}", QUALITY_NAMES.getOrElse(value) { "DLAA" })
                 status == -1 -> Illusion.LOGGER.warn(
-                    "mcdr_dx12SetDlssQuality({}) was rejected (-1: out of range)", value)
+                    "mcdr_dx12SetDlssQuality({}) rejected: -1 out of range", value)
                 status == Int.MIN_VALUE -> Illusion.LOGGER.info(
-                    "the loaded MCDR.dll has no mcdr_dx12SetDlssQuality; the "
-                        + "quality tier stays whatever native picked")
+                    "MCDR.dll lacks mcdr_dx12SetDlssQuality; native picks")
                 else -> Illusion.LOGGER.warn(
-                    "mcdr_dx12SetDlssQuality({}) returned {} (expected the tier back, "
-                        + "or -1 when out of range)", value, status)
+                    "mcdr_dx12SetDlssQuality({}) returned {} (want tier or -1)", value, status)
             }
         } catch (t: Throwable) {
             Illusion.LOGGER.warn("pushing DLSS quality {} threw: {}", value, t)
@@ -505,11 +491,10 @@ object DeepLearningSuperSampling {
         when (val status = MCDR_ABI.D3D12SetDlssEnabled(flag)) {
             1 -> Illusion.LOGGER.info("DLSS upscaling = on")
             0 -> Illusion.LOGGER.info(
-                "DLSS upscaling = off (the world layer goes through the linear blit)")
+                "DLSS upscaling off, world layer uses linear blit")
             Int.MIN_VALUE -> legacyPush(enabled)
             else -> Illusion.LOGGER.warn(
-                "mcdr_dx12SetDlssEnabled({}) returned {} (expected the post-call "
-                    + "state: 1 = on, 0 = off)", flag, status)
+                "mcdr_dx12SetDlssEnabled({}) returned {} (1=on, 0=off)", flag, status)
         }
         // 渲染缩放的有效集合随开关切换（关 25..400 步进 25、开 50..90 步进 10），两种模式各自记住并持久化。
         D3D12RenderScale.setDlssMode(enabled)
@@ -539,9 +524,7 @@ object DeepLearningSuperSampling {
         legacyAaObserved = D3D12AntiAliasing.current()
         if (enabled) {
             MCDR_ABI.D3D12SetAntiAliasing(LEGACY_DLSS_AA_MODE)
-            Illusion.LOGGER.warn("the loaded MCDR.dll has no mcdr_dx12SetDlssEnabled "
-                + "(the DLL predates this), so DLSS goes through the legacy aaMode == 4 path; SMAA cannot "
-                + "run at the same time on that DLL")
+            Illusion.LOGGER.warn("MCDR.dll lacks mcdr_dx12SetDlssEnabled; aaMode 4, no SMAA")
         } else {
             MCDR_ABI.D3D12SetAntiAliasing(
                 if (legacyAaObserved == D3D12AntiAliasing.SMAA) D3D12AntiAliasing.SMAA
@@ -707,7 +690,7 @@ object DeepLearningSuperSampling {
     private fun snapshotDlssDepth(encoder: D3D12CommandEncoderBackend, minecraft: Minecraft) {
         val depth = minecraft.gameRenderer.mainRenderTarget().depthTexture as? D3D12GpuTexture
         if (depth == null || depth.isClosed()) {
-            noteDepthSnapshot("the main render target has no D3D12 depth texture")
+            noteDepthSnapshot("no D3D12 depth texture")
             return
         }
         val result = try {
@@ -716,20 +699,16 @@ object DeepLearningSuperSampling {
             noteDepthSnapshot("dx12SnapshotDlssDepth threw: $t", true)
             return
         }
-        p206Counter++
-        if (p206Counter % 120 == 0) {
+        evaluateResultLogCounter++
+        if (evaluateResultLogCounter % 120 == 0) {
             IllusionLogger.debugMessage("evaluate result=".format(Locale.ROOT) + result.toString())
         }
         when (result) {
-            1 -> noteDepthSnapshot("captured this frame's world depth into the native D32 snapshot; "
-                + "the DLSS evaluation later this frame uses it instead of the depth vanilla clears")
-            0 -> noteDepthSnapshot("native skipped the snapshot (unusable arguments); DLSS falls back "
-                + "to the JVM-supplied depth")
-            -1 -> noteDepthSnapshot("native could not create/copy the snapshot; DLSS falls back to the "
-                + "JVM-supplied depth", true)
-            Int.MIN_VALUE -> noteDepthSnapshot("the loaded MCDR.dll has no mcdr_dx12SnapshotDlssDepth "
-                + "(it predates this export), so the depth vanilla clears is used instead")
-            else -> noteDepthSnapshot("dx12SnapshotDlssDepth returned an unexpected value $result", true)
+            1 -> noteDepthSnapshot("captured into native D32 snapshot")
+            0 -> noteDepthSnapshot("native skipped (bad args); JVM depth used")
+            -1 -> noteDepthSnapshot("create/copy failed; JVM depth used", true)
+            Int.MIN_VALUE -> noteDepthSnapshot("MCDR.dll lacks mcdr_dx12SnapshotDlssDepth; JVM depth used")
+            else -> noteDepthSnapshot("dx12SnapshotDlssDepth returned $result", true)
         }
     }
 
@@ -759,16 +738,11 @@ object DeepLearningSuperSampling {
             loggedHandoverMode = enabled
             if (enabled) {
                 Illusion.LOGGER.info(
-                    "DLSS output handover is ON ({}={}): the JVM builds a "
-                        + "target-sized UAV texture and native writes NGX's output into it. If "
-                        + "this ever makes the world black, check that the handover succeeded and "
-                        + "that native reports 'Evaluate succeeded' (the blit is only skipped then).",
+                    "DLSS handover on ({}={}): native writes NGX into JVM UAV",
                     "outputHandover", enabled)
             } else {
                 Illusion.LOGGER.warn(
-                    "DLSS output handover is OFF ({}={}): native falls back to its "
-                        + "own private UAV, which cannot be written on this machine, so DLSS will "
-                        + "have no visible effect. This is a troubleshooting setting only.",
+                    "DLSS handover off ({}={}): private UAV, no effect",
                     "outputHandover", enabled)
             }
         }
@@ -861,8 +835,7 @@ object DeepLearningSuperSampling {
                     if (!reportedBelowNominal) {
                         reportedBelowNominal = true
                         Illusion.LOGGER.warn(
-                            "render scale {}% is below what tier {} needs ({}%); raising it, " +
-                                "otherwise NGX rejects the frame and the world goes black",
+                            "render scale {}% below tier {} minimum ({}%); raising",
                             currentPercent, QUALITY_NAMES[quality()], nominalPercent,
                         )
                     }
@@ -876,12 +849,12 @@ object DeepLearningSuperSampling {
 
         val renderTarget = minecraft.gameRenderer.mainRenderTarget()
         val color = (renderTarget.colorTextureView as? D3D12GpuTextureView)?.texture() as? D3D12GpuTexture
-            ?: return noteState("the world layer is not a D3D12 texture")
+            ?: return noteState("world layer is not a D3D12 texture")
         val depth = renderTarget.depthTexture as? D3D12GpuTexture
-            ?: return noteState("the main render target has no D3D12 depth texture")
+            ?: return noteState("no D3D12 depth texture")
         // 世界切换时主目标整批重建，旧纹理可能已被释放；把句柄交给 native 会在 `GetDesc()` 上撞野指针。
         if (color.isClosed() || depth.isClosed()) {
-            return noteState("the world layer's color/depth was released this frame (world transition)")
+            return noteState("color/depth released this frame")
         }
         // pInOutput：`targetForFrame()` 在 renderScale == 100% 时返回 null，而 NGX 要求输入输出是两张资源。
         // DLAA 正是 100%：取主目标颜色纹理，native 重定向到交接的 target 尺寸纹理，评价完再拷回。
@@ -911,8 +884,7 @@ object DeepLearningSuperSampling {
         val targetWidth = output.getWidth(0)
         val targetHeight = output.getHeight(0)
         if (renderWidth <= 0 || renderHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
-            return noteState("degenerate sizes: render ${renderWidth}x${renderHeight}, "
-                + "target ${targetWidth}x${targetHeight}")
+            return noteState("sizes ${renderWidth}x$renderHeight -> ${targetWidth}x$targetHeight")
         }
 
         D3D12Temporal.adoptPhaseCount(
@@ -936,8 +908,7 @@ object DeepLearningSuperSampling {
         encoder.recordVelocityPass()
         val motionVectors = D3D12Velocity.currentHandle()
         if (motionVectors == 0L) {
-            return noteState("no motion-vector texture (the velocity pass has no history yet on the "
-                + "frame DLSS is switched on, or it disabled itself - see the velocity log)")
+            return noteState("velocity pass has no history yet")
         }
 
         val jitter = D3D12Temporal.jitter()
@@ -945,8 +916,8 @@ object DeepLearningSuperSampling {
         val window = minecraft.window
         val resetReason = resetReason(level, renderWidth, renderHeight, targetWidth, targetHeight,
             scalePercent, window.width, window.height)
-        p205Counter++
-        if (p205Counter % 120 == 0) {
+        frameLogCounter++
+        if (frameLogCounter % 120 == 0) {
             IllusionLogger.debugMessage(
                 ("render=%dx%d target=%dx%d window=%dx%d scale=%d%% reset=%s "
                     + "jitter=(%.4f, %.4f) frameNs=%d once=%s")
@@ -976,8 +947,8 @@ object DeepLearningSuperSampling {
         } catch (t: Throwable) {
             return disable("dx12EvaluateDlss threw: $t")
         }
-        p206Counter++
-        if (p206Counter % 120 == 0) {
+        evaluateResultLogCounter++
+        if (evaluateResultLogCounter % 120 == 0) {
             IllusionLogger.debugMessage("evaluate result=".format(Locale.ROOT) + result.toString())
         }
         when (result) {
@@ -992,28 +963,24 @@ object DeepLearningSuperSampling {
             // 0 = native 自己跳过（模式/尺寸/特征未就绪），它已打过自己的 WARN；这里只在状态变化时报一行。
             0 -> {
                 countEvaluateFailure()
-                noteState("native skipped this frame (feature not ready, or the sizes changed "
-                    + "without a successful create)")
+                noteState("feature not ready or size changed")
             }
             // 2 = 结果落在 native 私有纹理上：prepareForGui 必须继续 blit，否则界面目标里没有世界内容（世界全黑、GUI 正常）。
             2 -> {
                 countEvaluateFailure()
-                noteState("DLSS evaluated into its private output texture (the JVM hand-over " 
-                    + "texture was rejected); keeping the linear blit so the world stays visible")
+                noteState("private output used; handover rejected, blit kept")
             }
             -1 -> {
                 countEvaluateFailure()
-                noteProblem("native rejected the input packet (-1: invalid arguments). "
-                    + "Resource states are left untouched this frame")
+                noteProblem("packet rejected (-1: invalid args), states untouched")
             }
             Int.MIN_VALUE -> {
                 countEvaluateFailure()
-                noteProblem("the loaded MCDR.dll has no mcdr_dx12EvaluateDlss "
-                    + "(the DLL predates this); DLSS stays off until a matching DLL is in place")
+                noteProblem("MCDR.dll lacks mcdr_dx12EvaluateDlss")
             }
             else -> {
                 countEvaluateFailure()
-                noteProblem("dx12EvaluateDlss returned an unexpected value $result")
+                noteProblem("dx12EvaluateDlss returned $result")
             }
         }
     }
@@ -1085,9 +1052,7 @@ object DeepLearningSuperSampling {
         }
         handoverSkipNoteShown = true
         Illusion.LOGGER.warn(
-            "handover did not take effect this frame, so the world layer is still "
-                + "blitted by prepareForGui (no black screen). DLSS keeps evaluating; this line "
-                + "appears once per streak.")
+            "handover missed: world layer still blitted, no black")
     }
 
     /** evaluate 连续失败计数：失败帧不会 `markWorldLayerDone()`，画面不会黑；连败超阈值时打一行限流 WARN。 */
@@ -1117,9 +1082,7 @@ object DeepLearningSuperSampling {
         handoverSkipNoteShown = false
         if (consecutiveEvaluateFailures == EVALUATE_FAILURE_WARN_THRESHOLD) {
             Illusion.LOGGER.error(
-                "DLSS has failed to evaluate {} frames in a row; the world layer "
-                    + "is being blitted every frame instead (this is the safe path, not a crash). "
-                    + "Set [logging] logLevel = INFO in config/dxr_mc-client.toml to see the DLSS reason.",
+                "DLSS evaluate failed {} frames; blit path, logLevel=INFO",
                 consecutiveEvaluateFailures)
         }
     }
@@ -1141,18 +1104,16 @@ object DeepLearningSuperSampling {
         lastState = STATUS_EVALUATED
         if (resetReason != null) {
             Illusion.LOGGER.info(
-                "reset=1 this frame - {} (render {}x{} -> target {}x{})",
+                "reset=1 {} ({}x{} -> {}x{})",
                 resetReason, renderWidth, renderHeight, targetWidth, targetHeight)
         }
         if (!loggedFed) {
             loggedFed = true
             // near/far 的降级说明只跟"第一次真的喂进去"一起出现一次。
             Illusion.LOGGER.info(
-                "near/far are not reachable from the JVM side, so 0.0 is reported "
-                    + "for both; native only writes them into its own DLSS diagnostic line")
+                "near/far unavailable from JVM: 0.0 sent to native")
             Illusion.LOGGER.info(
-                "DLSS inputs fed - render {}x{} -> target {}x{} jitter=({}, {}) "
-                    + "mvScale={} near={} far={} depthInverted=1 ngx={}",
+                "dlss {}x{}->{}x{} jit=({}, {}) mv={} near={} far={} ngx={}",
                 renderWidth, renderHeight, targetWidth, targetHeight, jitterX, jitterY,
                 MV_SCALE, NEAR_Z, FAR_Z, ngxSummary)
         }
@@ -1191,15 +1152,14 @@ object DeepLearningSuperSampling {
         }
         if (!MCDR_ABI.dx12BlitTextureToTexture(encoder.nativeHandle(), scratch.handle(),
                 target.handle())) {
-            noteState("post-sharpen: the blit back into the output target failed; the frame keeps "
-                + "the unsharpenened DLSS output")
+            noteState("post-sharpen blit failed; unsharpened output kept")
         }
     }
 
     @Volatile
-    private var p203Counter: Int = 0
-    private var p205Counter: Int = 0
-    private var p206Counter: Int = 0
+    private var jitterLogCounter: Int = 0
+    private var frameLogCounter: Int = 0
+    private var evaluateResultLogCounter: Int = 0
 
     /** 上报给 DLSS/DLAA 的像素空间 jitter 必须是 `(+Jx, -Jy)`：实机 A/B 定案，其余符号组合都会让静止画面持续轻晃。 */
     private fun reportedJitter(jx: Float, jy: Float): FloatArray = floatArrayOf(jx, -jy)
@@ -1258,12 +1218,12 @@ object DeepLearningSuperSampling {
             val reported = reportedJitter(jitterX, jitterY)
             val slJitterX = reported[0]
             val slJitterY = reported[1]
-            p203Counter++
-            if (p203Counter % 120 == 0) {
+            jitterLogCounter++
+            if (jitterLogCounter % 120 == 0) {
                 val injected = D3D12Temporal.injectedJitter()
                 // String.format 只认 %s/%f，写 `{}` 只会打出字面量。
                 IllusionLogger.debugMessage(
-                    "jitter current=(%.4f, %.4f) injected=(%.4f, %.4f) reported=(%.4f, %.4f) mismatch=%s"
+                    "jit %.4f,%.4f inj %.4f,%.4f rep %.4f,%.4f mism %s"
                         .format(
                             Locale.ROOT,
                             jitterX, jitterY,
@@ -1363,15 +1323,13 @@ object DeepLearningSuperSampling {
             D3D12Temporal.enabled = true
             forcedTemporal = true
             Illusion.LOGGER.info(
-                "DLSS needs the temporal data plane: sub-pixel projection jitter "
-                    + "(dxrmc.temporal) is switched on while DLSS is selected")
+                "DLSS needs jitter: forcing dxrmc.temporal")
         }
         if (!D3D12Velocity.enabled) {
             D3D12Velocity.enabled = true
             forcedVelocity = true
             Illusion.LOGGER.info(
-                "DLSS needs motion vectors: the velocity pass "
-                    + "(dxrmc.temporal.velocity) is switched on while DLSS is selected")
+                "DLSS needs motion vectors: forcing dxrmc.temporal.velocity")
         }
     }
 
@@ -1417,14 +1375,12 @@ object DeepLearningSuperSampling {
                 forcedVelocity = false
                 D3D12Velocity.enabled = false
             }
-            Illusion.LOGGER.info("DLSS is no longer selected: the temporal data plane "
-                + "it had switched on is back to off")
+            Illusion.LOGGER.info("DLSS off: dxrmc.temporal restored to off")
         } else if (forcedVelocity) {
             forcedVelocity = false
             D3D12Velocity.reset()
             D3D12Velocity.enabled = false
-            Illusion.LOGGER.info("DLSS is no longer selected: the velocity pass it had "
-                + "switched on is back to off")
+            Illusion.LOGGER.info("DLSS off: dxrmc.temporal.velocity restored to off")
         }
     }
 
@@ -1492,8 +1448,7 @@ object DeepLearningSuperSampling {
         if (available) {
             Illusion.LOGGER.info("DLSS is available: {}", text)
         } else {
-            Illusion.LOGGER.warn("DLSS cannot run on this machine; the world layer "
-                + "keeps going through the linear blit: {}", text)
+            Illusion.LOGGER.warn("DLSS unavailable, world layer uses linear blit: {}", text)
         }
         return available
     }
@@ -1584,7 +1539,7 @@ object DeepLearningSuperSampling {
             return
         }
         broken = true
-        Illusion.LOGGER.error("DLSS input feeding is disabled for this session: {}", reason)
+        Illusion.LOGGER.error("DLSS input feeding disabled: {}", reason)
     }
 }
 

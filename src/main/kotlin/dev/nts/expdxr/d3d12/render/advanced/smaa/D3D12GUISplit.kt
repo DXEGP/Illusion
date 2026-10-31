@@ -129,7 +129,7 @@ object D3D12GUISplit {
         }
         hudlessArmed = next
         Illusion.LOGGER.info(
-            "hudless presentation {} - presenting {}, the GUI is {}",
+            "hudless {}; presenting {}, GUI {}",
             if (next) "on" else "off",
             if (next) "the world layer only" else "the world + GUI composite",
             if (next) "composed by the frame generation backend" else "drawn by us into the presented image")
@@ -143,8 +143,7 @@ object D3D12GUISplit {
         if (now - lastNotReadyLogNanos < NOT_READY_LOG_INTERVAL_NANOS) return
         lastNotReadyLogNanos = now
         Illusion.LOGGER.info(
-            "hudless presentation wanted, but the frame generation backend is not composing yet " +
-                "(fg state={}, backend={}) - keeping the world + GUI composite",
+            "hudless wanted; FG idle ({} / {}), composite kept",
             MCDR_ABI.D3D12FgState(),
             FrameGeneration.activeBackend())
     }
@@ -241,7 +240,7 @@ object D3D12GUISplit {
         } catch (t: Throwable) {
             givenUp = true
             Illusion.LOGGER.error(
-                "could not create the GUI's own render target; forcing render scale back to 100% so the GUI cannot outgrow the render area",
+                "GUI target failed; render scale forced to 100%",
                 t)
             // Without a window-sized GUI target the GUI falls back to the main target, whose scissor then goes out of bounds below 100 %.
             D3D12RenderScale.setPercent(100)
@@ -266,19 +265,19 @@ object D3D12GUISplit {
         val status = try {
             MCDR_ABI.D3D12FgSetUiTexture(handle)
         } catch (t: Throwable) {
-            Illusion.LOGGER.warn("could not hand the GUI target to frame generation: {}", t.toString())
+            Illusion.LOGGER.warn("could not hand GUI target to FG: {}", t.toString())
             return
         }
         when (status) {
             1 -> {
                 pushedUiHandle = handle
-                Illusion.LOGGER.info("handed the GUI target ({}) to frame generation as the UI texture", handle)
+                Illusion.LOGGER.info("GUI target ({}) handed to FG as UI", handle)
             }
             Int.MIN_VALUE -> if (!warnedNoUiTexture) {
                 warnedNoUiTexture = true
-                Illusion.LOGGER.info("this native library has no frame-generation UI texture entry point; UI tagging stays off")
+                Illusion.LOGGER.info("MCDR.dll lacks FG UI texture entry; tagging off")
             }
-            else -> Illusion.LOGGER.warn("frame generation rejected the GUI target as UI texture (status={})", status)
+            else -> Illusion.LOGGER.warn("FG rejected GUI target as UI, status={}", status)
         }
     }
 
@@ -287,7 +286,7 @@ object D3D12GUISplit {
         val world = (minecraft.gameRenderer.mainRenderTarget().colorTextureView as? D3D12GpuTextureView)
             ?.texture() as? D3D12GpuTexture
         Illusion.LOGGER.info(
-            "GUI split {} - world {}x{} ({}%), GUI target {}x{}",
+            "GUI split {}: world {}x{} ({}%), GUI {}x{}",
             state,
             world?.getWidth(0) ?: -1, world?.getHeight(0) ?: -1, D3D12RenderScale.percent(),
             gui.width, gui.height)
@@ -371,7 +370,7 @@ object D3D12GUISplit {
                     "the world layer is blitted into the GUI target"
                 })
         } else {
-            Illusion.LOGGER.warn("GUI split degraded ({}); the GUI keeps drawing into its own window-sized target, this frame just presents the world target", reason)
+            Illusion.LOGGER.warn("GUI split degraded ({}); world target only", reason)
         }
     }
 

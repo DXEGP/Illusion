@@ -63,8 +63,7 @@ class D3D12Backend : GpuBackend {
      */
     override fun createWindow(title: String?, width: Int, height: Int, flags: Long): Long {
         if (D3D12Settings.glContext) {
-            LOGGER.warn("glContext = true has no effect since 26.3: the GL context belongs to "
-                + "the OpenGL backend, the D3D12 backend never requests one")
+            LOGGER.warn("glContext = true ignored: no GL context")
         }
         val handle = SDLVideo.SDL_CreateWindow(title ?: "", width, height, flags)
         if (handle == 0L) {
@@ -72,7 +71,7 @@ class D3D12Backend : GpuBackend {
                 + "${SDLVideo.SDL_GetCurrentVideoDriver()}): ${SDLError.SDL_GetError()}", null)
         }
         lastWindowHandle = handle
-        LOGGER.info("[$NATIVE_NAME] SDL window: {}x{}, flags=0x{}", width, height, flags.toString(16))
+        LOGGER.info("SDL window: {}x{}, flags=0x{}", width, height, flags.toString(16))
         return handle
     }
 
@@ -94,8 +93,7 @@ class D3D12Backend : GpuBackend {
 
             // 地形已无 IMR 回退：mesh 能力不足时必须留下玩家可见的 ERROR，不能让地形静默消失。
             if (!D3D12MeshShader.isSupported() && D3D12Settings.meshTerrain) {
-                LOGGER.error("mesh shaders are unavailable but terrain has no IMR fallback: "
-                    + "terrain batches will be skipped (see the mesh support reason above)")
+                LOGGER.error("no mesh shaders, no IMR fallback: terrain batches skipped")
             }
             try {
                 selfTestJavaResources(device)
@@ -120,8 +118,7 @@ class D3D12Backend : GpuBackend {
                 if (D3D12Settings.selfTestSurface) {
                     selfTestSurface(device, lastWindowHandle)
                 } else {
-                    LOGGER.info("Surface self-test skipped: swapped-chain self-test would steal "
-                        + "the RTSS OSD binding (enable with [debug] selfTestSurface = true)")
+                    LOGGER.info("Surface self-test off: set [debug] selfTestSurface = true")
                 }
             } catch (t: Throwable) {
                 device.close()
@@ -132,8 +129,7 @@ class D3D12Backend : GpuBackend {
             return FrontendGpuDevice(device)
         } catch (t: Throwable) {
             LOGGER.error("D3D12 self-test failed", t)
-            LOGGER.error("D3D12 failure is fatal by design: no GL/Vulkan fallback, "
-                + "preferredGraphicsBackend is reset to default and the game crashes with a report")
+            LOGGER.error("D3D12 fatal: no fallback, preferredGraphicsBackend reset")
             // 抛 ReportedException 而不是 BackendCreationException —— 后者会被回退循环吞掉。
             D3D12Fatal.crash("DX12 self-test failed: $t", t)
         }
@@ -164,7 +160,7 @@ class D3D12Backend : GpuBackend {
             buffer.close()
             sampler.close()
             texture.close()
-            LOGGER.info("Java resource self-test OK (texture/buffer/sampler/view via FFM)")
+            LOGGER.info("resource self-test OK: texture/buffer/sampler/view")
         }
 
         /** 命令层自检：录制上传/拷贝 → submit → 等围栏 → 缓冲与纹理各回读一遍比对。 */
@@ -400,7 +396,7 @@ class D3D12Backend : GpuBackend {
                     throw IllegalStateException("native pipeline compile failed for $name")
                 }
             }
-            LOGGER.info("Pipeline self-test OK (GLSL->SPIR-V->HLSL->DXBC->PSO for core/gui + core/position_tex_color)")
+            LOGGER.info("pipeline self-test OK: core/gui + core/position_tex_color")
             // 自检结果不能留在缓存里：否则 vanilla 用真实源编译时命中缓存，真实源永远不生效。
             device.clearPipelineCache()
         }
@@ -527,7 +523,7 @@ class D3D12Backend : GpuBackend {
                                 "compute self-test: unexpected pixel (${bad[0]},${bad[1]},${bad[2]},${bad[3]}), " +
                                     "expected ($tag,0,0,255)")
                         }
-                        LOGGER.info("Compute self-test PASSED (cs_6_8 + descriptor-table UAV u0 + root constants b0)")
+                        LOGGER.info("compute self-test OK: cs_6_8, UAV u0, root constants b0")
                     } finally {
                         MCDR_ABI.D3D12DestroyCommandEncoder(ctx)
                     }
@@ -621,8 +617,7 @@ class D3D12Backend : GpuBackend {
                                 throw IllegalStateException(
                                     "SRI self-test: tile(0,0) expected 5 (2X2), got ${px[0]}")
                             }
-                            LOGGER.info(
-                                "SRI self-test PASSED (R8_UINT image + 2 SRV + UAV + RSSetShadingRateImage)")
+                            LOGGER.info("SRI self-test OK: R8_UINT, 2 SRV, UAV, SRI set")
                         } finally {
                             MCDR_ABI.D3D12DestroyCommandEncoder(ctx)
                         }
@@ -768,7 +763,7 @@ class D3D12Backend : GpuBackend {
                     // 提交后立刻回读存在可见性竞态（整条列表的内容都读不到，alpha=0）：隔一下重读再判。
                     Thread.sleep(150)
                     val retry = MCDR_ABI.D3D12ReadbackTexturePixels(texture)
-                    LOGGER.warn("mesh self-test: first readback = [{}]; retry after 150ms = [{}]",
+                    LOGGER.warn("mesh self-test: first readback [{}], retry 150ms [{}]",
                         dump(pixels), if (retry == null) "null" else dump(retry))
                     if (retry != null) pixels = retry
                 }
@@ -782,7 +777,7 @@ class D3D12Backend : GpuBackend {
                     throw IllegalStateException("mesh self-test: no red pixel in 3x3 readback — pixels=["
                         + "${dump}] lastError=${MCDR_ABI.D3D12LastError()}")
                 }
-                LOGGER.info("Mesh self-test OK (DXC ms_6_6 + PSO + DispatchMesh -> red pixel readback)")
+                LOGGER.info("mesh self-test OK: DXC ms_6_6 + DispatchMesh, red pixel")
             } finally {
                 // 逆序释放；句柄为 0 表示没建起来，跳过。
                 if (ctx != 0L) MCDR_ABI.D3D12DestroyCommandEncoder(ctx)
@@ -826,7 +821,7 @@ class D3D12Backend : GpuBackend {
                 D3DSurface?.close()
                 encoderBackend.close()
             }
-            LOGGER.info("Surface self-test OK (pure green clear + present via FFM on real window)")
+            LOGGER.info("surface self-test OK: green clear + present on window")
         }
     }
 }

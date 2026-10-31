@@ -46,6 +46,31 @@
   - 关闭时只切前 64 次（`MESHLET_SHADOW_UPLOADS = 64`），仅用于「shadow」统计，默认路径零成本。
 - 切分过程整段 `catch` 掉（`catch (ignored: Throwable)`）：meshlet 是旁路数据，
   任何异常都**不允许**影响原版的上传主流程。
+- 每段还带 **`geometryVersion`**（逐 section，不是全局）：层集合或任一层的 `indexCount` /
+  `vertexBytes` / `indexBytes` 变化时 +1，同数据重传不动它。它俩的用途不同 —— `generation` 回答
+  "这帧看到的是不是同一份"，`geometryVersion` 回答"这份几何有没有变过"，后者才是 BLAS 重建 /
+  体素砖更新的判据（[§2.1](#21-数据从哪来段上传时采集)）。
+- **契约自检**：`captureUpload` 只查"不依赖导出面就能判"的三条 —— 顶点字节数必须是 28 的整数倍、
+  走共享顺序 quad 缓冲的层索引数必须是 6 的整数倍、自带索引切片时 `indexBytes` 要能被 `indexCount`
+  整除且元素大小只能是 2/4。命中就 `violations +1` 并记下第一条的文字（日志里 `first=`），
+  不抛异常：采集是旁路，绝不允许影响上传本身。依赖体素导出的检查（逐步方块的 kind 与面数）
+  要等 S2 的导出面。
+- 契约视图：`D3D12SectionGeometry.contract(sectionNode)` 按 15 字段返回一条
+  `Contract`，其中 `vertexOffset` / `quadIndexOffset` 目前是 `-1`（**全局 quad 索引缓冲还没建**，
+  见 S1 步骤 3），`faceRange` / `materialSetId` 恒 0（体素导出还没做）。`contractSummary()`
+  给出规模与违规计数，随每 1024 次上传的日志一起打。
+- 索引从哪来（已核到原版源码，2026-10-29）：**原版本来就有共享的顺序索引缓冲**，我们不需要自建。
+  `RenderSystem.sharedSequentialQuad` 是 `AutoStorageIndexBuffer(4, 6, …)`，模式
+  `(i, i+1, i+2, i+2, i+3, i)`（`RenderSystem.java:53-60`），按需增长
+  （`getSequentialBuffer(QUADS).getBuffer(indexCount)`，元素类型由 `IndexType.least(vertexCount)`
+  决定，`RenderSystem.java:445-475`）。只有 `SectionDraw.hasCustomIndexBuffer()` 的层才带自己的一片
+  索引（排序后的半透明，`LevelRenderer.java:800-837`），那片索引的元素大小 = `IndexType.SHORT/INT`。
+- 因此契约里记 **`indexSource`**：`SEQUENTIAL_QUADS`（用原版共享缓冲）或 `CUSTOM_SLICE`（自带索引，
+  元素字节数记 `indexStrideBytes`，由 `indexBytes / indexCount` 反推）。`captureUpload` 收到
+  `indexBuffer == null` 就是前者。改源也算几何变化 —— `geometryVersion` 会 +1（索引语义可能变）。
+- quad 的顶点/索引算术：quad `q` 占顶点 `4q..4q+3`；共享缓冲给的是 `(i, i+1, i+2, i+2, i+3, i)`，
+  与 `[mesh] terrain` 的算术展开（§2.5）是同一组三角形（`(0,1,2)` + `(2,3,0)`，与 `(0,2,3)` 同绕序）。
+  写进契约时以原版那条序列为准，不要自己排。
 
 ### 2.2 meshlet 怎么切（`D3D12MeshletBuilder`）
 
@@ -95,9 +120,13 @@
 
 ### 2.4 顶点解码代码生成（`D3D12MeshVertexDecode`）
 
-MS 的顶点属性不是从 IA 阶段来的，得把 spvc（SPIRV-Cross）翻译出来的 VS 输入结构自己填。
+MS 的顶点属性不是从 IA 阶段来的，得把 VS 输入自己填。VS 有两种形态：旧链 spvc（SPIRV-Cross）产物的
+`SPIRV_Cross_Input` 结构体，与转换器（naga）产物的 `XxxOutput main(参数 : LOC<n>, …)`。
 
-- `parseInputFields()` 找 `struct SPIRV_Cross_Input`，逐行匹配 `类型 名字 : 语义;`。
+- 旧形态：`parseInputFields()` 找 `struct SPIRV_Cross_Input`，逐行匹配 `类型 名字 : 语义;`。
+- naga 形态：`vsShape()` 用 `(\w+)\s+main\(([^)]*)\)` 抓入口，参数按 `^\s*(\w+)\s+(\w+)\s*:\s*LOC(\d+)\s*$`
+  解析成字段；任一参数不是 `LOC` 语义就返回 null（交调用方回退旧链）。字段类型直接取参数类型
+  （`float3`/`float4`/`int2`…），语义名是 `LOC<n>`，与宿主 `semanticNames` 一致。
 - `parseGpuFormat()` 拆 `GpuFormat` 名字：分量数、位宽、种类。
   - 分量数取「字母个数」和「`R8G8B8A8` 这类分组数」的较大者，再压到 4。
     按字母数算是为了不把 `float3` 解析成 4 分量（会直接让 DXC 编译失败）。
@@ -114,8 +143,9 @@ MS 的顶点属性不是从 IA 阶段来的，得把 spvc（SPIRV-Cross）翻译
 `build(vsHlsl, format, stride = 28, cull = false): String?`：返回 null 表示「这次生成失败，
 调用方回退」。常量：`THREADS = 64`、`MAX_PRIMITIVES = 32`、`VERTEX_STRIDE = 28`。
 
-前置要求：VS 里必须能找到 `SPIRV_Cross_Output main(SPIRV_Cross_Input stage_input)`
-这个入口（spvc 的产物固定叫 `main`，与 `ms_main` 冲突，所以改名 `vs_main`）。
+前置要求：VS 里必须能找到可改名的入口——spvc 产物是 `SPIRV_Cross_Output main(SPIRV_Cross_Input stage_input)`
+（固定叫 `main`，与 `ms_main` 冲突，所以改名 `vs_main`），转换器产物是 `<输出结构体> main(参数 : LOC<n>, …)`
+（重建 `struct DxrVertexInput`、入口改成 `vs_main(参数…)`，生成代码按位置传 `vin.<字段>`）。
 
 字段取值优先级：
 
@@ -184,11 +214,15 @@ MS 的顶点属性不是从 IA 阶段来的，得把 spvc（SPIRV-Cross）翻译
 
 #### 2.5.4 矩阵与常量约定
 
-- spvc 产出的 VS 是 `row_major` + `mul(float4, M)`（行向量在左）。
+- spvc 产出的 VS 是 `row_major` + `mul(float4, M)`（行向量在左）。转换器（naga）产物同样用
+  `mul(float4, M)` 并把矩阵声明成 `row_major`，两者一致。
   MS 里必须沿用同一约定：**不要**写 `mul(M, v)`，否则几何整体错位。
 - `resolveCullUniforms()` 要求 VS 里同时有 `CameraBlockPos`、`CameraOffset`、
   `ModelViewMat`（`float4x4`）、`ProjMat`（`float4x4`）：缺任何一个就返回 null，
-  调用方改为生成**不剔除**的版本。绝不生成「剔除判据全为 0」的 AS —— 那会把整个地形剔没。
+  调用方改为生成**不剔除**的版本。名字前缀可空——spvc 会给唯一化前缀（`_81_CameraBlockPos`），
+  转换器产物是裸名（`int3 CameraBlockPos;` + `global_1.CameraBlockPos`）；矩阵那条还要求前面确实是
+  `float4x4`，避免把 `float4x4` 之外的同名成员当矩阵。绝不生成「剔除判据全为 0」的 AS —— 那会把整个
+  地形剔没。
 - uniform 名字用前缀正则匹配：spvc 可能给名字加前缀，精确匹配会静默漏掉。
 
 ### 2.6 管线创建与三级回退（`D3D12Device.createMeshVariant`）

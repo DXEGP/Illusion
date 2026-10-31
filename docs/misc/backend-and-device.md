@@ -282,6 +282,21 @@ val token = MCDR_ABI.D3D12GetFenceValue(ctx) + 1
 `StagedVertexBuffer.endFrame` / `MappableRingBuffer.rotate` 这类调用是在帧**中间**取 token 的。
 用全局序列会让 token 提前「已完成」，缓冲提前回收 —— 表现为随机的画面错位，且极难复现。
 
+### 3.7.1 提交必须串行：`gSubmitMutex` 与 atomic 的打开列表计数
+
+`submitCommandList` 里「分配 fence 值 → `ExecuteCommandLists` → `Signal` → 记账」这一整段在
+`std::mutex gSubmitMutex` 下执行。
+
+**现状：所有提交都在同一个线程。** Minecraft 的主线程就叫 `Render thread`，客户端 tick 事件与渲染是同一
+条线程（崩溃日志里能看到 `ClientTickEvent$Post` 的栈帧落在 `"Render thread"` 上），所以光追自检在 tick 里
+建自己的编码器提交、与当帧渲染是顺序的，不是并发的。这条锁是**防御性的**：一旦有第二个线程提交
+（异步上传、后台预烘、别的模组），不加锁就会把「列表 A」配上「列表 B 的 fence 值」，等待方按自己那个值
+提前醒来读到还没写完的缓冲 —— 不报错、只是结果不对，和「随机画错但不崩」一样难查。
+
+`gOpenListCount`（当前打开的列表数）是 `std::atomic<int>`。它是延迟删除的判据之一
+（`gOpenListCount == 0` 才允许 `flushPendingDeletes`），普通 `int` 下两个线程的 `++`/`--` 会丢更新，
+判据就可能提前成立、释放 GPU 还在用（或即将用）的资源。日志里打印它时一律 `.load()`。
+
 ### 3.8 设备关闭的固定顺序
 
 ```
@@ -302,6 +317,39 @@ D3D12AdapterInfo.current = null
   `dxgi.dll` detach 之后执行，触发原生异常，退出码 2170（表现为「关游戏时崩一下」）。
 
 ---
+
+### 3.9 屏障提交与影子状态跟踪
+
+JVM 侧只从 `D3D12Barrier` 发屏障：
+
+```kotlin
+MCDR_ABI.D3D12Barrier(ctx, listOf(
+    MCDR_ABI.BarrierDesc(gbuffer, MCDR_ABI.D3D12State.RENDER_TARGET,
+                         MCDR_ABI.D3D12State.PIXEL_SHADER_RESOURCE),
+    MCDR_ABI.BarrierDesc(radiance, 0, 0, kind = MCDR_ABI.BarrierKind.UAV),
+))
+```
+
+`false` 只表示参数错或列表未开；`before == after` 的条目在 native 侧被丢弃，不算失败。`flags = 1/2` 是 split barrier 的 begin-only/end-only，只发 begin 必须补 end。`subresource` 默认 `ALL_SUBRESOURCES`（-1）。
+
+读影子账本（S0 期间每帧或退出时打一次）：
+
+```kotlin
+MCDR_ABI.D3D12QueryRtTrackStats()?.let { s ->
+    if (s.mismatches > 0) IllusionLogger.warnFormat("rt_state_mismatch %d %s", s.mismatches, s.note)
+}
+```
+
+`mismatches` = 声明的 `StateBefore` 与账本不一致的次数，`note` 是最后一次的 `decl=/track=`；`firstUse` = 首次登记（无法校验）的次数。影子模式只记账，不改变任何已提交的屏障。
+
+能力面在建完设备后读一次：
+
+```kotlin
+val caps = MCDR_ABI.D3D12QueryRtCaps()
+if (caps != null) IllusionLogger.infoMessage("rt caps: ${caps.preferredBackend} wg=${caps.workGraphsTier}")
+```
+
+`workGraphsSupported` 要求 `options21Queried` 为真（Windows SDK 10.0.26100 起 `OPTIONS21` 才有 `workGraphsTier` 字段）；`serActuallyReorders` 恒为 0，等换 `directx-headers` 才可能非零。
 
 ## 4. 内存策略
 

@@ -280,6 +280,55 @@ object MCDRLayout {
         MemoryLayout.sequenceLayout(28L, I8).withName("note")
     ).withName("mcdr_sr_caps")
 
+    // mcdr_rt_caps — 光追 / Work Graph 能力面（C sizeof = 80、align = 4）。
+    // 14 个 int32 + char[24]；两个 queried 位区分「问了但为 0」与「没问成」，别把 0 当不支持。
+    @JvmField
+    val RT_CAPS: MemoryLayout = MemoryLayout.structLayout(
+        I32.withName("raytracingTier"),
+        I32.withName("meshShaderTier"),
+        I32.withName("workGraphsTier"),
+        I32.withName("shadingRateTier"),
+        I32.withName("shaderModel"),
+        I32.withName("samplerFeedbackTier"),
+        I32.withName("options21Queried"),
+        I32.withName("options22Queried"),
+        I32.withName("serActuallyReorders"),
+        I32.withName("enhancedBarriers"),
+        I32.withName("dxcAvailable"),
+        I32.withName("max1DDispatchSize"),
+        I32.withName("max1DDispatchMeshSize"),
+        I32.withName("reserved"),
+        MemoryLayout.sequenceLayout(24L, I8).withName("note")
+    ).withName("mcdr_rt_caps")
+
+    // mcdr_rt_track_stats — 影子状态跟踪器计数（C sizeof = 92、align = 4）。
+    @JvmField
+    val RT_TRACK_STATS: MemoryLayout = MemoryLayout.structLayout(
+        I32.withName("transitions"),
+        I32.withName("mismatches"),
+        I32.withName("promotions"),
+        I32.withName("widened"),
+        I32.withName("firstUse"),
+        I32.withName("uavBarriers"),
+        I32.withName("tracked"),
+        MemoryLayout.sequenceLayout(64L, I8).withName("note")
+    ).withName("mcdr_rt_track_stats")
+
+    // mcdr_barrier_desc — 一次屏障提交（C sizeof = 40、align = 8，尾部 4 字节填充）。
+    @JvmField
+    val BARRIER_DESC: MemoryLayout = MemoryLayout.structLayout(
+        PTR.withName("resource"),
+        PTR.withName("resourceAfter"),
+        I32.withName("kind"),
+        I32.withName("flags"),
+        I32.withName("before"),
+        I32.withName("after"),
+        I32.withName("subresource"),
+        MemoryLayout.paddingLayout(4L)
+    ).withName("mcdr_barrier_desc")
+
+    @JvmField val BARRIER_DESC_SIZE: Long = BARRIER_DESC.byteSize()
+
     // mcdr_sr_dispatch — 每帧载荷（C sizeof = 136 / align 8）；六个 void* 落在 72..119，无隐式填充。
     @JvmField
     val SR_DISPATCH: MemoryLayout = MemoryLayout.structLayout(
@@ -325,6 +374,21 @@ object MCDRLayout {
     @JvmField val SR_CAPS_MAX_RENDER_HEIGHT: Long = offset(SR_CAPS, "maxRenderHeight")
     @JvmField val SR_CAPS_NATIVE_AA: Long = offset(SR_CAPS, "nativeAA")
     @JvmField val SR_CAPS_NOTE: Long = offset(SR_CAPS, "note")
+
+    @JvmField val RT_CAPS_RAYTRACING_TIER: Long = offset(RT_CAPS, "raytracingTier")
+    @JvmField val RT_CAPS_MESH_SHADER_TIER: Long = offset(RT_CAPS, "meshShaderTier")
+    @JvmField val RT_CAPS_WORK_GRAPHS_TIER: Long = offset(RT_CAPS, "workGraphsTier")
+    @JvmField val RT_CAPS_SHADING_RATE_TIER: Long = offset(RT_CAPS, "shadingRateTier")
+    @JvmField val RT_CAPS_SHADER_MODEL: Long = offset(RT_CAPS, "shaderModel")
+    @JvmField val RT_CAPS_SAMPLER_FEEDBACK_TIER: Long = offset(RT_CAPS, "samplerFeedbackTier")
+    @JvmField val RT_CAPS_OPTIONS21_QUERIED: Long = offset(RT_CAPS, "options21Queried")
+    @JvmField val RT_CAPS_OPTIONS22_QUERIED: Long = offset(RT_CAPS, "options22Queried")
+    @JvmField val RT_CAPS_SER_ACTUALLY_REORDERS: Long = offset(RT_CAPS, "serActuallyReorders")
+    @JvmField val RT_CAPS_ENHANCED_BARRIERS: Long = offset(RT_CAPS, "enhancedBarriers")
+    @JvmField val RT_CAPS_DXC_AVAILABLE: Long = offset(RT_CAPS, "dxcAvailable")
+    @JvmField val RT_CAPS_MAX_1D_DISPATCH: Long = offset(RT_CAPS, "max1DDispatchSize")
+    @JvmField val RT_CAPS_MAX_1D_DISPATCH_MESH: Long = offset(RT_CAPS, "max1DDispatchMeshSize")
+    @JvmField val RT_CAPS_NOTE: Long = offset(RT_CAPS, "note")
 
     // mcdr_fg_caps — 字段名/顺序必须与 typedef 逐字一致，verify() 双向比对 offset + size。
     // `note`（char[28]）与 `latencyProvider` 都必须是有名字段：describe() 只枚举有名字的成员。
@@ -424,6 +488,46 @@ object MCDRLayout {
     @JvmField val FG_DISPATCH_P_MOTION_VECTORS: Long = offset(FG_DISPATCH, "pMotionVectors")
     @JvmField val FG_DISPATCH_P_UI_COLOR: Long = offset(FG_DISPATCH, "pUiColor")
 
+    // mcdr_rt_geometry — 一条 BLAS 几何（C sizeof = 64、align = 8）。两个指针都是缓冲句柄；
+    // 偏移是**字节**偏移（顶点为 StartVertexLocation * vertexStride）。
+    @JvmField
+    val RT_GEOMETRY: MemoryLayout = MemoryLayout.structLayout(
+        PTR.withName("vertexBuffer"),
+        I64.withName("vertexStride"),
+        I64.withName("vertexCount"),
+        I64.withName("vertexOffset"),
+        PTR.withName("indexBuffer"),
+        I64.withName("indexCount"),
+        I64.withName("indexOffset"),
+        I32.withName("flags"),
+        I32.withName("indexStride")
+    ).withName("mcdr_rt_geometry")
+
+    @JvmField val RT_GEOMETRY_VERTEX_BUFFER: Long = offset(RT_GEOMETRY, "vertexBuffer")
+    @JvmField val RT_GEOMETRY_VERTEX_STRIDE: Long = offset(RT_GEOMETRY, "vertexStride")
+    @JvmField val RT_GEOMETRY_VERTEX_COUNT: Long = offset(RT_GEOMETRY, "vertexCount")
+    @JvmField val RT_GEOMETRY_VERTEX_OFFSET: Long = offset(RT_GEOMETRY, "vertexOffset")
+    @JvmField val RT_GEOMETRY_INDEX_BUFFER: Long = offset(RT_GEOMETRY, "indexBuffer")
+    @JvmField val RT_GEOMETRY_INDEX_COUNT: Long = offset(RT_GEOMETRY, "indexCount")
+    @JvmField val RT_GEOMETRY_INDEX_OFFSET: Long = offset(RT_GEOMETRY, "indexOffset")
+    @JvmField val RT_GEOMETRY_FLAGS: Long = offset(RT_GEOMETRY, "flags")
+    @JvmField val RT_GEOMETRY_INDEX_STRIDE: Long = offset(RT_GEOMETRY, "indexStride")
+
+    // mcdr_rt_hit_group — 一个 hit group 的四个名字（C sizeof = 32、align = 8）。四条都是 UTF-8
+    // 字符串指针，只在建状态对象那一次调用里被读；没有 closestHit / anyHit / intersection 时写 0。
+    @JvmField
+    val RT_HIT_GROUP: MemoryLayout = MemoryLayout.structLayout(
+        PTR.withName("name"),
+        PTR.withName("closestHit"),
+        PTR.withName("anyHit"),
+        PTR.withName("intersection")
+    ).withName("mcdr_rt_hit_group")
+
+    @JvmField val RT_HIT_GROUP_NAME: Long = offset(RT_HIT_GROUP, "name")
+    @JvmField val RT_HIT_GROUP_CLOSEST_HIT: Long = offset(RT_HIT_GROUP, "closestHit")
+    @JvmField val RT_HIT_GROUP_ANY_HIT: Long = offset(RT_HIT_GROUP, "anyHit")
+    @JvmField val RT_HIT_GROUP_INTERSECTION: Long = offset(RT_HIT_GROUP, "intersection")
+
     private val EXPECTED_C_SIZES: Array<Array<Any>> = arrayOf(
         arrayOf<Any>("mcdr_binding_slot",         BINDING_SLOT,        40L),
         arrayOf<Any>("mcdr_partition_draw",       PARTITION_DRAW,      56L),
@@ -443,6 +547,11 @@ object MCDRLayout {
         arrayOf<Any>("mcdr_fg_dispatch",         FG_DISPATCH,        96L),
         arrayOf<Any>("mcdr_fg_constants",       FG_CONSTANTS,      152L),
         arrayOf<Any>("mcdr_abi_field",            ABI_FIELD,           24L),
+        arrayOf<Any>("mcdr_rt_caps",              RT_CAPS,             80L),
+        arrayOf<Any>("mcdr_rt_track_stats",       RT_TRACK_STATS,      92L),
+        arrayOf<Any>("mcdr_rt_hit_group",         RT_HIT_GROUP,        32L),
+        arrayOf<Any>("mcdr_rt_geometry",          RT_GEOMETRY,         64L),
+        arrayOf<Any>("mcdr_barrier_desc",         BARRIER_DESC,        40L),
     )
 
     init {
@@ -465,6 +574,11 @@ object MCDRLayout {
     init {
         // describe() and verify() both enumerate this map, so a registered struct is always checked.
         STRUCTS["mcdr_binding_slot"] = BINDING_SLOT
+        STRUCTS["mcdr_rt_caps"] = RT_CAPS
+        STRUCTS["mcdr_rt_track_stats"] = RT_TRACK_STATS
+        STRUCTS["mcdr_rt_hit_group"] = RT_HIT_GROUP
+        STRUCTS["mcdr_rt_geometry"] = RT_GEOMETRY
+        STRUCTS["mcdr_barrier_desc"] = BARRIER_DESC
         STRUCTS["mcdr_partition_draw"] = PARTITION_DRAW
         STRUCTS["mcdr_color_target_desc"] = COLOR_TARGET
         STRUCTS["mcdr_depth_state_desc"] = DEPTH_STATE
@@ -480,7 +594,6 @@ object MCDRLayout {
         // FG 的两张表同理必须登记（native 的 layoutTable() 有它们的字段）。
         STRUCTS["mcdr_fg_caps"] = FG_CAPS
         STRUCTS["mcdr_fg_dispatch"] = FG_DISPATCH
-        STRUCTS["mcdr_fg_constants"] = FG_CONSTANTS
         STRUCTS["mcdr_fg_constants"] = FG_CONSTANTS
 
     }

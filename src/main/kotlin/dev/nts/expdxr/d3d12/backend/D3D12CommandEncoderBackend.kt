@@ -7,15 +7,16 @@ import com.mojang.renderpearl.api.buffers.GpuBufferSlice
 import com.mojang.renderpearl.api.commands.GpuFence
 import com.mojang.renderpearl.api.buffers.TransientMemory
 import com.mojang.renderpearl.api.commands.GpuQueryPool
-import com.mojang.renderpearl.api.commands.RenderPass
 import com.mojang.renderpearl.api.commands.RenderPassDescriptor
 import com.mojang.renderpearl.api.textures.GpuTexture
 import dev.nts.expdxr.misc.IllusionLogger
-import dev.nts.expdxr.Illusion
 import dev.nts.expdxr.d3d12.extern.MCDR_ABI
 import dev.nts.expdxr.d3d12.render.adapter.D3D12Device
 import dev.nts.expdxr.d3d12.render.advanced.taa.D3D12TAA
 import dev.nts.expdxr.d3d12.render.advanced.taa.D3D12Temporal
+import dev.nts.expdxr.dxrmc.rt.D3D12RtFrame
+import dev.nts.expdxr.dxrmc.rt.D3D12RtGBuffer
+import dev.nts.expdxr.dxrmc.rt.D3D12RtStats
 import dev.nts.expdxr.d3d12.render.advanced.D3D12PostSharpen
 import dev.nts.expdxr.d3d12.render.advanced.taa.D3D12Velocity
 import dev.nts.expdxr.d3d12.render.core.*
@@ -35,7 +36,8 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
 
     /** GUI 的防御性 `RSSetShadingRate` 复位要用同一条列表的上下文（只给同包调用方）。 */
     internal fun nativeCtx(): Long = ctx
-    private val device: D3D12Device?
+    /** 帧中间追加后处理（光追合光）要建纹理，需要拿到编码器所属的设备。 */
+    val device: D3D12Device?
     private val transientMemory: D3D12TransientMemory
     // 拷贝完成回调是**设备级全局队列**：vanilla 的 Screenshot 只在一个从不 submit 的一次性 encoder 上登记回调，
     // 回调若存在 encoder 自己身上则永不执行 → 截图缓冲永不 close（每秒 1.6MB READBACK 泄漏）。
@@ -68,7 +70,8 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
     /**
      * 懒加载打开命令列表（幂等）。列表未打开时会 allocator reset —— 内部按 fenceValue-2 等 GPU 释放该 allocator。
      */
-    private fun ensureListOpen() {
+    /** 光追派发要在 pass 之外自己开列表：调用方在帧中间也可能拿到还没打开的编码器。 */
+    fun ensureListOpen() {
         // 结算上一帧挂起的提交必须早于读 listOpen：渲染线程的 submitCommandList 会 Close 旧列表（1→0），
         // 先读可能读到中间态而跳过 begin，主线程随即写进一条正在被关闭/提交的列表（数据竞争）。
         settlePendingSubmit()
@@ -190,7 +193,8 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
         }
         val pass = D3D12RenderPassBackend(
             this.device, this.ctx,
-            area, w, h, hasDepth, if (colorCount > 0) colorTextures[0] else 0L, flipY,
+            area, w, h, hasDepth, if (colorCount > 0) colorTextures[0] else 0L,
+            flipY,
             this.transientMemory,
         )
         this.currentRenderPass = pass
@@ -263,8 +267,79 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
         return MCDR_ABI.dx12BlitTextureToTexture(this.ctx, src.handle(), dst.handle())
     }
     override fun submitRenderPass() {
+        val pass = this.currentRenderPass
         MCDR_ABI.D3D12EndRenderPass(this.ctx)
         this.currentRenderPass = null
+        if (pass != null) {
+            this.recordGBufferPass(pass)
+        }
+    }
+
+    /**
+     * G-Buffer pass：主 pass 结束后立刻用**同一份深度**重放主 pass 里捕获的地形批次，写四张附件。
+     *
+     * 主 pass 一旦 End 就不能在同一次渲染里重新 Begin（native 直接报 "render pass already open"），
+     * 所以这是唯一时机；只有真的捕到批次（不透明地形画过）才开这个 pass。见 docs/rt/README.md §8。
+     */
+    private var gbufferReplayFrames = 0
+
+    private fun recordGBufferPass(pass: D3D12RenderPassBackend) {
+        if (!pass.hasGBufferBatches()) {
+            return
+        }
+        // 光追是开发档功能：任何异常都不许冒泡到帧图，游戏必须继续可玩。
+        var opened = false
+        try {
+            // 时间戳的读点放在这里：上一帧已经 present 提交，读回不会把这一帧卡在栅栏上。
+            D3D12RtStats.beginFrame(this, pass.areaWidth(), pass.areaHeight())
+            val targets = D3D12RtGBuffer.ensure(this.device, pass.areaWidth(), pass.areaHeight()) ?: return
+            val colors = LongArray(D3D12RtGBuffer.ATTACHMENTS) { index -> targets.handle(index) }
+            val mips = IntArray(D3D12RtGBuffer.ATTACHMENTS)
+            // 每帧都清：上一帧的残留会让 debug 视图与 S3 的采样读到过期像素。
+            // 反照率清成白色而不是黑色：没被地形覆盖的像素（天空、实体、粒子）在追踪里落到
+            // miss 分支，乘回 albedo 后剩下的就是天空色；清成黑会把它们整片抹黑。
+            val clearFlags = ByteArray(D3D12RtGBuffer.ATTACHMENTS) { 1 }
+            // albedo 清成 (0,0,0,0)：alpha 是「这一像素被 G-Buffer 写过」的标记，合光靠它把
+            // 光栅没画的像素退回天空色（清成 1 会把那些像素当白色 albedo 乘出一片死白）。
+            val clearColors = floatArrayOf(
+                0.0f, 0.0f, 0.0f, 0.0f,
+                0.0f, 0.0f, 0.0f, 1.0f,
+                0.0f, 0.0f, 0.0f, 0.0f,
+                0.0f, 0.0f, 0.0f, 0.0f,
+                0.0f, 0.0f, 0.0f, 0.0f,
+            )
+            this.ensureListOpen()
+            // 深度用 G-Buffer 自己的那份（清成 0 = reverse-Z 的远端）：借主 pass 的深度会因为
+            // 同帧二次绘制的浮点不等而整片拒绝，留下地平线窄带与近处楔形的漏画。
+            MCDR_ABI.D3D12BeginRenderPass(this.ctx, colors, mips, clearFlags, clearColors,
+                targets.depthHandle(), 0, 1, 0.0,
+                pass.areaX(), pass.areaY(), pass.areaWidth(), pass.areaHeight())
+            opened = true
+            pass.replayGBuffer()
+            // 前几帧打出重放的批次/meshlet 规模，用来和主 pass 的 meshlet dispatch 对账。
+            if (this.gbufferReplayFrames++ < 3) {
+                IllusionLogger.infoMessage(
+                    "rt gbuffer: replay batches=${pass.gbufferBatchCount()} " +
+                        "meshlets=${pass.gbufferMeshletCount()}")
+            }
+            D3D12RtStats.mark(this, D3D12RtStats.SLOT_GBUFFER)
+        } catch (t: Throwable) {
+            D3D12RtFrame.reportFailure(t)
+            return
+        } finally {
+            if (opened) {
+                MCDR_ABI.D3D12EndRenderPass(this.ctx)
+            }
+        }
+        // G-Buffer 已经落盘，紧接着跑一次 B-Mega 遍历：这里在 pass 之外，D3D12 允许派发 compute。
+        val width = pass.areaWidth()
+        val height = pass.areaHeight()
+        try {
+            D3D12RtFrame.dispatch(this.device, this,
+                D3D12RtFrame.currentCamera(width.toFloat() / height), width, height)
+        } catch (t: Throwable) {
+            D3D12RtFrame.reportFailure(t)
+        }
     }
 
     // ---- clears ----
@@ -617,4 +692,6 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
         private var gProfTotalNs = 0L
     }
 }
+
+
 

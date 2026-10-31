@@ -12,4 +12,6 @@ data class D3D12CompiledShader(
     val entries: List<D3D12BindGroupEntry>,
     val vertexShaderInputs: List<String>,
     val semanticNames: MutableList<String>,
+    /** 转换器接管的 buffer texture：绑定条目要改成 [D3D12BindGroupEntry.Type.RAW_BUFFER]。 */
+    val rawBuffers: Set<String> = emptySet(),
 )

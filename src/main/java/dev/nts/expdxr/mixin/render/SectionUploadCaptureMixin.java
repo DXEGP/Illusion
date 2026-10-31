@@ -33,13 +33,24 @@ public abstract class SectionUploadCaptureMixin {
                                       ByteBuffer vertexBuffer, ByteBuffer indexBuffer,
                                       CallbackInfoReturnable<Boolean> cir) {
         Level level = Minecraft.getInstance().level;
+        // 索引来源：带自定义切片的层（排序后的半透明等）自己有索引，其余走原版共享的顺序 quad 缓冲。
+        // 元素字节数用 `indexBytes / indexCount` 反推，避免引用包私有的 SectionDraw / IndexType。
+        int indexCount = mesh.isEmpty(layer) ? 0 : mesh.getSectionDraw(layer).indexCount();
+        int indexBytes = indexBuffer == null ? 0 : indexBuffer.remaining();
+        D3D12SectionGeometry.IndexSource source = indexBytes == 0
+                ? D3D12SectionGeometry.IndexSource.SEQUENTIAL_QUADS
+                : D3D12SectionGeometry.IndexSource.CUSTOM_SLICE;
+        int indexStride = indexCount > 0 && indexBytes > 0 ? indexBytes / indexCount : 0;
         D3D12SectionGeometry.captureUpload(
                 getSectionNode(),
                 layer.name(),
-                mesh.isEmpty(layer) ? 0 : mesh.getSectionDraw(layer).indexCount(),
+                indexCount,
                 vertexBuffer == null ? 0 : vertexBuffer.remaining(),
-                indexBuffer == null ? 0 : indexBuffer.remaining(),
+                indexBytes,
                 level == null ? 0 : System.identityHashCode(level),
-                vertexBuffer);
+                vertexBuffer,
+                source,
+                indexStride,
+                indexBuffer);
     }
 }

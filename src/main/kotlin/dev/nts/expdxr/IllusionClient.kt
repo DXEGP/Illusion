@@ -29,7 +29,7 @@ class IllusionClient(container: ModContainer) {
             IConfigScreenFactory { modContainer, parent -> ConfigurationScreen(modContainer, parent) }
         )
 
-        Illusion.LOGGER.info("[$MODID] $MOD_NAME Client setup: D3D12 backend is registered via PreferredGraphicsApiMixin; creation is driven by the vanilla backend-selection loop")
+        Illusion.LOGGER.info("$MOD_NAME client ready; D3D12 backend registered")
         D3D12ExitWatchdog.start()
         // PIX timing capture on a key press: the binding has to be registered during mod loading,
         // and the handler only runs on the client bus (this class never loads on a server).

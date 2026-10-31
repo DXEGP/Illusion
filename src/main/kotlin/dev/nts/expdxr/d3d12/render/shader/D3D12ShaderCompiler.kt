@@ -145,7 +145,7 @@ class D3D12ShaderCompiler : AutoCloseable {
             if (fragmentHlsl.contains(needle)) {
                 fragmentHlsl = fragmentHlsl.replace(needle, repl)
             } else {
-                IllusionLogger.warnMessage("[FIX] WARN: frag_main needle not found for "
+                IllusionLogger.warnMessage("shader: frag_main needle missing for "
                     + pipeline.location)
             }
         }

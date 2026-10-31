@@ -14,7 +14,12 @@ Illusion（幻光影现）是 Minecraft NeoForge 模组，把渲染后端换成�
 - native 侧是 C++23 动态库 **MCDR**（同一仓库的 `MCDR\` 目录），通过 **Java FFM API** 调用，
   **不使用 JNI**。
 - 高级特性：DLSS / FSR / XeSS 超分，DLSS-G / FSR-FG / XeSS-FG 帧生成，NVIDIA Reflex，
-  TAA / SMAA，mesh shader（meshlet），VRS 与渲染比例；光线追踪**尚未实现**。
+  TAA / SMAA，mesh shader（meshlet），VRS 与渲染比例；光线追踪有三条出图链（导出 → G-Buffer → 追踪 → 合光上屏）：
+  **B-Mega** 段 AABB + 三角形暴力求交、**B-Mega AS** 同一 kernel 改走 inline `RayQuery`（`MEGA` 档 + `asTrace = true`），
+  以及 **B-DXR** 状态对象 + SBT + `DispatchRays`（`backend = DXR`）；三条路的命中解码与光照共用光影包里的
+  `mega_shade.hlsli`，自检逐像素对拍。Work Graph 后端仍未接。
+- 光影包从「视频设置 → 光影包」里选；`[raytracing]` 那组键是**包作用域**的，入口只有「光影包 → 光影包设置」，
+  由包自己的 `shaders/configs.json` 声明（见 `rt/README.md` 的 11.6 节）。
 
 ## 文档地图
 
@@ -26,6 +31,7 @@ Illusion（幻光影现）是 Minecraft NeoForge 模组，把渲染后端换成�
 | [`antialiasing/README.md`](antialiasing/README.md) | TAA / SMAA / 后期锐化：历史缓冲、速度缓冲 | 残影、抖动、GUI 拆分问题 |
 | [`mesh&vrs/README.md`](mesh&vrs/README.md) | mesh shader（meshlet）与 VRS / 渲染比例 | 地形管线、性能取舍 |
 | [`shaders/README.md`](shaders/README.md) | 着色器管线：原版管线 → HLSL → DXC → PSO | 编译失败、绑定错位 |
+| [`rt/README.md`](rt/README.md) | 光线追踪：`[raytracing]` 配置、日志、查询、导出几何/材质缓存、G-Buffer pass、逐帧派发与合光、加速结构（BLAS/TLAS）、inline `RayQuery` 与 B-DXR（状态对象 + SBT）、光影包位置与选中规则、静态检查与实机验收清单 | 复查光追配置、核对导出与 G-Buffer、改派发规模或 HLSL、动加速结构或 DXR 档 |
 | [`misc/backend-and-device.md`](misc/backend-and-device.md) | D3D12 后端、设备、资源与内存管理 | 加资源类型、改每帧流程 |
 | [`misc/ffm-abi.md`](misc/ffm-abi.md) | JVM ↔ native 的 FFM ABI | 新增或修改 native 导出 |
 | [`misc/debug-and-crash.md`](misc/debug-and-crash.md) | 崩溃处理、诊断与日志体系 | 崩溃、黑屏、日志看不懂 |
@@ -49,5 +55,6 @@ Illusion（幻光影现）是 Minecraft NeoForge 模组，把渲染后端换成�
 
 ## 相关文档
 
-- `MCDR\docs\` —— native 库 MCDR 的设计文档（C++ 侧，另行编写）。
+- `MCDR\docs\overview.md` —— native 库 MCDR 的设计文档（C++ 侧，ABI 的另一端）；
+  JVM 与 native 的调用契约在 [`misc/ffm-abi.md`](misc/ffm-abi.md)，两端对读。
 - `Illusion\README.md` / `Illusion\README_ZH.md` —— 面向玩家的功能介绍与使用说明。

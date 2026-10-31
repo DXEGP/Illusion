@@ -68,9 +68,11 @@ class D3D12AdapterInfo private constructor(
 
     fun sharedMiB(): Long = sharedBytes shr 20
 
-    /** 启动日志用的一行摘要。 */
-    fun summary(): String = "${name} [${vendorName()} ${deviceType}]" +
-        " backend=${backendName()} driver=${driverInfo()}" +
+    /** 启动日志的一行摘要。 */
+    fun summary(): String = "$name (${vendorName()} $deviceType, ${vramMiB()} MiB VRAM)"
+
+    /** 排查用的完整适配器信息（DEBUG 级）。 */
+    fun detail(): String = "backend=${backendName()} driver=${driverInfo()}" +
         " vram=${vramMiB()}MiB shared=${sharedMiB()}MiB" +
         " luid=${luid} d3dcore=${d3dcore}"
 

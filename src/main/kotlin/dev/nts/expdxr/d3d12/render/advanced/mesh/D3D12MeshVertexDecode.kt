@@ -5,7 +5,10 @@ package dev.nts.expdxr.d3d12.render.advanced.mesh
  */
 object D3D12MeshVertexDecode {
 
-    /** `SPIRV_Cross_Input` 的一个字段：HLSL 类型 + 名字。 */
+    /**
+     * 顶点输入的一个字段：HLSL 类型 + 名字。名字来自源码，可能带 naga 去重用的下划线
+     * （`UV0_`），查 `VertexFormat` 元素前由调用方 `trimEnd('_')`。
+     */
     data class Field(val type: String, val name: String)
 
     /** 从 VS HLSL 里解析 `struct SPIRV_Cross_Input { ... };` 的字段（类型 + 名字）。 */

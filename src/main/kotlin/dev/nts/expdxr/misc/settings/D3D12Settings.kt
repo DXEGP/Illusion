@@ -4,7 +4,12 @@ import dev.nts.expdxr.CommandBundleMode
 import dev.nts.expdxr.DlssFrameGeneration
 import dev.nts.expdxr.DlssImplementation
 import dev.nts.expdxr.HdrMode
+import dev.nts.expdxr.RtBackend
+import dev.nts.expdxr.RtDebugView
+import dev.nts.expdxr.RtDenoise
 import dev.nts.expdxr.RtMode
+import dev.nts.expdxr.RtQualityProfile
+import dev.nts.expdxr.RtSamplingMode
 import dev.nts.expdxr.SrBackend
 import dev.nts.expdxr.IllusionConfig
 import dev.nts.expdxr.MeshDiagnostics
@@ -41,6 +46,10 @@ object D3D12Settings {
         val meshTerrain: Boolean,
         val meshTerrainCull: Boolean,
         val dumpHlsl: Boolean,
+        val shaderConverter: Boolean,
+        val shaderConverterDll: String,
+        val shaderConverterPrimary: Boolean,
+        val shaderConverterPipelines: String,
         val debugLayer: Boolean,
         val profiling: Boolean,
         val skipGlSwap: Boolean,
@@ -70,6 +79,34 @@ object D3D12Settings {
 
     /** 光追可见性分层（0=off 1=ao 2=ao_shadows 3=full）。 */
     val rtMode: Int,
+
+    /** 后端（0=auto 1=mega 2=dxr 3=wg）、质量档（0=validation 1=balanced 2=quality）。 */
+    val rtBackend: Int,
+    val rtQualityProfile: Int,
+
+    /** 降噪与超分轨道（[RtDenoise] 的序号）、渲染倍率百分比。 */
+    val rtDenoise: Int,
+    val rtRenderScale: Int,
+
+    /** 采样：每像素样本数、最大弹射数、方向选择（0=bsdf 1=cosine 2=reservoir）。 */
+    val rtSpp: Int,
+    val rtMaxBounces: Int,
+    val rtSamplingMode: Int,
+
+    /** 体素轨信任半径（方块）、上一帧 HZB 剔除、时域历史上限、调试视图、失效日志。 */
+    val rtVoxelTrustRadius: Float,
+    val rtHzb: Boolean,
+    val rtAsTrace: Boolean,
+    val rtHistoryFrames: Int,
+    val rtDebugView: Int,
+    val rtInvalidationLog: Boolean,
+
+    /** `[materials]`：是否读 labPBR 图，以及直接读的包目录（空 = 用启用的资源包）。 */
+    val materialsEnabled: Boolean,
+    val materialsPackPath: String,
+
+    /** 光影包名（空 = 无光影）；着色器入口按它解析路径。 */
+    val shaderpack: String,
     )
 
     @Volatile
@@ -77,6 +114,9 @@ object D3D12Settings {
 
     @Volatile
     private var pushed: String? = null
+
+    /** The capability face is read once per process: it cannot change without a device recreate. */
+    private var capsLogged = false
 
     private val warned: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
@@ -106,12 +146,59 @@ object D3D12Settings {
     /** `[dlss] reflexFrameLimitUs` — Reflex 自己的限帧器（微秒/帧，0 = 关）。 */
     val reflexFrameLimitUs: Int get() = snapshot().reflexFrameLimitUs
     /** `[mesh] terrain` — 地形走 mesh 管线（已无 IMR 回退，这是唯一的地形光栅化路径）。 */
+    val rtBackend: Int get() = snapshot().rtBackend
+
+    /** `[raytracing] mode` —— 光追档位。`OFF` 时整条链不跑，即使后端已经选了 MEGA/DXR。 */
+    val rtMode: Int get() = snapshot().rtMode
+
+    /** `[raytracing] denoise` —— 降噪与超分走哪条轨道（见 `D3D12RtPipelinePlan`）。 */
+    val rtDenoise: RtDenoise get() = RtDenoise.entries[snapshot().rtDenoise]
+
+    /** `[raytracing] renderScale` —— 光追渲染分辨率占显示分辨率的百分比（25–100）。 */
+    val rtRenderScale: Int get() = snapshot().rtRenderScale
+
+    /**
+     * 光追是否真的要出图：后端不是 `AUTO` 且档位不是 `OFF`。
+     *
+     * 两个条件缺一不可——档位是光影包自己声明的开关（`configs.json` 的 `mode`），后端是选哪条实现；
+     * 只看后端会让「档位 OFF」形同虚设，只看档位又区分不出无光影。
+     */
+    /** Compute path traced against the acceleration structure instead of the mirrored AABB. */
+    val rtAsTrace: Boolean get() = snapshot().rtAsTrace
+
+    val rtEnabled: Boolean
+        get() = rtBackend != RtBackend.AUTO.ordinal && rtMode != RtMode.OFF.ordinal
+
+    /** `[raytracing] debugView` —— 光追调试视图（把 G-Buffer 的哪一张铺到主目标上）。 */
+    val rtDebugView: Int get() = snapshot().rtDebugView
+
+    /** `[materials] enabled` —— 是否把 `_s` / `_n` 材质图读进材质表。 */
+    val materialsEnabled: Boolean get() = snapshot().materialsEnabled
+
+    /** `[materials] packPath` —— 直接读的材质包目录（空 = 用游戏里启用的资源包）。 */
+    val materialsPackPath: String get() = snapshot().materialsPackPath
+
+    /** `[shaderpack] active` —— 当前光影包名（空 = 无光影，光追保持关闭）。 */
+    val shaderpack: String get() = snapshot().shaderpack
+
     val meshTerrain: Boolean get() = snapshot().meshTerrain
 
     /** `[mesh] terrainCull` —— 用 AS 剔除地形 meshlet（依赖 `[mesh] terrain`）。 */
     val meshTerrainCull: Boolean get() = snapshot().meshTerrainCull
 
     val dumpHlsl: Boolean get() = snapshot().dumpHlsl
+
+    /** `[debug] shaderConverter` — convert every shader with the standalone DLL as a shadow of the SPIRV-Cross chain. */
+    val shaderConverter: Boolean get() = snapshot().shaderConverter
+
+    /** `[debug] shaderConverterDll` — `illusion_shader.dll` location, relative to the game directory. */
+    val shaderConverterDll: String get() = snapshot().shaderConverterDll
+
+    /** `[debug] shaderConverterPrimary` — render with the converter output where the bindings match. */
+    val shaderConverterPrimary: Boolean get() = snapshot().shaderConverterPrimary
+
+    /** `[debug] shaderConverterPipelines` — comma-separated pipeline id fragments allowed to use it. */
+    val shaderConverterPipelines: String get() = snapshot().shaderConverterPipelines
 
     val debugLayer: Boolean get() = snapshot().debugLayer
 
@@ -176,9 +263,37 @@ object D3D12Settings {
             append('|').append(s.allowTearing)
             append('|').append(s.presentChildWindow)
         }
+        // 能力面只打一行：它是光追后端选择的输入，也是排查「这台机器为什么走了 MEGA」的第一现场。
+        if (!capsLogged) {
+            MCDR_ABI.D3D12QueryRtCaps()?.let { caps ->
+                capsLogged = true
+                IllusionLogger.infoMessage(
+                    "RT caps: rt=${caps.raytracingTier} mesh=${caps.meshShaderTier} " +
+                        "wg=${caps.workGraphsTier}(${if (caps.options21Queried) "queried" else "unqueried"}) " +
+                        "vrs=${caps.shadingRateTier} sm=0x${caps.shaderModel.toString(16)} " +
+                        "ser=${caps.serActuallyReorders} dxc=${caps.dxcAvailable} " +
+                        "sched=${caps.preferredBackend} note=${caps.note}"
+                )
+                IllusionLogger.infoMessage(
+                    "RT config: backend=${s.rtBackend} mode=${s.rtMode} profile=${s.rtQualityProfile} " +
+                        "spp=${s.rtSpp} bounces=${s.rtMaxBounces} sampling=${s.rtSamplingMode} " +
+                        "hzb=${s.rtHzb} as=${s.rtAsTrace} history=${s.rtHistoryFrames} " +
+"view=${s.rtDebugView} " +
+                        "invlog=${s.rtInvalidationLog} trustRadius=${s.rtVoxelTrustRadius} " +
+                        "pack=${s.shaderpack.ifEmpty { "none" }}"
+                )
+            }
+        }
         if (wanted == pushed) return
         pushed = wanted
-        MCDR_ABI.D3D12SetEnvironment("DX12_DEBUG_LAYER", if (s.debugLayer) "1" else null)
+        // 调试层与 profiler 只在设备创建时读一次：晚于设备创建再推就等于没推，日志要能看出这件事。
+        // 调试层走专用 ABI（`mcdr_dx12SetDebugLayer`）——JVM 侧的 _putenv_s 不保证对 native 的
+        // getenv() 可见，之前正是这条路径让 `[debug] debugLayer` 静默失效。
+        if (s.debugLayer) {
+            IllusionLogger.infoMessage(
+                "settings: [debug] debugLayer requested, it attaches if the device is created after this point")
+        }
+        MCDR_ABI.D3D12SetDebugLayer(s.debugLayer)
         MCDR_ABI.D3D12SetEnvironment("DX12_PROF", if (s.profiling) "1" else null)
         MCDR_ABI.D3D12SetEnvironment(
             LEGACY_DLSS_IMPL,
@@ -274,6 +389,12 @@ object D3D12Settings {
             meshTerrain = config(true) { IllusionConfig.MESH_TERRAIN.get() },
             meshTerrainCull = config(false) { IllusionConfig.MESH_TERRAIN_CULL.get() },
             dumpHlsl = config(false) { IllusionConfig.DUMP_HLSL.get() },
+            shaderConverter = config(false) { IllusionConfig.SHADER_CONVERTER.get() },
+            shaderConverterDll = config("dxrmc/illusion_shader.dll") {
+                IllusionConfig.SHADER_CONVERTER_DLL.get()
+            },
+            shaderConverterPrimary = config(false) { IllusionConfig.SHADER_CONVERTER_PRIMARY.get() },
+            shaderConverterPipelines = config("") { IllusionConfig.SHADER_CONVERTER_PIPELINES.get() },
             dlssOutputHandover = config(true) { IllusionConfig.DLSS_OUTPUT_HANDOVER.get() } &&
                 !legacy("dlssOutputHandover") {
                     System.getProperty("dxrmc.dlssOutput")?.trim()?.equals("off", ignoreCase = true) == true
@@ -319,6 +440,29 @@ object D3D12Settings {
             allowTearing = config(true) { IllusionConfig.ALLOW_TEARING.get() },
             presentChildWindow = config(false) { IllusionConfig.PRESENT_CHILD_WINDOW.get() },
             rtMode = config(RtMode.OFF) { IllusionConfig.RAYTRACING_MODE.get() }.ordinal,
+            rtBackend = config(RtBackend.AUTO) { IllusionConfig.RAYTRACING_BACKEND.get() }.ordinal,
+            rtQualityProfile = config(RtQualityProfile.BALANCED) {
+                IllusionConfig.RAYTRACING_QUALITY_PROFILE.get()
+            }.ordinal,
+            rtDenoise = config(RtDenoise.OFF) { IllusionConfig.RAYTRACING_DENOISE.get() }.ordinal,
+            rtRenderScale = config(100) { IllusionConfig.RAYTRACING_RENDER_SCALE.get() },
+            rtSpp = config(1) { IllusionConfig.RAYTRACING_SPP.get() },
+            rtMaxBounces = config(2) { IllusionConfig.RAYTRACING_MAX_BOUNCES.get() },
+            rtSamplingMode = config(RtSamplingMode.BSDF) {
+                IllusionConfig.RAYTRACING_SAMPLING_MODE.get()
+            }.ordinal,
+            rtVoxelTrustRadius = config(8.0) { IllusionConfig.RAYTRACING_VOXEL_TRUST_RADIUS.get() }
+                .toFloat(),
+            rtHzb = config(false) { IllusionConfig.RAYTRACING_HZB.get() },
+            rtAsTrace = config(false) { IllusionConfig.RAYTRACING_AS_TRACE.get() },
+            rtHistoryFrames = config(16) { IllusionConfig.RAYTRACING_HISTORY_FRAMES.get() },
+            rtDebugView = config(RtDebugView.NONE) {
+                IllusionConfig.RAYTRACING_DEBUG_VIEW.get()
+            }.ordinal,
+            rtInvalidationLog = config(false) { IllusionConfig.RAYTRACING_INVALIDATION_LOG.get() },
+            materialsEnabled = config(true) { IllusionConfig.MATERIALS_ENABLED.get() },
+            materialsPackPath = config("") { IllusionConfig.MATERIALS_PACK_PATH.get().trim() },
+            shaderpack = config("B-Mega") { IllusionConfig.SHADERPACK_ACTIVE.get().trim() },
             dlssgMode = config(DlssFrameGeneration.OFF) { IllusionConfig.DLSS_FRAME_GENERATION.get() }.ordinal,
             dlssgFrames = config(1) { IllusionConfig.DLSS_FRAME_GENERATION_FRAMES.get() },
             srBackend = config(SrBackend.DLSS) { IllusionConfig.SR_BACKEND.get() },
@@ -345,3 +489,4 @@ object D3D12Settings {
         return true
     }
 }
+

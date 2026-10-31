@@ -66,7 +66,7 @@ object D3D12Fatal {
                     "and saved options.txt ($reason)",
                 true)
         } catch (t: Throwable) {
-            LOGGER.error("preferredGraphicsBackend reset in memory but options.txt could not be saved", t)
+            LOGGER.error("preferredGraphicsBackend reset; options.txt save failed", t)
             "reset in memory to \"${PreferredGraphicsApi.DEFAULT.serializedName}\", but saving options.txt failed: ${t}"
         }
     }
@@ -110,7 +110,7 @@ object D3D12Fatal {
                     "startedCleanly in $file directly (Minecraft instance was unavailable: $reason)",
                 true)
         } catch (t: Throwable) {
-            LOGGER.error("failed to reset $file without a Minecraft instance", t)
+            LOGGER.error("failed to reset $file, no Minecraft instance", t)
             "reset failed: Minecraft instance is unavailable and $file could not be rewritten: $t"
         }
     }
@@ -129,7 +129,7 @@ object D3D12Fatal {
             "reset threw ${t}"
         }
 
-        LOGGER.error("fatal: {} (no GL/Vulkan fallback by design)", what)
+        LOGGER.error("fatal: {}, no GL/Vulkan fallback", what)
         showPopup(what, resetDetail)
         val report = CrashReport.forThrowable(cause ?: RuntimeException(what), TITLE)
         val category = report.addCategory("DXRMC / Direct3D 12")
@@ -158,7 +158,7 @@ object D3D12Fatal {
      */
     private fun showPopup(what: String, resetDetail: String) {
         if (D3D12Settings.noCrashPopup) {
-            LOGGER.warn("fatal dialog suppressed ([debug] noCrashPopup = true); see the crash report instead")
+            LOGGER.warn("fatal dialog suppressed ([debug] noCrashPopup = true)")
             return
         }
 
@@ -180,15 +180,15 @@ object D3D12Fatal {
         val fallbackMessage = sanitizeForTinyfd(message)
 
         // 守护线程：没人点也不会拖住 JVM；自动化用 [debug] noCrashPopup 直接跳过。
-        LOGGER.info("showing fatal error dialog (set [debug] noCrashPopup = true to suppress)")
+        LOGGER.info("showing fatal dialog ([debug] noCrashPopup = true skips)")
         val dialog = Thread({
             try {
                 if (!showNativeMessageBox(message, "Minecraft")) {
-                    LOGGER.info("falling back to MessageBox.error (tinyfd) for the fatal dialog")
+                    LOGGER.info("fatal dialog falls back to MessageBox.error")
                     MessageBox.error(fallbackMessage)
                 }
             } catch (t: Throwable) {
-                LOGGER.error("failed to show the fatal error dialog", t)
+                LOGGER.error("failed to show the fatal dialog", t)
             }
         }, "dxrmc-fatal-dialog")
         dialog.isDaemon = true
@@ -196,7 +196,7 @@ object D3D12Fatal {
         try {
             dialog.join(DIALOG_WAIT_MILLIS)
             if (dialog.isAlive) {
-                LOGGER.warn("fatal dialog still open after {} ms; writing the crash report anyway",
+                LOGGER.warn("fatal dialog open after {} ms, report written anyway",
                     DIALOG_WAIT_MILLIS)
             }
         } catch (t: InterruptedException) {
@@ -230,7 +230,7 @@ object D3D12Fatal {
                 result > 0
             }
         } catch (t: Throwable) {
-            LOGGER.warn("direct user32!MessageBoxW failed ({}); will use MessageBox.error",
+            LOGGER.warn("user32!MessageBoxW failed ({}), using MessageBox.error",
                 t.toString())
             false
         }
@@ -248,7 +248,7 @@ object D3D12Fatal {
     private fun sanitizeForTinyfd(message: String): String {
         val sanitized = message.replace('"', '`').replace('\'', '`')
         if (sanitized != message) {
-            LOGGER.info("fatal dialog fallback text had quotes; replaced with backticks for tinyfd")
+            LOGGER.info("dialog text had quotes, replaced with backticks")
         }
         return sanitized
     }

@@ -18,6 +18,8 @@ class D3D12CompiledRenderPipeline(
     private val fragmentShader: D3D12IntermediaryShaderModule,
     private val vertexHlsl: String,
     private val fragmentHlsl: String,
+    /** 转换器接管的 buffer texture：这些条目的 HLSL 是 `ByteAddressBuffer`，描述符要建 RAW 视图。 */
+    private val rawBuffers: Set<String> = emptySet(),
 ) : BackendRenderPipeline {
     /** 管线生命周期内恒定，缓存以避免每帧重复构建（含 stream/集合分配）。 */
     @Volatile
@@ -62,6 +64,24 @@ class D3D12CompiledRenderPipeline(
 
     fun lineQuadPipeline(): Long = this.lineQuadPso
 
+    /**
+     * G-Buffer 变体 PSO：同一套 meshlet MS（改成输出世界坐标）+ 自己的 PS，写四张附件、深度只读比较。
+     * 见 docs/rt/README.md §8。
+     */
+    private var gbufferPso: Long = 0L
+
+    /** 挂上 G-Buffer 变体（重复挂会先释放旧的）。 */
+    fun attachGBufferVariant(pso: Long) {
+        if (this.gbufferPso != 0L && this.gbufferPso != pso) {
+            MCDR_ABI.D3D12DestroyPipeline(this.gbufferPso)
+        }
+        this.gbufferPso = pso
+    }
+
+    fun hasGBufferVariant(): Boolean = this.gbufferPso != 0L
+
+    fun gbufferPipeline(): Long = this.gbufferPso
+
 
     fun info(): RenderPipeline {
         return this.info
@@ -98,8 +118,12 @@ class D3D12CompiledRenderPipeline(
                 // 26.3 起 BindGroupLayout 为每个纹理 uniform 都报一条描述，「名字在 allUniforms 里」
                 // 不再等于「texel buffer」：必须按 UniformType 判定（26.2 是靠 getSamplers() 的存在性）。
                 if (utbDesc != null && utbDesc.type() == UniformType.TEXEL_BUFFER) {
-                    entries.add(D3D12BindGroupEntry(D3D12BindGroupEntry.Type.TEXEL_BUFFER, name,
-                        utbDesc.gpuFormat()))
+                    // 转换器把该 buffer texture 降级成只读 storage buffer（HLSL 是 ByteAddressBuffer），
+                    // 描述符必须建 RAW 视图；保留格式会得到一个喂不进 ByteAddressBuffer 的类型化视图。
+                    val type = if (name in this.rawBuffers) D3D12BindGroupEntry.Type.RAW_BUFFER
+                        else D3D12BindGroupEntry.Type.TEXEL_BUFFER
+                    entries.add(D3D12BindGroupEntry(type, name,
+                        if (type == D3D12BindGroupEntry.Type.RAW_BUFFER) null else utbDesc.gpuFormat()))
                 } else {
                     entries.add(D3D12BindGroupEntry(D3D12BindGroupEntry.Type.SAMPLED_IMAGE, name, null))
                 }
@@ -138,6 +162,14 @@ class D3D12CompiledRenderPipeline(
         if (this.meshletPso != 0L) {
             MCDR_ABI.D3D12DestroyPipeline(this.meshletPso)
             this.meshletPso = 0L
+        }
+        if (this.lineQuadPso != 0L) {
+            MCDR_ABI.D3D12DestroyPipeline(this.lineQuadPso)
+            this.lineQuadPso = 0L
+        }
+        if (this.gbufferPso != 0L) {
+            MCDR_ABI.D3D12DestroyPipeline(this.gbufferPso)
+            this.gbufferPso = 0L
         }
         // 先取走再归零：FrontendGpuDevice.close() 与缓存/桥接路径都可能再 close 一次，
         // 不归零就是同一个 Dx12Pipeline* 被销毁两次（原生 double free → 退出时 0xC0000374 堆损坏）。

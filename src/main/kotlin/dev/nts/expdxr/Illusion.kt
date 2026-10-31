@@ -8,6 +8,7 @@ import dev.nts.expdxr.d3d12.backend.D3D12GraphicsApi
 import dev.nts.expdxr.d3d12.debug.D3D12VrsDebugEntry
 import dev.nts.expdxr.d3d12.extern.MCDR_ABI
 import dev.nts.expdxr.d3d12.render.adapter.D3D12AdapterInfo
+import dev.nts.expdxr.dxrmc.rt.D3D12RtMaterialTable
 import dev.nts.expdxr.d3d12.render.advanced.vrs.D3D12VariableShadingRate
 import dev.nts.expdxr.misc.IllusionLogger
 import net.neoforged.bus.api.IEventBus
@@ -38,6 +39,8 @@ class Illusion(modEventBus: IEventBus, modContainer: ModContainer) {
         D3D12VrsDebugEntry.register(modEventBus)
         // 退出存档时把 VRS 诊断计数清零（属于一局的统计，不跨存档累加）。
         D3D12VariableShadingRate.register()
+        // 材质表在第一个客户端 tick 惰性烘一次；`[raytracing] backend = AUTO` 时每个 tick 直接返回。
+        D3D12RtMaterialTable.register()
         // Construct log level before initialize the logger.
         IllusionLogger.applyDefaults()
         // early-window provider 以 jar-in-jar 形式随模组发布，启动时解到 mods/ 并改好 fml.toml。
@@ -54,15 +57,15 @@ class Illusion(modEventBus: IEventBus, modContainer: ModContainer) {
             D3D12Settings.pushToNative()
             applyGpuCaptureConfig()
         }
-        LOGGER.info("[$MODID] $MOD_NAME is constructing...")
+        LOGGER.info("$MOD_NAME constructing")
         // 一行构建标记：任何一份日志都能自己回答"跑的是不是刚编出来的代码"。
         // To probe exact backend setting before loading the mod, the only way to achieve this is to read it from file.
         val preferredGraphics = preferredGraphicsSettingFromOptionsFile()
         LOGGER.info(
             if (preferredGraphics == D3D12GraphicsApi.SERIALIZED_NAME) {
-                "[$NATIVE_NAME] $MODID is currently using Direct3D Feature Level ${startupFeatureLevel()}."
+                "$MODID is currently using Direct3D Feature Level ${startupFeatureLevel()}."
             } else {
-                "[$MODID] Preferred graphics setting is ${preferredGraphics ?: "default"}, so $NATIVE_NAME will not be initialized."
+                "Preferred graphics setting is ${preferredGraphics ?: "default"}, so $NATIVE_NAME will not be initialized."
             }
         )
     }
@@ -73,7 +76,7 @@ class Illusion(modEventBus: IEventBus, modContainer: ModContainer) {
      * The live device does not exist yet at mod construction — [D3D12AdapterInfo.current] is only
      * filled once [dev.nts.expdxr.d3d12.render.adapter.D3D12Device] created it — so this asks the
      * native side to enumerate the adapters instead (DXGI/DXCore walk plus a throw-away probe
-     * device per adapter, no persistent device is created). Selection matches native P66: the
+     * device per adapter, no persistent device is created). Selection matches the native choice: the
      * first adapter that can create a 12_2 device, otherwise the first D3D12-capable one.
      *
      * Returns `"unknown"` when the native library is unavailable or the query fails: this line is
@@ -120,7 +123,7 @@ class Illusion(modEventBus: IEventBus, modContainer: ModContainer) {
                     ?.takeIf { it.isNotEmpty() }
             }
         } catch (t: Throwable) {
-            LOGGER.warn("[$MODID] could not read $file ($t); assuming the vanilla default graphics setting")
+            LOGGER.warn("could not read $file ($t); using vanilla default")
             null
         }
     }
@@ -141,12 +144,12 @@ class Illusion(modEventBus: IEventBus, modContainer: ModContainer) {
         val enabled = IllusionConfig.PIX_CAPTURE.get() || IllusionConfig.PIX_TIMING_CAPTURE.get()
         val status = MCDR_ABI.D3D12SetPIXCapture(enabled)
         when (status) {
-            1 -> LOGGER.info("[$MODID] PIX GPU capture layer loaded (PIX must be running to save a capture).")
+            1 -> LOGGER.info("PIX capture layer loaded")
 
-            0 if enabled -> LOGGER.info("[$MODID] PIX GPU capture requested; the layer loads before the first device.")
-            0 -> LOGGER.info("[$MODID] PIX GPU capture disabled ([debug] pixCapture = false).")
-            Int.MIN_VALUE -> LOGGER.info("[$MODID] PIX GPU capture unavailable: the loaded $NATIVE_NAME.dll has no mcdrSetPixCapture.")
-            else -> LOGGER.warn("[$MODID] PIX GPU capture is on but WinPixGpuCapturer.dll could not be loaded; see the [$NATIVE_NAME] ERROR line for the paths that were searched, or set MCDR_PIX_CAPTURER.")
+            0 if enabled -> LOGGER.info("PIX capture requested; layer loads before first device")
+            0 -> LOGGER.info("PIX capture off ([debug] pixCapture = false)")
+            Int.MIN_VALUE -> LOGGER.info("PIX capture unavailable: no mcdrSetPixCapture export")
+            else -> LOGGER.warn("WinPixGpuCapturer.dll not found; set MCDR_PIX_CAPTURER")
         }
     }
 }

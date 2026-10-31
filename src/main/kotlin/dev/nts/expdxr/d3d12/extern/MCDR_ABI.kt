@@ -46,6 +46,7 @@ object MCDR_ABI {
     private var MH_setlogverbose: MethodHandle? = null
     private var MH_setloglevel: MethodHandle? = null
     private var MH_setshutdowntrace: MethodHandle? = null
+    private var MH_setdebuglayer: MethodHandle? = null
     private var MH_setlogfile: MethodHandle? = null
     private var MH_setenvironment: MethodHandle? = null
     private var MH_setpixcapture: MethodHandle? = null
@@ -60,6 +61,7 @@ object MCDR_ABI {
     /** The 8 SR entry points; all skipOptional. */
     private var MH_srpick: MethodHandle? = null
     private var MH_srquerycaps: MethodHandle? = null
+    private var MH_rtquerycaps: MethodHandle? = null
     private var MH_srcreate: MethodHandle? = null
     private var MH_srresize: MethodHandle? = null
     private var MH_srevaluate: MethodHandle? = null
@@ -93,6 +95,13 @@ object MCDR_ABI {
     private var MH_reflexframebegin: MethodHandle? = null
     private var MH_reflexmarker: MethodHandle? = null
     private var MH_meshsupport: MethodHandle? = null
+    /** NRD 实例清单（S4 4-c）：纯 CPU 调用，不需要设备。 */
+    private var MH_nrdinspect: MethodHandle? = null
+    /** NRD 常驻上下文（S4 4-c）：实例 + PSO + 纹理池 + 描述符堆。 */
+    private var MH_nrdinit: MethodHandle? = null
+    private var MH_nrdshutdown: MethodHandle? = null
+    private var MH_nrddenoise: MethodHandle? = null
+    private var MH_dlssdeval: MethodHandle? = null
     /** Reflex mode + availability. */
     private var MH_setreflexmode: MethodHandle? = null
     private var MH_setdlssgmode: MethodHandle? = null
@@ -176,6 +185,23 @@ object MCDR_ABI {
 
     // Compute minimum path (prerequisite for the shading-rate image / NRC).
     private var MH_createcomputepipeline: MethodHandle? = null
+    private var MH_createcomputepipelineex: MethodHandle? = null
+    private var MH_dispatchcomputeex: MethodHandle? = null
+    private var MH_barrier: MethodHandle? = null
+    // 加速结构（S3）：BLAS/TLAS。
+    private var MH_createaccelstructbuffer: MethodHandle? = null
+    private var MH_getblasprebuildinfo: MethodHandle? = null
+    private var MH_gettlasprebuildinfo: MethodHandle? = null
+    private var MH_buildblas: MethodHandle? = null
+    private var MH_buildtlas: MethodHandle? = null
+    private var MH_copyaccelstruct: MethodHandle? = null
+    private var MH_createaccelstructview: MethodHandle? = null
+    private var MH_getbufferaddress: MethodHandle? = null
+    // 光线追踪状态对象（S3 3-f）：RTPS / 着色器标识符 / DispatchRays。
+    private var MH_createraytracingpipeline: MethodHandle? = null
+    private var MH_getshaderidentifier: MethodHandle? = null
+    private var MH_dispatchrays: MethodHandle? = null
+    private var MH_rttrackstats: MethodHandle? = null
     private var MH_dispatchcompute: MethodHandle? = null
     private var MH_createcomputepipelineshadingrate: MethodHandle? = null
     private var MH_createshadingrateimage: MethodHandle? = null
@@ -456,11 +482,15 @@ object MCDR_ABI {
         return if (seg == null) 0L else seg.address()
     }
     /**
-     * `MCDR_ABI_VERSION` from `mcdr_abi.h`; 2->3 added the SR tables, 3->4 the FG tables (append-only).
+     * `MCDR_ABI_VERSION` from `mcdr_abi.h`; 2->3 the SR tables, 3->4 the FG tables, 4->5 the RT caps,
+     * tracker and barrier tables, 5->6 the tracker's promotion / widening counters (append-only),
+     * 6->7 the compute constant-buffer slot, 7->8 the acceleration-structure table with its seven
+     * entry points, 8->9 the ray tracing state object (RTPS), shader identifiers and DispatchRays,
+     * 10->11 the NRD instance inspector.
      * This constant, the Kotlin mirrors and the native `layoutTable()` must agree — [verifyABI]
      * aborts before device creation otherwise.
      */
-    const val MCDR_ABI_VERSION: Int = 4
+    const val MCDR_ABI_VERSION: Int = 16
     /** `MCDR_FG_BACKEND_*`, value for value with `mcdr_abi.h`. */
     const val FG_BACKEND_NONE: Int = 0
     const val FG_BACKEND_DLSSG: Int = 1
@@ -578,6 +608,20 @@ object MCDR_ABI {
         // configuration propagation must never fail start-up
         }
     }
+    /**
+     * Request the D3D12 debug layer — config `[debug] debugLayer`. It is enabled while the first device is
+     * created, so a later call changes nothing; return `1` when the request was recorded.
+     */
+    fun D3D12SetDebugLayer(enabled: Boolean): Int {
+        val handle = MH_setdebuglayer ?: return Int.MIN_VALUE
+        return try {
+            handle.invokeExact(if (enabled) 1 else 0) as Int
+        } catch (t: Throwable) {
+            IllusionLogger.warnMessage("dx12SetDebugLayer failed: $t")
+            Int.MIN_VALUE
+        }
+    }
+
     /**
      * Whether shutdown-path progress markers bypass logLevel; config `[logging] shutdownTrace`.
      * A DLL without this export keeps the built-in always-on behaviour.
@@ -868,6 +912,94 @@ object MCDR_ABI {
     }
     /** 0=auto 1=force on 2=force off; takes effect only when the swapchain is (re)built. */
     /** 0=off 1=ao 2=ao_shadows 3=full; state only — push it before the device is created. */
+    /**
+     * 光追 / Work Graph 的能力面（`mcdr_dx12QueryRtCaps`）。
+     *
+     * 与 `mcdr_device.cppm` 的 `Capabilities` 同源，但**只有这一份能跨进程边界读到**：能力串的
+     * `wg=` / `ser=` 段与光追计划的 B-WG 门控都读它。tier 是 D3D12 枚举原值（0/10/11/12），
+     * `options21Queried = false` 时 `workGraphsTier = 0` 只表示"没问成"，不表示"不支持"。
+     */
+    data class RtCaps(
+        val raytracingTier: Int,
+        val meshShaderTier: Int,
+        val workGraphsTier: Int,
+        val shadingRateTier: Int,
+        val shaderModel: Int,
+        val samplerFeedbackTier: Int,
+        val options21Queried: Boolean,
+        val options22Queried: Boolean,
+        val serActuallyReorders: Boolean,
+        val enhancedBarriers: Boolean,
+        val dxcAvailable: Boolean,
+        val max1DDispatchSize: Int,
+        val max1DDispatchMeshSize: Int,
+        val note: String
+    ) {
+        /** D3D12_RAYTRACING_TIER_1_0 = 10。 */
+        val raytracingSupported: Boolean get() = raytracingTier >= 10
+
+        /** D3D12_RAYTRACING_TIER_1_1 = 11（inline RayQuery 需要的下限）。 */
+        val inlineRayQuerySupported: Boolean get() = raytracingTier >= 11
+
+        val meshShadersSupported: Boolean get() = meshShaderTier >= 10
+
+        /** D3D12_WORK_GRAPHS_TIER_1_0 = 10；`options21Queried = false` 时恒 false。 */
+        val workGraphsSupported: Boolean get() = options21Queried && workGraphsTier >= 10
+
+        val shadingRateImageSupported: Boolean get() = shadingRateTier >= 2
+
+        /** D3D_SHADER_MODEL_6_9 == 0x69；图形管线的硬下限。 */
+        val shaderModel69: Boolean get() = shaderModel >= 0x69
+
+        /**
+         * 能力侧允许的后端，顺序即偏好（WG → DXR → MEGA）。
+         *
+         * 只看硬件/运行时能力：用户的 `[raytracing] backend` 与 G1 探针结果由上层合成 ——
+         * 探针是构建期事实（`_port\wg_probe`），这里不能假装知道。
+         */
+        val capabilityBackends: List<String>
+            get() = buildList {
+                if (workGraphsSupported) add("WG")
+                if (inlineRayQuerySupported) add("DXR")
+                add("MEGA")
+            }
+
+        val preferredBackend: String get() = capabilityBackends.first()
+    }
+
+    /** 读能力面；native 未导出该符号时返回 null（旧 native / 非 D3D12 后端）。 */
+    fun D3D12QueryRtCaps(): RtCaps? {
+        if (LOAD_FAILURE != null) return null
+        val handle = MH_rtquerycaps ?: return null
+        return try {
+            Arena.ofConfined().use { arena ->
+                val seg = arena.allocate(MCDRLayout.RT_CAPS)
+                if (handle.invokeExact(seg) as Int != 1) {
+                    return null
+                }
+                RtCaps(
+                    raytracingTier = seg.get(MCDRLayout.I32, MCDRLayout.RT_CAPS_RAYTRACING_TIER),
+                    meshShaderTier = seg.get(MCDRLayout.I32, MCDRLayout.RT_CAPS_MESH_SHADER_TIER),
+                    workGraphsTier = seg.get(MCDRLayout.I32, MCDRLayout.RT_CAPS_WORK_GRAPHS_TIER),
+                    shadingRateTier = seg.get(MCDRLayout.I32, MCDRLayout.RT_CAPS_SHADING_RATE_TIER),
+                    shaderModel = seg.get(MCDRLayout.I32, MCDRLayout.RT_CAPS_SHADER_MODEL),
+                    samplerFeedbackTier = seg.get(MCDRLayout.I32, MCDRLayout.RT_CAPS_SAMPLER_FEEDBACK_TIER),
+                    options21Queried = seg.get(MCDRLayout.I32, MCDRLayout.RT_CAPS_OPTIONS21_QUERIED) != 0,
+                    options22Queried = seg.get(MCDRLayout.I32, MCDRLayout.RT_CAPS_OPTIONS22_QUERIED) != 0,
+                    serActuallyReorders = seg.get(MCDRLayout.I32, MCDRLayout.RT_CAPS_SER_ACTUALLY_REORDERS) != 0,
+                    enhancedBarriers = seg.get(MCDRLayout.I32, MCDRLayout.RT_CAPS_ENHANCED_BARRIERS) != 0,
+                    dxcAvailable = seg.get(MCDRLayout.I32, MCDRLayout.RT_CAPS_DXC_AVAILABLE) != 0,
+                    max1DDispatchSize = seg.get(MCDRLayout.I32, MCDRLayout.RT_CAPS_MAX_1D_DISPATCH),
+                    max1DDispatchMeshSize = seg.get(MCDRLayout.I32, MCDRLayout.RT_CAPS_MAX_1D_DISPATCH_MESH),
+                    note = seg.getString(MCDRLayout.RT_CAPS_NOTE)
+                )
+            }
+        } catch (t: Throwable) {
+            IllusionLogger.warnMessage("dx12QueryRtCaps failed: ${t}")
+            null
+        }
+    }
+
     fun D3D12SetRaytracingMode(mode: Int) {
         if (!isAvailable()) return
         @Suppress("TooGenericExceptionCaught")
@@ -921,6 +1053,134 @@ object MCDR_ABI {
             -1
         }
     }
+    /** 1 = 清单写进 [textOut]，0 = 这份 DLL 没编进 NRD，-1 = 没导出或建实例失败；每行一条事实。 */
+    fun D3D12NrdInspect(textOut: MemorySegment, capacity: Int): Int {
+        if (LOAD_FAILURE != null) return -1
+        val handle = MH_nrdinspect ?: return -1
+        return try {
+            (handle.invokeExact(textOut, capacity) as Int)
+        } catch (t: Throwable) {
+            IllusionLogger.warnMessage("dx12NrdInspect failed: ${t}")
+            -1
+        }
+    }
+    /**
+     * 建常驻的 NRD 上下文（S4 4-c）：实例、每条着色器一条 PSO、两套纹理池、一张描述符堆。
+     * 分辨率变了会整体重建，所以每帧都可以调；返回 1=就绪 0=没编进 NRD -1=失败。
+     */
+    fun D3D12NrdInit(width: Int, height: Int, textOut: MemorySegment, capacity: Int): Int {
+        if (LOAD_FAILURE != null) return -1
+        val handle = MH_nrdinit ?: return -1
+        return try {
+            (handle.invokeExact(width, height, textOut, capacity) as Int)
+        } catch (t: Throwable) {
+            IllusionLogger.warnMessage("dx12NrdInit failed: ${t}")
+            -1
+        }
+    }
+
+    /**
+     * 逐帧降噪派发（S4 4-c）：五张纹理按 motion / normal-roughness / viewZ / radiance-in /
+     * radiance-out 传，matrices 是 4 个列主序 4x4。返回派发的 pass 数，0 表示没有上下文。
+     */
+    fun D3D12NrdDenoise(
+        encoder: Long,
+        textures: LongArray,
+        matrices: MemorySegment,
+        frameIndex: Int,
+        resetHistory: Boolean,
+        textOut: MemorySegment,
+        capacity: Int,
+    ): Int {
+        if (LOAD_FAILURE != null) return -1
+        val handle = MH_nrddenoise ?: return -1
+        val count = textures.size
+        Arena.ofConfined().use { arena ->
+            val array = arena.allocate(MCDRLayout.PTR.byteSize() * count, MCDRLayout.PTR.byteAlignment())
+            for (i in textures.indices) {
+                array.setAtIndex(MCDRLayout.PTR, i.toLong(), MemorySegment.ofAddress(textures[i]))
+            }
+            return try {
+                (handle.invokeExact(
+                    encoder,
+                    array,
+                    count,
+                    matrices,
+                    frameIndex,
+                    if (resetHistory) 1 else 0,
+                    textOut,
+                    capacity,
+                ) as Int)
+            } catch (t: Throwable) {
+                IllusionLogger.warnMessage("dx12NrdDenoise failed: ${t}")
+                -1
+            }
+        }
+    }
+
+    /**
+     * DLSS-D（Ray Reconstruction）逐帧求值（S4 4-d）：纹理按 radiance / output / depth / motion /
+     * normal 给；packed 模式到此为止，unpacked 模式再加一张粗糙度。
+     *
+     * [constants] 是 `slSetConstants` 的载荷（72 个浮点，四个行主序矩阵 + near/far/fovY/aspect）；
+     * 传 null 时 SL 按「零位移」重投影，画面会拖影。返回 1 表示 SL 接受，0 表示未执行（SL 缺函数），
+     * -1 表示失败。
+     */
+    fun D3D12DlssdEval(
+        encoder: Long,
+        textures: LongArray,
+        width: Int,
+        height: Int,
+        outputWidth: Int,
+        outputHeight: Int,
+        frameIndex: Int,
+        reset: Boolean,
+        constants: MemorySegment?,
+        textOut: MemorySegment,
+        capacity: Int,
+    ): Int {
+        if (LOAD_FAILURE != null) return -1
+        val handle = MH_dlssdeval ?: return -1
+        val count = textures.size
+        Arena.ofConfined().use { arena ->
+            val array = arena.allocate(MCDRLayout.PTR.byteSize() * count, MCDRLayout.PTR.byteAlignment())
+            for (i in textures.indices) {
+                array.setAtIndex(MCDRLayout.PTR, i.toLong(), MemorySegment.ofAddress(textures[i]))
+            }
+            return try {
+                (handle.invokeExact(
+                    encoder,
+                    array,
+                    count,
+                    width,
+                    height,
+                    outputWidth,
+                    outputHeight,
+                    frameIndex,
+                    if (reset) 1 else 0,
+                    constants ?: MemorySegment.NULL,
+                    textOut,
+                    capacity,
+                ) as Int)
+            } catch (t: Throwable) {
+                IllusionLogger.warnMessage("dx12DlssdEval failed: ${t}")
+                -1
+            }
+        }
+    }
+
+    /** 销毁上面的上下文；设备销毁前调一次。 */
+    fun D3D12NrdShutdown(): Int {
+        if (LOAD_FAILURE != null) return -1
+        val handle = MH_nrdshutdown ?: return -1
+        return try {
+            (handle.invokeExact() as Int)
+        } catch (t: Throwable) {
+            IllusionLogger.warnMessage("dx12NrdShutdown failed: ${t}")
+            -1
+        }
+    }
+
     /** PCL marker (1=eSimulationEnd 2=eRenderSubmitStart). */
     fun D3D12ReflexMarker(marker: Int) {
         if (LOAD_FAILURE != null) return
@@ -2149,6 +2409,389 @@ object MCDR_ABI {
         }
     }
 
+    /** SRV 走 t0..、UAV 走 u0..，各 0..16；两张表可以任一为空。 */
+    fun D3D12CreateComputePipelineEx(dxil: ByteArray, srvCount: Int, uavCount: Int): Long {
+        requireLoaded()
+        val handle = MH_createcomputepipelineex ?: return 0L
+        Arena.ofConfined().use { arena ->
+            val src = arena.allocate(dxil.size.toLong().coerceAtLeast(1L))
+            MemorySegment.copy(dxil, 0, src, ValueLayout.JAVA_BYTE, 0, dxil.size)
+            return addr(handle.invokeExact(src, dxil.size, srvCount, uavCount) as MemorySegment)
+        }
+    }
+
+    /**
+     * `[srvs]`/`[uavs]` 是纹理或缓冲句柄，二者不能是同一张纹理。
+     * `[cbv]` 是整块常量缓冲（0 = 不绑），`[cbvOffset]` 必须 256 字节对齐（D3D12 常量缓冲要求）。
+     * `false` = 参数错或列表未开。
+     */
+    fun D3D12DispatchComputeEx(ctx: Long, pipeline: Long, srvs: LongArray, uavs: LongArray,
+                               constants: IntArray, cbv: Long, cbvOffset: Long,
+                               x: Int, y: Int, z: Int): Boolean {
+        requireLoaded()
+        val handle = MH_dispatchcomputeex ?: return false
+        val count = constants.size
+        require(count in 0..8) { "compute constants: 0..8 dwords, got $count" }
+        Arena.ofConfined().use { arena ->
+            fun handles(values: LongArray): MemorySegment {
+                if (values.isEmpty()) return MemorySegment.NULL
+                val seg = arena.allocate(values.size * 8L)
+                values.forEachIndexed { i, v -> seg.set(MCDRLayout.PTR, i * 8L, ptr(v)) }
+                return seg
+            }
+            val srvSeg = handles(srvs)
+            val uavSeg = handles(uavs)
+            val cSeg = if (count == 0) MemorySegment.NULL else arena.allocate(count * 4L)
+            for (i in 0 until count) cSeg.set(MCDRLayout.I32, i * 4L, constants[i])
+            return ok(
+                handle.invokeExact(ptr(ctx), ptr(pipeline), srvSeg, srvs.size, uavSeg, uavs.size,
+                    cSeg, count, ptr(cbv), cbvOffset, x, y, z) as Int
+            )
+        }
+    }
+
+    /**
+     * 一条 BLAS 几何（`mcdr_rt_geometry` 的 Kotlin 镜像）：顶点与索引都指向已经上传到 GPU 的缓冲，
+     * 偏移是**字节**偏移（顶点为 `StartVertexLocation * vertexStride`）。
+     * [indexStride] 是索引宽度（2 = R16_UINT、4 = R32_UINT）：段内顶点超过 65535 时必须是 4。
+     * [useAlphaTest] 为 false 时几何标成不透明 —— 驱动据此跳过任何跨几何的 alpha 判定。
+     */
+    class RtGeometry(
+        val vertexBuffer: Long,
+        val vertexStride: Long,
+        val vertexCount: Long,
+        val vertexOffset: Long,
+        val indexBuffer: Long,
+        val indexCount: Long,
+        val indexOffset: Long,
+        val indexStride: Int = 2,
+        val useAlphaTest: Boolean = false,
+    )
+
+    /** 建一块能直接当 BLAS/TLAS 用的缓冲（DEFAULT 堆 + ALLOW_UNORDERED_ACCESS，初始状态 AS）。0 = 失败。 */
+    fun D3D12CreateAccelStructBuffer(size: Long): Long {
+        requireLoaded()
+        try {
+            return addr(MH_createaccelstructbuffer!!.invokeExact(size) as MemorySegment)
+        } catch (t: Throwable) {
+            throw unexpected(t)
+        }
+    }
+
+    /**
+     * 查询 BLAS 预构建信息，返回 `[结果上限字节, scratch 字节]`；失败返回 null（原因见 native 最后错误）。
+     * 最多 4 条几何（native 侧 `kMaxAccelGeometries`）。
+     */
+    fun D3D12GetBlasPrebuildInfo(geometries: List<RtGeometry>): LongArray? {
+        requireLoaded()
+        require(geometries.isNotEmpty() && geometries.size <= MAX_ACCEL_GEOMETRIES) {
+            "blas geometries: 1..$MAX_ACCEL_GEOMETRIES, got ${geometries.size}"
+        }
+        Arena.ofConfined().use { arena ->
+            val seg = geometryArray(arena, geometries)
+            val out = arena.allocate(16L)
+            val ok = MH_getblasprebuildinfo!!.invokeExact(seg, geometries.size, out) as Int
+            if (ok == 0) return null
+            return longArrayOf(out.get(MCDRLayout.I64, 0L), out.get(MCDRLayout.I64, 8L))
+        }
+    }
+
+    /** 查询 TLAS 预构建信息，返回 `[结果上限字节, scratch 字节]`；失败返回 null。 */
+    fun D3D12GetTlasPrebuildInfo(instanceCount: Int): LongArray? {
+        requireLoaded()
+        require(instanceCount > 0) { "tlas instances must be positive, got $instanceCount" }
+        Arena.ofConfined().use { arena ->
+            val out = arena.allocate(16L)
+            val ok = MH_gettlasprebuildinfo!!.invokeExact(instanceCount, out) as Int
+            if (ok == 0) return null
+            return longArrayOf(out.get(MCDRLayout.I64, 0L), out.get(MCDRLayout.I64, 8L))
+        }
+    }
+
+    /**
+     * 在已打开的命令列表上构建/更新 BLAS。[update] = true 走 `PERFORM_UPDATE`（要求 [dest] 里已经是
+     * 同一拓扑的 BLAS）；false 走首次构建（`PREFER_FAST_BUILD + ALLOW_UPDATE`）。
+     */
+    fun D3D12BuildBlas(ctx: Long, dest: Long, scratch: Long, geometries: List<RtGeometry>,
+                       update: Boolean): Boolean {
+        requireLoaded()
+        require(geometries.isNotEmpty() && geometries.size <= MAX_ACCEL_GEOMETRIES) {
+            "blas geometries: 1..$MAX_ACCEL_GEOMETRIES, got ${geometries.size}"
+        }
+        Arena.ofConfined().use { arena ->
+            val seg = geometryArray(arena, geometries)
+            return ok(MH_buildblas!!.invokeExact(
+                ptr(ctx), ptr(dest), ptr(scratch), seg, geometries.size,
+                if (update) 1 else 0,
+            ) as Int)
+        }
+    }
+
+    /** 在已打开的命令列表上重建 TLAS。[instances] 是装满 64 字节实例记录的缓冲。 */
+    fun D3D12BuildTlas(ctx: Long, dest: Long, scratch: Long, instances: Long,
+                       instanceCount: Int): Boolean {
+        requireLoaded()
+        require(instanceCount > 0) { "tlas instances must be positive, got $instanceCount" }
+        return ok(MH_buildtlas!!.invokeExact(
+            ptr(ctx), ptr(dest), ptr(scratch), ptr(instances), instanceCount,
+        ) as Int)
+    }
+
+    /** 把 [src] 压缩拷贝到 [dest]（COMPACT）。紧凑版要等这次提交执行完才能当 SRV 用，下一帧再切。 */
+    fun D3D12CopyAccelStruct(ctx: Long, dest: Long, src: Long): Boolean {
+        requireLoaded()
+        return ok(MH_copyaccelstruct!!.invokeExact(ptr(ctx), ptr(dest), ptr(src)) as Int)
+    }
+
+    /** 给加速结构建 SRV（可直接放进 compute 的 SRV 表给 `RaytracingAccelerationStructure`）。0 = 失败。 */
+    fun D3D12CreateAccelStructView(accel: Long): Long {
+        requireLoaded()
+        try {
+            return addr(MH_createaccelstructview!!.invokeExact(ptr(accel)) as MemorySegment)
+        } catch (t: Throwable) {
+            throw unexpected(t)
+        }
+    }
+
+    /** 缓冲的 GPU 虚拟地址（0 = 失败）。加速结构实例描述里必须写这个地址，写句柄等于指向堆。 */
+    fun D3D12GetBufferAddress(buffer: Long): Long {
+        requireLoaded()
+        return try {
+            MH_getbufferaddress!!.invokeExact(ptr(buffer)) as Long
+        } catch (t: Throwable) {
+            throw unexpected(t)
+        }
+    }
+
+    /**
+     * 一个 hit group（`mcdr_rt_hit_group` 的 Kotlin 镜像）：名字 + 三个入口。
+     * 三角形几何只需要 [closestHit]（[anyHit] 用于镂空判定）；[intersection] 只有程序化体素才要。
+     * 四个字符串只在建状态对象那一次调用里被读，调用返回后无需保留。
+     */
+    class RtHitGroup(
+        val name: String,
+        val closestHit: String? = null,
+        val anyHit: String? = null,
+        val intersection: String? = null,
+    )
+
+    /**
+     * 用 `lib_6_x` 编出来的 DXIL 库建光线追踪状态对象（`D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE`）。
+     * 全局根签名与 compute 共用同一套四参数，所以 DispatchRays 与 compute 派发绑的是同一批槽位。
+     * [maxRecursion] 1..8（S3 只要 1）；返回 0 = 失败（原因在 native 日志里）。
+     */
+    fun D3D12CreateRaytracingPipeline(dxil: ByteArray, raygen: String, miss: String,
+                                      hitGroups: List<RtHitGroup>, srvCount: Int, uavCount: Int,
+                                      maxRecursion: Int = 1): Long {
+        requireLoaded()
+        require(hitGroups.isNotEmpty()) { "ray tracing pipeline needs at least one hit group" }
+        require(hitGroups.size <= MAX_RT_HIT_GROUPS) {
+            "hit group count ${hitGroups.size} exceeds $MAX_RT_HIT_GROUPS"
+        }
+        val handle = MH_createraytracingpipeline ?: return 0L
+        Arena.ofConfined().use { arena ->
+            val src = arena.allocate(dxil.size.toLong().coerceAtLeast(1L))
+            MemorySegment.copy(dxil, 0, src, ValueLayout.JAVA_BYTE, 0, dxil.size)
+            val groups = arena.allocate(hitGroups.size * MCDRLayout.RT_HIT_GROUP.byteSize())
+            hitGroups.forEachIndexed { i, group ->
+                val base = i * MCDRLayout.RT_HIT_GROUP.byteSize()
+                groups.set(MCDRLayout.PTR, base + MCDRLayout.RT_HIT_GROUP_NAME,
+                    cstringUtf8(arena, group.name))
+                group.closestHit?.let {
+                    groups.set(MCDRLayout.PTR, base + MCDRLayout.RT_HIT_GROUP_CLOSEST_HIT,
+                        cstringUtf8(arena, it))
+                }
+                group.anyHit?.let {
+                    groups.set(MCDRLayout.PTR, base + MCDRLayout.RT_HIT_GROUP_ANY_HIT,
+                        cstringUtf8(arena, it))
+                }
+                group.intersection?.let {
+                    groups.set(MCDRLayout.PTR, base + MCDRLayout.RT_HIT_GROUP_INTERSECTION,
+                        cstringUtf8(arena, it))
+                }
+            }
+            try {
+                return addr(handle.invokeExact(
+                    src, dxil.size.toLong(), cstringUtf8(arena, raygen), cstringUtf8(arena, miss),
+                    groups, hitGroups.size, srvCount, uavCount, maxRecursion,
+                ) as MemorySegment)
+            } catch (t: Throwable) {
+                throw unexpected(t)
+            }
+        }
+    }
+
+    /** 取某个导出名的 32 B 着色器标识符（SBT 记录的前 32 字节）。null = 名字不存在。 */
+    fun D3D12GetShaderIdentifier(pipeline: Long, exportName: String): ByteArray? {
+        requireLoaded()
+        val handle = MH_getshaderidentifier ?: return null
+        Arena.ofConfined().use { arena ->
+            val out = arena.allocate(SHADER_IDENTIFIER_BYTES.toLong())
+            val name = cstringUtf8(arena, exportName)
+            if (!ok(handle.invokeExact(ptr(pipeline), name, out) as Int)) {
+                return null
+            }
+            val bytes = ByteArray(SHADER_IDENTIFIER_BYTES)
+            MemorySegment.copy(out, ValueLayout.JAVA_BYTE, 0, bytes, 0, SHADER_IDENTIFIER_BYTES)
+            return bytes
+        }
+    }
+
+    /**
+     * 在已打开的命令列表上 DispatchRays。偏移与步长都是字节数：起点必须是 32 的倍数、步长也必须是
+     * 32 的倍数（D3D12 规范），记录本身建议 64 B 给局部根参数留位置。
+     * `[cbv]`/`[cbvOffset]` 与 compute 派发同一份常量缓冲（偏移 256 对齐）。
+     */
+    fun D3D12DispatchRays(ctx: Long, pipeline: Long, shaderTable: Long, raygenOffset: Long,
+                          missOffset: Long, missStride: Long, missCount: Int, hitOffset: Long,
+                          hitStride: Long, hitCount: Int, srvs: LongArray, uavs: LongArray,
+                          constants: IntArray, cbv: Long, cbvOffset: Long,
+                          width: Int, height: Int): Boolean {
+        requireLoaded()
+        val handle = MH_dispatchrays ?: return false
+        val count = constants.size
+        require(count in 0..8) { "ray tracing constants: 0..8 dwords, got $count" }
+        Arena.ofConfined().use { arena ->
+            fun handles(values: LongArray): MemorySegment {
+                if (values.isEmpty()) return MemorySegment.NULL
+                val seg = arena.allocate(values.size * 8L)
+                values.forEachIndexed { i, v -> seg.set(MCDRLayout.PTR, i * 8L, ptr(v)) }
+                return seg
+            }
+            val srvSeg = handles(srvs)
+            val uavSeg = handles(uavs)
+            val cSeg = if (count == 0) MemorySegment.NULL else arena.allocate(count * 4L)
+            for (i in 0 until count) cSeg.set(MCDRLayout.I32, i * 4L, constants[i])
+            try {
+                return ok(handle.invokeExact(
+                    ptr(ctx), ptr(pipeline), ptr(shaderTable), raygenOffset, missOffset, missStride,
+                    missCount, hitOffset, hitStride, hitCount, srvSeg, srvs.size, uavSeg, uavs.size,
+                    cSeg, count, ptr(cbv), cbvOffset, width, height,
+                ) as Int)
+            } catch (t: Throwable) {
+                throw unexpected(t)
+            }
+        }
+    }
+
+    /** native 侧 `kMaxRtHitGroups`：一次建状态对象最多几个 hit group。 */
+    const val MAX_RT_HIT_GROUPS: Int = 4
+    /** `D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES`：SBT 记录里标识符占的字节数。 */
+    const val SHADER_IDENTIFIER_BYTES: Int = 32
+    /** native 侧 `kMaxAccelGeometries`：一条 BLAS 最多几条几何。 */
+    const val MAX_ACCEL_GEOMETRIES: Int = 4
+
+    // 把几何表写进 arena：字段顺序与 mcdr_rt_geometry 一致（指针、6 个 i64、flags、reserved）。
+    private fun geometryArray(arena: Arena, geometries: List<RtGeometry>): MemorySegment {
+        val stride = MCDRLayout.RT_GEOMETRY.byteSize()
+        val seg = arena.allocate(stride * geometries.size)
+        geometries.forEachIndexed { i, g ->
+            val base = i * stride
+            seg.set(MCDRLayout.PTR, base + MCDRLayout.RT_GEOMETRY_VERTEX_BUFFER, ptr(g.vertexBuffer))
+            seg.set(MCDRLayout.I64, base + MCDRLayout.RT_GEOMETRY_VERTEX_STRIDE, g.vertexStride)
+            seg.set(MCDRLayout.I64, base + MCDRLayout.RT_GEOMETRY_VERTEX_COUNT, g.vertexCount)
+            seg.set(MCDRLayout.I64, base + MCDRLayout.RT_GEOMETRY_VERTEX_OFFSET, g.vertexOffset)
+            seg.set(MCDRLayout.PTR, base + MCDRLayout.RT_GEOMETRY_INDEX_BUFFER, ptr(g.indexBuffer))
+            seg.set(MCDRLayout.I64, base + MCDRLayout.RT_GEOMETRY_INDEX_COUNT, g.indexCount)
+            seg.set(MCDRLayout.I64, base + MCDRLayout.RT_GEOMETRY_INDEX_OFFSET, g.indexOffset)
+            seg.set(MCDRLayout.I32, base + MCDRLayout.RT_GEOMETRY_FLAGS, if (g.useAlphaTest) 1 else 0)
+            seg.set(MCDRLayout.I32, base + MCDRLayout.RT_GEOMETRY_INDEX_STRIDE, g.indexStride)
+        }
+        return seg
+    }
+
+    enum class BarrierKind { TRANSITION, UAV, ALIASING }
+
+    /** 一条屏障；[before]/[after] 取 [D3D12State] 的位值，[subresource] 默认全部。 */
+    data class BarrierDesc(
+        val resource: Long,
+        val before: Int,
+        val after: Int,
+        val kind: BarrierKind = BarrierKind.TRANSITION,
+        val resourceAfter: Long = 0L,
+        val flags: Int = 0,
+        val subresource: Int = D3D12State.ALL_SUBRESOURCES,
+    )
+
+    object D3D12State {
+        const val ALL_SUBRESOURCES: Int = -1
+        const val COMMON: Int = 0x0
+        const val VERTEX_AND_CONSTANT_BUFFER: Int = 0x1
+        const val INDEX_BUFFER: Int = 0x2
+        const val RENDER_TARGET: Int = 0x4
+        const val UNORDERED_ACCESS: Int = 0x8
+        const val DEPTH_WRITE: Int = 0x10
+        const val DEPTH_READ: Int = 0x20
+        const val NON_PIXEL_SHADER_RESOURCE: Int = 0x40
+        const val PIXEL_SHADER_RESOURCE: Int = 0x80
+        const val INDIRECT_ARGUMENT: Int = 0x200
+        const val COPY_DEST: Int = 0x400
+        const val COPY_SOURCE: Int = 0x800
+        const val ACCELERATION_STRUCTURE: Int = 0x400000
+        const val GENERIC_READ: Int = 0xAC
+    }
+
+    /** 返回 false = 参数/设备问题或列表未开。 */
+    fun D3D12Barrier(ctx: Long, descs: List<BarrierDesc>): Boolean {
+        requireLoaded()
+        val handle = MH_barrier ?: return false
+        if (descs.isEmpty()) return true
+        val stride = MCDRLayout.BARRIER_DESC_SIZE
+        Arena.ofConfined().use { arena ->
+            val seg = arena.allocate(stride * descs.size)
+            descs.forEachIndexed { i, d ->
+                seg.set(MCDRLayout.PTR, i * stride, MemorySegment.ofAddress(d.resource))
+                seg.set(MCDRLayout.PTR, i * stride + 8, MemorySegment.ofAddress(d.resourceAfter))
+                seg.set(MCDRLayout.I32, i * stride + 16, d.kind.ordinal)
+                seg.set(MCDRLayout.I32, i * stride + 20, d.flags)
+                seg.set(MCDRLayout.I32, i * stride + 24, d.before)
+                seg.set(MCDRLayout.I32, i * stride + 28, d.after)
+                seg.set(MCDRLayout.I32, i * stride + 32, d.subresource)
+            }
+            return ok(handle.invokeExact(ptr(ctx), seg, descs.size) as Int)
+        }
+    }
+
+    data class RtTrackStats(
+        val transitions: Int,
+        val mismatches: Int,
+        /** COMMON → 任意状态的隐式提升，D3D12 允许，不需要 barrier。 */
+        val promotions: Int,
+        /** 调用方用组合读掩码声明 before（单状态是它的子集），不算错。 */
+        val widened: Int,
+        val firstUse: Int,
+        val uavBarriers: Int,
+        val tracked: Int,
+        val note: String,
+    )
+
+    /** 影子跟踪器计数；null = 设备未建。 */
+    fun D3D12QueryRtTrackStats(): RtTrackStats? {
+        requireLoaded()
+        val handle = MH_rttrackstats ?: return null
+        Arena.ofConfined().use { arena ->
+            val seg = arena.allocate(MCDRLayout.RT_TRACK_STATS)
+            if ((handle.invokeExact(seg) as Int) != 1) return null
+            val note = buildString {
+                for (i in 0 until 64) {
+                    val c = seg.get(MCDRLayout.I8, 28L + i).toInt()
+                    if (c == 0) break
+                    append(c.toChar())
+                }
+            }
+            return RtTrackStats(
+                transitions = seg.get(MCDRLayout.I32, 0L),
+                mismatches = seg.get(MCDRLayout.I32, 4L),
+                promotions = seg.get(MCDRLayout.I32, 8L),
+                widened = seg.get(MCDRLayout.I32, 12L),
+                firstUse = seg.get(MCDRLayout.I32, 16L),
+                uavBarriers = seg.get(MCDRLayout.I32, 20L),
+                tracked = seg.get(MCDRLayout.I32, 24L),
+                note = note,
+            )
+        }
+    }
+
     /**
      * `Dispatch(x,y,z)` on the open DIRECT list. [uavTexture] must carry `USAGE_STORAGE`(32);
      * native brackets it with COMMON -> UNORDERED_ACCESS -> COMMON, so the caller tracks no state.
@@ -3039,6 +3682,8 @@ object MCDR_ABI {
         MH_setloglevel = skipOptional("mcdrSetLogLevel", fdv(MCDRLayout.I32))
         // Config [logging] shutdownTrace; a DLL without it keeps the built-in always-on behaviour.
         MH_setshutdowntrace = skipOptional("mcdrSetShutdownTraceAlways", fdv(MCDRLayout.I32))
+        // Config [debug] debugLayer — the layer attaches once, while the first device is created.
+        MH_setdebuglayer = skipOptional("mcdr_dx12SetDebugLayer", fd(MCDRLayout.I32, MCDRLayout.I32))
         // Config [logging] nativeLogFile — launchers do not persist the child's stdout/stderr.
         MH_setlogfile = skipOptional("mcdrSetLogFile", fd(MCDRLayout.I32, MCDRLayout.PTR))
         // **Must run before the first D3D12 device exists** — the layer hooks D3D12 when it loads.
@@ -3121,6 +3766,52 @@ object MCDR_ABI {
             MCDRLayout.PTR,
             MCDRLayout.I32
         ))
+        MH_nrdinspect = skipOptional("mcdr_dx12NrdInspect", fd(
+            MCDRLayout.I32,
+            MCDRLayout.PTR,
+            MCDRLayout.I32
+        ))
+        MH_nrdinit = skipOptional("mcdr_dx12NrdInit", fd(
+            MCDRLayout.I32,
+            MCDRLayout.I32,
+            MCDRLayout.PTR,
+            MCDRLayout.I32,
+            MCDRLayout.I32
+        ))
+        MH_nrdshutdown = skipOptional("mcdr_dx12NrdShutdown", fd(MCDRLayout.I32))
+        MH_nrddenoise =
+            skipOptional(
+                "mcdr_dx12NrdDenoise",
+                fd(
+                    MCDRLayout.I32,
+                    MCDRLayout.PTR,
+                    MCDRLayout.PTR,
+                    MCDRLayout.I32,
+                    MCDRLayout.PTR,
+                    MCDRLayout.I32,
+                    MCDRLayout.I32,
+                    MCDRLayout.PTR,
+                    MCDRLayout.I32,
+                ),
+            )
+        MH_dlssdeval =
+            skipOptional(
+                "mcdr_dx12DlssdEval",
+                fd(
+                    MCDRLayout.I32,
+                    MCDRLayout.PTR,
+                    MCDRLayout.I32,
+                    MCDRLayout.I32,
+                    MCDRLayout.I32,
+                    MCDRLayout.I32,
+                    MCDRLayout.I32,
+                    MCDRLayout.I32,
+                    MCDRLayout.I32,
+                    MCDRLayout.PTR,
+                    MCDRLayout.PTR,
+                    MCDRLayout.I32,
+                ),
+            )
         MH_setreflexmode = skipOptional("mcdr_dx12SetReflexMode", fdv(MCDRLayout.I32))
         MH_setdlssgmode = skipOptional("mcdr_dx12SetDlssgMode", fdv(MCDRLayout.I32, MCDRLayout.I32))
     MH_getdlssgpresented = skipOptional("mcdr_dx12GetDlssgPresented", fd(MCDRLayout.I32))
@@ -3128,6 +3819,8 @@ object MCDR_ABI {
         // **Before** device/swapchain creation; pushed while the config is read.
         MH_sethdrmode = skipOptional("mcdr_dx12SetHdrMode", fdv(MCDRLayout.I32))
         MH_setraytracingmode = skipOptional("mcdr_dx12SetRaytracingMode", fdv(MCDRLayout.I32))
+        // 能力面（只读）：给光追计划的 S0 能力串与门控用，缺这个符号时按「旧 native」处理。
+        MH_rtquerycaps = skipOptional("mcdr_dx12QueryRtCaps", fd(MCDRLayout.I32, MCDRLayout.PTR))
         // State only; native picks the G-Buffer / RT branch once device + surface are ready.
         MH_setswapchainoptions =
             skipOptional("mcdr_dx12SetSwapchainOptions", fdv(MCDRLayout.I32, MCDRLayout.I32))
@@ -3404,6 +4097,62 @@ object MCDR_ABI {
         ))
         // compute minimum path: root UAV u0 + 8 root constants b0.
         MH_createcomputepipeline = skip("mcdr_dx12CreateComputePipeline", fd(MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
+        MH_createcomputepipelineex = skip("mcdr_dx12CreateComputePipelineEx",
+            fd(MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32))
+        MH_dispatchcomputeex = skip("mcdr_dx12DispatchComputeEx", fd(
+            MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.PTR,
+            MCDRLayout.PTR, MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.I64,
+            MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32
+        ))
+        MH_barrier = skip("mcdr_dx12Barrier", fd(
+            MCDRLayout.I32,
+            MCDRLayout.PTR,
+            MCDRLayout.PTR,
+            MCDRLayout.I32
+        ))
+        // 加速结构（S3）：BLAS/TLAS 的建与查询。全部是必需导出 —— 版本 8 的 DLL 才有，握手已经挡住了旧 DLL。
+        MH_createaccelstructbuffer = skip("mcdr_dx12CreateAccelStructBuffer",
+            fd(MCDRLayout.PTR, MCDRLayout.I64))
+        MH_getblasprebuildinfo = skip("mcdr_dx12GetBlasPrebuildInfo",
+            fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.PTR))
+        MH_gettlasprebuildinfo = skip("mcdr_dx12GetTlasPrebuildInfo",
+            fd(MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.PTR))
+        MH_buildblas = skip("mcdr_dx12BuildBlas", fd(
+            MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR,
+            MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.I32
+        ))
+        MH_buildtlas = skip("mcdr_dx12BuildTlas", fd(
+            MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32
+        ))
+        MH_copyaccelstruct = skip("mcdr_dx12CopyAccelStruct",
+            fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
+        MH_createaccelstructview = skip("mcdr_dx12CreateAccelStructView",
+            fd(MCDRLayout.PTR, MCDRLayout.PTR))
+        MH_getbufferaddress = skip("mcdr_dx12GetBufferAddress",
+            fd(MCDRLayout.I64, MCDRLayout.PTR))
+        MH_createraytracingpipeline = skip("mcdr_dx12CreateRaytracingPipeline", fd(
+            MCDRLayout.PTR,
+            MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.PTR, MCDRLayout.PTR,
+            MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32
+        ))
+        MH_getshaderidentifier = skip("mcdr_dx12GetShaderIdentifier",
+            fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
+        MH_dispatchrays = skip("mcdr_dx12DispatchRays", fd(
+            MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR,
+            MCDRLayout.I64, MCDRLayout.I64, MCDRLayout.I64, MCDRLayout.I32,
+            MCDRLayout.I64, MCDRLayout.I64, MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I64,
+            MCDRLayout.I32, MCDRLayout.I32
+        ))
+        MH_rttrackstats = skip("mcdr_dx12QueryRtTrackStats", fd(MCDRLayout.I32, MCDRLayout.PTR))
         MH_dispatchcompute = skip("mcdr_dx12DispatchCompute", fd(
             MCDRLayout.I32,
             MCDRLayout.PTR,

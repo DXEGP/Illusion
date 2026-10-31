@@ -30,16 +30,15 @@ object EarlyWindowJarInstaller {
         val target = FMLPaths.GAMEDIR.get().resolve("mods").resolve(FILE_NAME)
         val installed = installProviderJar(target)
         val pointed = pointConfigAtProvider(FMLPaths.CONFIGDIR.get().resolve("fml.toml"))
-        val tag = "[${Illusion.MODID}]"
         when {
             installed && pointed -> Illusion.LOGGER.info(
-                "$tag early-window provider unpacked into mods/; restart the game once so FML picks up the single-window path"
+                "early window provider installed to mods/; restart once"
             )
             installed -> Illusion.LOGGER.info(
-                "$tag early-window provider unpacked into mods/ (fml.toml already selects it)"
+                "early window provider installed to mods/ (fml.toml ok)"
             )
             pointed -> Illusion.LOGGER.info(
-                "$tag fml.toml now selects the dxrmc early window provider; restart the game once"
+                "fml.toml now selects dxrmc early window; restart once"
             )
         }
     }
@@ -49,10 +48,10 @@ object EarlyWindowJarInstaller {
         val bundled = try {
             EarlyWindowJarInstaller::class.java.getResourceAsStream(RESOURCE)?.use { it.readBytes() }
         } catch (t: Throwable) {
-            Illusion.LOGGER.warn("[${Illusion.MODID}] cannot read the bundled early-window jar: $t")
+            Illusion.LOGGER.warn("cannot read bundled early-window jar: $t")
             null
         } ?: run {
-            Illusion.LOGGER.warn("[${Illusion.MODID}] bundled early-window jar is missing from this build")
+            Illusion.LOGGER.warn("bundled early-window jar missing from this build")
             return false
         }
 
@@ -72,12 +71,12 @@ object EarlyWindowJarInstaller {
                 Files.move(target, stale, StandardCopyOption.REPLACE_EXISTING)
                 Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING)
                 Illusion.LOGGER.info(
-                    "[${Illusion.MODID}] old early-window provider was locked by this process; replaced via $stale"
+                    "old early window jar locked; moved to $stale"
                 )
             }
             true
         } catch (t: Throwable) {
-            Illusion.LOGGER.warn("[${Illusion.MODID}] cannot install ${target}: $t")
+            Illusion.LOGGER.warn("cannot install ${target}: $t")
             false
         }
     }
@@ -102,7 +101,7 @@ object EarlyWindowJarInstaller {
             config.writeText(rewritten)
             true
         } catch (t: Throwable) {
-            Illusion.LOGGER.warn("[${Illusion.MODID}] cannot update ${config}: $t")
+            Illusion.LOGGER.warn("cannot update ${config}: $t")
             false
         }
     }

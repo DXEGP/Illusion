@@ -40,7 +40,7 @@ object D3D12VrsDebugEntry : DebugScreenEntry {
         modEventBus.addListener<RegisterDebugEntriesEvent> { event ->
             event.register(ID, this)
             event.includeInProfile(ID, DebugScreenProfile.DEFAULT, DebugScreenEntryStatus.IN_OVERLAY)
-            Illusion.LOGGER.info("[{}] debug entry {} registered (toggle it in F3+F6)", Illusion.MODID, ID)
+            Illusion.LOGGER.info("debug entry {} registered: {} (F3+F6)", Illusion.MODID, ID)
         }
     }
 }

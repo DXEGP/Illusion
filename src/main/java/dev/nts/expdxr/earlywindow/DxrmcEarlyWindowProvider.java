@@ -89,20 +89,20 @@ public final class DxrmcEarlyWindowProvider implements ImmediateWindowProvider {
         logo = loadLogo();
         mojangles = loadImage(MOJANGLES_RESOURCE);
         System.setProperty(HANDLE_PROPERTY, Long.toString(window));
-        LOGGER.info("early window created handle={} renderer={} (single-window mode)", window, renderer);
-        LOGGER.info("loading screen: logo={} bar=purple caption='{}' (Mojangles glyphs={})", logo != null ? logo.getWidth() + "x" + logo.getHeight() : "missing", CAPTION, mojangles != null ? mojangles.getWidth() + "x" + mojangles.getHeight() : "missing");
+        LOGGER.info("early window created handle={} renderer={}", window, renderer);
+        LOGGER.info("loading screen logo={} bar=purple caption='{}' glyphs={}", logo != null ? logo.getWidth() + "x" + logo.getHeight() : "missing", CAPTION, mojangles != null ? mojangles.getWidth() + "x" + mojangles.getHeight() : "missing");
         redraw();
     }
 
     private BufferedImage loadLogo() {
         try (InputStream in = DxrmcEarlyWindowProvider.class.getResourceAsStream(LOGO_RESOURCE)) {
             if (in == null) {
-                LOGGER.warn("logo resource {} is missing from the early-window jar", LOGO_RESOURCE);
+                LOGGER.warn("logo {} missing from early-window jar", LOGO_RESOURCE);
                 return null;
             }
             return ImageIO.read(in);
         } catch (Throwable t) {
-            LOGGER.warn("cannot decode the loading screen logo: {}", t.toString());
+            LOGGER.warn("cannot decode loading screen logo: {}", t.toString());
             return null;
         }
     }
@@ -294,14 +294,14 @@ public final class DxrmcEarlyWindowProvider implements ImmediateWindowProvider {
         handedOver = true;
         if (!adopted) {
             // 非 D3D12：原版自己建了窗口，我们这扇不能当第二个窗口留在屏幕上。
-            LOGGER.info("graphics backend is not D3D12 - dropping the early window, vanilla creates its own");
+            LOGGER.info("backend is not D3D12; dropping early window");
             close();
             if (window != 0L) {
                 SDLVideo.SDL_HideWindow(window);
             }
             return new WindowState(0, 0, INITIAL_WIDTH, INITIAL_HEIGHT, false, false, false, false);
         }
-        LOGGER.info("handing the early window over to Minecraft (same window, no recreate)");
+        LOGGER.info("early window handed to Minecraft, same window");
         // 故意不销毁 renderer：销毁会让窗口黑到游戏第一帧，观感上就是闪一下。改在 close() 释放。
         return new WindowState(0, 0, INITIAL_WIDTH, INITIAL_HEIGHT, false, false, false, false);
     }

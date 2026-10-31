@@ -414,7 +414,7 @@ private const val DEFAULT_RENDER_PERCENT = 75
         val current = D3D12RenderScale.percent()
         if (current < needed) {
             Illusion.LOGGER.error(
-                "DLSS tier {} needs a render scale of at least {}% but the saved value is {}% (entering a world will raise it automatically)",
+                "DLSS tier {} needs {}% scale, saved {}, auto-raised",
                 QUALITY_NAMES[tier.coerceIn(0, QUALITY_NAMES.lastIndex)], needed, current)
         }
     }
@@ -489,7 +489,7 @@ private const val DEFAULT_RENDER_PERCENT = 75
             // DLAA 把比例锁在 100%，那里没有可放大的东西：明确拒绝并写清原因。
             if (D3D12RenderScale.isLockedByDlaa()) {
                 Illusion.LOGGER.warn(
-                    "cannot switch to {} while DLAA is active; turn DLAA off first",
+                    "cannot switch to {} while DLAA is on; turn DLAA off",
                     requested,
                 )
                 syncOptions(previous)
@@ -676,15 +676,13 @@ private const val DEFAULT_RENDER_PERCENT = 75
             D3D12Temporal.enabled = true
             forcedTemporal = true
             Illusion.LOGGER.info(
-                "{} needs the temporal data plane: sub-pixel projection jitter "
-                    + "(dxrmc.temporal) is switched on while it is selected", backendName(backendId()))
+                "{} needs jitter: forcing dxrmc.temporal", backendName(backendId()))
         }
         if (!D3D12Velocity.enabled) {
             D3D12Velocity.enabled = true
             forcedVelocity = true
             Illusion.LOGGER.info(
-                "{} needs motion vectors: the velocity pass "
-                    + "(dxrmc.temporal.velocity) is switched on while it is selected",
+                "{} needs motion vectors: forcing dxrmc.temporal.velocity",
                 backendName(backendId()))
         }
         if (!D3D12Velocity.isLatched()) {
@@ -1017,7 +1015,7 @@ private const val DEFAULT_RENDER_PERCENT = 75
         }
         val sorted = gpuSamples.copyOf(accepted).also { it.sort() }
         Illusion.LOGGER.debug(
-            "gpu cost over {} frames: backend={} p50={}us p95={}us (max {}us, {} samples rejected)",
+            "gpu cost {} frames: {} p50={}us p95={}us max={}us rej={}",
             accepted,
             backendLabel(backendId()),
             sorted[accepted / 2] * 1_000_000L / frequency,
@@ -1039,7 +1037,7 @@ private const val DEFAULT_RENDER_PERCENT = 75
         val eval = evalSamples.copyOf(frames).also { it.sort() }
         val blit = blitSamples.copyOf(frames).also { it.sort() }
         Illusion.LOGGER.debug(
-            "record cost over {} frames: evaluate p50={}us p95={}us, blit p50={}us p95={}us (CPU only)",
+            "cpu cost {} frames: eval p50={} p95={} blit p50={} p95={}us",
             frames,
             eval[frames / 2] / 1_000,
             eval[(frames * 95) / 100] / 1_000,

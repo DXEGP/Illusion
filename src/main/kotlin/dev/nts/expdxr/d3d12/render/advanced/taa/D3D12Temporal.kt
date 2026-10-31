@@ -93,15 +93,14 @@ object D3D12Temporal {
             if (loggedPhaseCount != reported) {
                 loggedPhaseCount = reported
                 LOGGER.info(
-                    "jitter phase: backend=DLSS wants {} but the caller-owned sequence stays {} " +
-                        "(SL only requires jitterOffset to match what we injected)",
+                    "jitter: DLSS wants {}, sequence stays {}",
                     reported,
                     jitterSamples,
                 )
             }
             return
         }
-        LOGGER.info("jitter phase: adopting backend-reported {} (was {})", reported, jitterSamples)
+        LOGGER.info("jitter: adopting backend {} (was {})", reported, jitterSamples)
         jitterSamples = reported
         loggedPhaseCount = reported
     }
