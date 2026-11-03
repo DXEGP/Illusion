@@ -30,10 +30,7 @@ internal object D3D12RtDlssd {
     private var constants: MemorySegment? = null
 
     /**
-     * 求值一帧。纹理顺序是 radiance / output / depth / motion / normal（打包的法线-粗糙度）。
-     *
-     * [slConstants] 是 `D3D12RtFrameConstants.write` 填的 72 个浮点（四个行主序矩阵 + 近/远/视场/宽高比）：
-     * DLSS-D 缺了这套常量不会报错，只会按「零位移」重投影，画面表现为拖影。
+     * [slConstants] 是 `D3D12RtFrameConstants.write` 填的 104 个浮点；缺少相机常量时拒绝求值。
      *
      * 返回 1 表示 SL 接受，0 表示不可用（已放弃），-1 表示这一帧失败。
      */
@@ -44,17 +41,22 @@ internal object D3D12RtDlssd {
         depth: Long,
         motion: Long,
         normal: Long,
+        diffuseAlbedo: Long,
+        specularAlbedo: Long,
+        specularHitDistance: Long,
         width: Int,
         height: Int,
         outputWidth: Int,
         outputHeight: Int,
         slConstants: FloatArray,
         reset: Boolean,
+        exposure: Long = 0L,
     ): Int {
         if (!available) {
             return 0
         }
-        val textures = longArrayOf(radiance, output, depth, motion, normal)
+        val textures = longArrayOf(radiance, output, depth, motion, normal, diffuseAlbedo, specularAlbedo,
+            specularHitDistance).let { if (exposure == 0L) it else it + exposure }
         var result = 0
         var text = ""
         frameIndex += 1
@@ -62,7 +64,7 @@ internal object D3D12RtDlssd {
         Arena.ofConfined().use { arena ->
             val buffer = arena.allocate(TEXT_CAPACITY.toLong())
             result =
-                MCDR_ABI.D3D12DlssdEval(
+                MCDR_ABI.D3D12DlssdEvalExposure(
                     encoder,
                     textures,
                     width,
@@ -72,6 +74,7 @@ internal object D3D12RtDlssd {
                     frameIndex,
                     reset,
                     constantSegment,
+                    floatArrayOf(1f, 1f),
                     buffer,
                     TEXT_CAPACITY,
                 )
@@ -97,13 +100,12 @@ internal object D3D12RtDlssd {
     fun reset() {
         available = true
         reported = false
-        frameIndex = 0
         constantsArena?.close()
         constantsArena = null
         constants = null
     }
 
-    /** 把 72 个浮点摊进本地内存，复用同一段，避免每帧新建 Arena。 */
+    /** 按载荷长度复用本地内存。 */
     private fun constantSegment(values: FloatArray): MemorySegment? {
         if (values.size < D3D12RtFrameConstants.SL_CONSTANTS_FLOATS) {
             return null

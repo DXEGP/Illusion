@@ -54,7 +54,7 @@ object D3D12RtLightContract {
 
     /** `RtSeed`：同一 (pixel, frame, bounce, sample, seed) 恒得同一序列。 */
     fun seed(px: Int, py: Int, frame: Int, bounce: Int, sample: Int, seed: Int): Int {
-        var h = px xor pcgHash(py)
+        var h = pcgHash(px xor pcgHash(py))
         h = pcgHash(h xor (frame * GOLDEN))
         h = pcgHash(h xor (bounce * BOUNCE_K))
         h = pcgHash(h xor (sample * SAMPLE_K))
@@ -89,6 +89,39 @@ object D3D12RtLightContract {
 
     /** `RtCosinePdf`。 */
     fun cosinePdf(cosTheta: Float): Float = (if (cosTheta > 0f) cosTheta else 0f) * INV_PI
+
+    fun sampleGgxVndf(sample: Pair<Float, Float>, normal: RtVec3, view: RtVec3,
+                      alpha: Float): Pair<RtVec3, RtVec3> {
+        val up = if (abs(normal.z) < 0.999f) RtVec3(0f, 0f, 1f) else RtVec3(1f, 0f, 0f)
+        val tangent = normalize(up.cross(normal))
+        val bitangent = normal.cross(tangent)
+        val localView = RtVec3(view.dot(tangent), view.dot(bitangent), view.dot(normal))
+        val stretched = normalize(RtVec3(alpha * localView.x, alpha * localView.y, localView.z))
+        val lengthSquared = stretched.x * stretched.x + stretched.y * stretched.y
+        val basis1 = if (lengthSquared > 0f) {
+            RtVec3(-stretched.y, stretched.x, 0f) * (1f / sqrt(lengthSquared))
+        } else {
+            RtVec3(1f, 0f, 0f)
+        }
+        val basis2 = stretched.cross(basis1)
+        val radius = sqrt(sample.first)
+        val angle = 2f * PI * sample.second
+        val diskX = radius * cos(angle)
+        val blend = 0.5f * (1f + stretched.z)
+        val diskY = (1f - blend) * sqrt(saturate(1f - diskX * diskX)) + blend * radius * sin(angle)
+        val projected = basis1 * diskX + basis2 * diskY +
+            stretched * sqrt(saturate(1f - diskX * diskX - diskY * diskY))
+        val localHalf = normalize(RtVec3(alpha * projected.x, alpha * projected.y,
+            projected.z.coerceAtLeast(EPS) + EPS))
+        val halfDirection = normalize(tangent * localHalf.x + bitangent * localHalf.y + normal * localHalf.z)
+        return halfDirection * (2f * view.dot(halfDirection)) - view to halfDirection
+    }
+
+    fun ggxSmithG1(normalDotLight: Float, alpha: Float): Float {
+        val alphaSquared = alpha * alpha
+        return 2f * normalDotLight / (normalDotLight +
+            sqrt(alphaSquared + (1f - alphaSquared) * normalDotLight * normalDotLight)).coerceAtLeast(1e-9f)
+    }
 
     /** `RtRayBias`：沿法线偏移的距离，单位米。 */
     fun rayBias(hitDistance: Float): Float = 1e-3f + 0.01f * hitDistance

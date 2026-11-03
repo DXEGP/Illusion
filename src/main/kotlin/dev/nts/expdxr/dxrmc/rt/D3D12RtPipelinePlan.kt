@@ -1,6 +1,8 @@
 package dev.nts.expdxr.dxrmc.rt
 
 import dev.nts.expdxr.RtDenoise
+import dev.nts.expdxr.SrBackend
+import dev.nts.expdxr.dxrmc.sr.SuperResolution
 import dev.nts.expdxr.misc.IllusionLogger
 import dev.nts.expdxr.misc.settings.D3D12Settings
 
@@ -14,14 +16,18 @@ internal object D3D12RtPipelinePlan {
     private const val MIN_SIDE = 16
 
     /** 一帧的形状：谁在什么分辨率上跑、后面还要不要再过一道降噪与超分。 */
-    class Plan(
+    data class Plan(
+        val enabled: Boolean,
         val track: RtDenoise,
+        val upscaler: SrBackend,
         val displayWidth: Int,
         val displayHeight: Int,
         val renderWidth: Int,
         val renderHeight: Int,
         val gbufferWidth: Int,
         val gbufferHeight: Int,
+        val traceWidth: Int,
+        val traceHeight: Int,
         val denoise: Boolean,
         val superResolution: Boolean,
     )
@@ -30,25 +36,45 @@ internal object D3D12RtPipelinePlan {
 
     /** 按当前配置与显示分辨率算出这一帧的形状；分辨率下限 [MIN_SIDE]，避免缩到 0 让派发退化。 */
     fun configured(displayWidth: Int, displayHeight: Int): Plan {
-        val track = D3D12Settings.rtDenoise
-        val scale = D3D12Settings.rtRenderScale.coerceIn(25, 100)
-        // 光追整条不跑时倍率没有意义，按 100% 算，别让它去缩一个根本不存在的渲染目标。
+        return calculate(
+            displayWidth, displayHeight, D3D12Settings.rtDenoise, D3D12Settings.rtRenderScale,
+            D3D12Settings.rtEnabled,
+            SuperResolution.backend(),
+        )
+    }
+
+    fun calculate(
+        displayWidth: Int,
+        displayHeight: Int,
+        track: RtDenoise,
+        percent: Int,
+        enabled: Boolean,
+        upscaler: SrBackend,
+    ): Plan {
+        require(displayWidth > 0 && displayHeight > 0)
+        val scale = percent.coerceIn(25, 100)
         val renderScale = if (track == RtDenoise.OFF) 100 else scale
         val renderWidth = side(displayWidth, renderScale)
         val renderHeight = side(displayHeight, renderScale)
-        val denoise = track == RtDenoise.RR || track == RtDenoise.NRD_SR
-        val superResolution = track == RtDenoise.RR || track == RtDenoise.NRD_SR
-        // RR 要求 G-Buffer 与渲染分辨率一致；解耦轨也一样，只有关闭光追时才没有 G-Buffer。
-        val gbufferWidth = if (track == RtDenoise.OFF) 0 else renderWidth
-        val gbufferHeight = if (track == RtDenoise.OFF) 0 else renderHeight
+        val denoise = enabled && (track == RtDenoise.RR || track == RtDenoise.NRD_SR)
+        val superResolution = denoise && upscaler != SrBackend.NONE &&
+            (renderWidth != displayWidth || renderHeight != displayHeight)
+        val gbufferWidth = if (enabled) renderWidth else 0
+        val gbufferHeight = if (enabled) renderHeight else 0
+        val traceWidth = if (enabled) renderWidth else 0
+        val traceHeight = if (enabled) renderHeight else 0
         return Plan(
+            enabled = enabled,
             track = track,
+            upscaler = upscaler,
             displayWidth = displayWidth,
             displayHeight = displayHeight,
             renderWidth = renderWidth,
             renderHeight = renderHeight,
             gbufferWidth = gbufferWidth,
             gbufferHeight = gbufferHeight,
+            traceWidth = traceWidth,
+            traceHeight = traceHeight,
             denoise = denoise,
             superResolution = superResolution,
         )
@@ -64,10 +90,10 @@ internal object D3D12RtPipelinePlan {
 
     fun describe(plan: Plan): String = "rt: denoise=${plan.track.name.lowercase()} " +
         "render=${plan.renderWidth}x${plan.renderHeight} " +
-        "gbuffer=${plan.gbufferWidth}x${plan.gbufferHeight}"
+        "gbuffer=${plan.gbufferWidth}x${plan.gbufferHeight} sr=${plan.upscaler.name.lowercase()}"
 
     private fun side(display: Int, percent: Int): Int {
         val scaled = display * percent / 100
-        return scaled.coerceAtLeast(MIN_SIDE)
+        return scaled.coerceAtLeast(minOf(MIN_SIDE, display))
     }
 }

@@ -101,7 +101,12 @@ object MCDR_ABI {
     private var MH_nrdinit: MethodHandle? = null
     private var MH_nrdshutdown: MethodHandle? = null
     private var MH_nrddenoise: MethodHandle? = null
+    private var MH_nrddenoisetemporal: MethodHandle? = null
     private var MH_dlssdeval: MethodHandle? = null
+    private var MH_rtsreval: MethodHandle? = null
+    private var MH_dlssdevalexposure: MethodHandle? = null
+    private var MH_rtsrevalexposure: MethodHandle? = null
+    private var MH_sdkresourcestate: MethodHandle? = null
     /** Reflex mode + availability. */
     private var MH_setreflexmode: MethodHandle? = null
     private var MH_setdlssgmode: MethodHandle? = null
@@ -490,7 +495,7 @@ object MCDR_ABI {
      * This constant, the Kotlin mirrors and the native `layoutTable()` must agree — [verifyABI]
      * aborts before device creation otherwise.
      */
-    const val MCDR_ABI_VERSION: Int = 16
+    const val MCDR_ABI_VERSION: Int = 23
     /** `MCDR_FG_BACKEND_*`, value for value with `mcdr_abi.h`. */
     const val FG_BACKEND_NONE: Int = 0
     const val FG_BACKEND_DLSSG: Int = 1
@@ -514,6 +519,7 @@ object MCDR_ABI {
     const val SR_BACKEND_DLSS: Int = 1
     const val SR_BACKEND_FSR: Int = 2
     const val SR_BACKEND_XESS: Int = 3
+    const val SR_FLAG_UNJITTERED_MV: Int = 1
     /** `MCDR_SR_MASK_*`. */
     const val SR_MASK_REACTIVE: Int = 1
     const val SR_MASK_RESPONSIVE: Int = 2
@@ -952,19 +958,18 @@ object MCDR_ABI {
         val shaderModel69: Boolean get() = shaderModel >= 0x69
 
         /**
-         * 能力侧允许的后端，顺序即偏好（WG → DXR → MEGA）。
+         * 能力侧允许的硬件后端，顺序即偏好（WG → DXR）。
          *
          * 只看硬件/运行时能力：用户的 `[raytracing] backend` 与 G1 探针结果由上层合成 ——
          * 探针是构建期事实（`_port\wg_probe`），这里不能假装知道。
          */
         val capabilityBackends: List<String>
             get() = buildList {
-                if (workGraphsSupported) add("WG")
-                if (inlineRayQuerySupported) add("DXR")
-                add("MEGA")
+                if (workGraphsSupported && inlineRayQuerySupported) add("WG")
+                if (raytracingSupported) add("DXR")
             }
 
-        val preferredBackend: String get() = capabilityBackends.first()
+        val preferredBackend: String get() = capabilityBackends.firstOrNull() ?: "OFF"
     }
 
     /** 读能力面；native 未导出该符号时返回 null（旧 native / 非 D3D12 后端）。 */
@@ -1079,10 +1084,6 @@ object MCDR_ABI {
         }
     }
 
-    /**
-     * 逐帧降噪派发（S4 4-c）：五张纹理按 motion / normal-roughness / viewZ / radiance-in /
-     * radiance-out 传，matrices 是 4 个列主序 4x4。返回派发的 pass 数，0 表示没有上下文。
-     */
     fun D3D12NrdDenoise(
         encoder: Long,
         textures: LongArray,
@@ -1102,7 +1103,7 @@ object MCDR_ABI {
             }
             return try {
                 (handle.invokeExact(
-                    encoder,
+                    MemorySegment.ofAddress(encoder),
                     array,
                     count,
                     matrices,
@@ -1118,12 +1119,40 @@ object MCDR_ABI {
         }
     }
 
+    fun D3D12NrdDenoiseTemporal(
+        encoder: Long,
+        textures: LongArray,
+        matrices: MemorySegment,
+        jitter: MemorySegment,
+        frameIndex: Int,
+        resetHistory: Boolean,
+        textOut: MemorySegment,
+        capacity: Int,
+    ): Int {
+        if (LOAD_FAILURE != null) return -1
+        val handle = MH_nrddenoisetemporal ?: return -1
+        if (matrices.byteSize() < 256L ||
+            jitter.byteSize() < MCDRLayout.NRD_JITTER_FLOAT_COUNT.toLong() * Float.SIZE_BYTES) return 0
+        Arena.ofConfined().use { arena ->
+            val array = arena.allocate(MCDRLayout.PTR.byteSize() * textures.size, MCDRLayout.PTR.byteAlignment())
+            for (index in textures.indices) {
+                array.setAtIndex(MCDRLayout.PTR, index.toLong(), MemorySegment.ofAddress(textures[index]))
+            }
+            return try {
+                (handle.invokeExact(
+                    MemorySegment.ofAddress(encoder), array, textures.size, matrices, jitter,
+                    frameIndex, if (resetHistory) 1 else 0, textOut, capacity,
+                ) as Int)
+            } catch (failure: Throwable) {
+                IllusionLogger.warnMessage("NRD temporal: FFM call failed (${failure.javaClass.simpleName})")
+                -1
+            }
+        }
+    }
+
     /**
-     * DLSS-D（Ray Reconstruction）逐帧求值（S4 4-d）：纹理按 radiance / output / depth / motion /
-     * normal 给；packed 模式到此为止，unpacked 模式再加一张粗糙度。
-     *
-     * [constants] 是 `slSetConstants` 的载荷（72 个浮点，四个行主序矩阵 + near/far/fovY/aspect）；
-     * 传 null 时 SL 按「零位移」重投影，画面会拖影。返回 1 表示 SL 接受，0 表示未执行（SL 缺函数），
+     * [constants] 是 104 个浮点，包含重投影与视图正逆矩阵。缺失时拒绝派发。
+     * 返回 1 表示 SL 接受，0 表示未执行（SL 缺函数），
      * -1 表示失败。
      */
     fun D3D12DlssdEval(
@@ -1149,7 +1178,7 @@ object MCDR_ABI {
             }
             return try {
                 (handle.invokeExact(
-                    encoder,
+                    MemorySegment.ofAddress(encoder),
                     array,
                     count,
                     width,
@@ -1164,6 +1193,80 @@ object MCDR_ABI {
                 ) as Int)
             } catch (t: Throwable) {
                 IllusionLogger.warnMessage("dx12DlssdEval failed: ${t}")
+                -1
+            }
+        }
+    }
+
+    fun D3D12RtSrEval(
+        encoder: Long,
+        textures: LongArray,
+        width: Int,
+        height: Int,
+        outputWidth: Int,
+        outputHeight: Int,
+        frameIndex: Int,
+        reset: Boolean,
+        constants: MemorySegment,
+        textOut: MemorySegment,
+        capacity: Int,
+    ): Int {
+        if (LOAD_FAILURE != null) return -1
+        val handle = MH_rtsreval ?: return -1
+        Arena.ofConfined().use { arena ->
+            val array = arena.allocate(MCDRLayout.PTR.byteSize() * textures.size, MCDRLayout.PTR.byteAlignment())
+            for (index in textures.indices) {
+                array.setAtIndex(MCDRLayout.PTR, index.toLong(), MemorySegment.ofAddress(textures[index]))
+            }
+            return try {
+                handle.invokeExact(
+                    MemorySegment.ofAddress(encoder), array, textures.size,
+                    width, height, outputWidth, outputHeight, frameIndex,
+                    if (reset) 1 else 0, constants, textOut, capacity,
+                ) as Int
+            } catch (failure: Throwable) {
+                IllusionLogger.warnMessage("RT SR: call failed (${failure.javaClass.simpleName})")
+                -1
+            }
+        }
+    }
+
+    fun D3D12DlssdEvalExposure(
+        encoder: Long, textures: LongArray, width: Int, height: Int,
+        outputWidth: Int, outputHeight: Int, frameIndex: Int, reset: Boolean,
+        constants: MemorySegment, exposure: FloatArray, textOut: MemorySegment, capacity: Int,
+    ): Int = evaluateRtExposure(MH_dlssdevalexposure, encoder, textures, width, height,
+        outputWidth, outputHeight, frameIndex, reset, constants, exposure, textOut, capacity)
+
+    fun D3D12RtSrEvalExposure(
+        encoder: Long, textures: LongArray, width: Int, height: Int,
+        outputWidth: Int, outputHeight: Int, frameIndex: Int, reset: Boolean,
+        constants: MemorySegment, exposure: FloatArray, textOut: MemorySegment, capacity: Int,
+    ): Int = evaluateRtExposure(MH_rtsrevalexposure, encoder, textures, width, height,
+        outputWidth, outputHeight, frameIndex, reset, constants, exposure, textOut, capacity)
+
+    private fun evaluateRtExposure(
+        handle: MethodHandle?, encoder: Long, textures: LongArray, width: Int, height: Int,
+        outputWidth: Int, outputHeight: Int, frameIndex: Int, reset: Boolean,
+        constants: MemorySegment, exposure: FloatArray, textOut: MemorySegment, capacity: Int,
+    ): Int {
+        if (LOAD_FAILURE != null || handle == null) return -1
+        if (constants.byteSize() < 104L * MCDRLayout.F32.byteSize() ||
+            exposure.size != MCDRLayout.RT_EXPOSURE_FLOAT_COUNT || exposure.any { !it.isFinite() }) return 0
+        Arena.ofConfined().use { arena ->
+            val array = arena.allocate(MCDRLayout.PTR.byteSize() * textures.size, MCDRLayout.PTR.byteAlignment())
+            for (index in textures.indices) {
+                array.setAtIndex(MCDRLayout.PTR, index.toLong(), MemorySegment.ofAddress(textures[index]))
+            }
+            val parameters = arena.allocateFrom(ValueLayout.JAVA_FLOAT, *exposure)
+            return try {
+                handle.invokeExact(
+                    MemorySegment.ofAddress(encoder), array, textures.size,
+                    width, height, outputWidth, outputHeight, frameIndex,
+                    if (reset) 1 else 0, constants, parameters, textOut, capacity,
+                ) as Int
+            } catch (failure: Throwable) {
+                IllusionLogger.warnMessage("RT exposure: call failed (${failure.javaClass.simpleName})")
                 -1
             }
         }
@@ -2752,6 +2855,37 @@ object MCDR_ABI {
         }
     }
 
+    data class SdkResourceState(
+        val state: Long,
+        val owner: Long,
+        val acquired: Long,
+        val released: Long,
+        val rejected: Long,
+        val externalResources: Long,
+        val violations: Long,
+        val heapRestores: Long,
+    )
+
+    fun D3D12QuerySdkResourceState(ctx: Long, texture: Long): SdkResourceState? {
+        requireLoaded()
+        val handle = MH_sdkresourcestate ?: return null
+        Arena.ofConfined().use { arena ->
+            val count = MCDRLayout.SDK_RESOURCE_STATE_VALUE_COUNT
+            val values = arena.allocate(count * 8L, 8L)
+            if ((handle.invokeExact(ptr(ctx), ptr(texture), values, count) as Int) != 1) return null
+            return SdkResourceState(
+                state = values.get(MCDRLayout.I64, 0L),
+                owner = values.get(MCDRLayout.I64, 8L),
+                acquired = values.get(MCDRLayout.I64, 16L),
+                released = values.get(MCDRLayout.I64, 24L),
+                rejected = values.get(MCDRLayout.I64, 32L),
+                externalResources = values.get(MCDRLayout.I64, 40L),
+                violations = values.get(MCDRLayout.I64, 48L),
+                heapRestores = values.get(MCDRLayout.I64, 56L),
+            )
+        }
+    }
+
     data class RtTrackStats(
         val transitions: Int,
         val mismatches: Int,
@@ -3774,8 +3908,8 @@ object MCDR_ABI {
         MH_nrdinit = skipOptional("mcdr_dx12NrdInit", fd(
             MCDRLayout.I32,
             MCDRLayout.I32,
-            MCDRLayout.PTR,
             MCDRLayout.I32,
+            MCDRLayout.PTR,
             MCDRLayout.I32
         ))
         MH_nrdshutdown = skipOptional("mcdr_dx12NrdShutdown", fd(MCDRLayout.I32))
@@ -3794,11 +3928,27 @@ object MCDR_ABI {
                     MCDRLayout.I32,
                 ),
             )
-        MH_dlssdeval =
+        MH_nrddenoisetemporal = skipOptional(
+            "mcdr_dx12NrdDenoiseTemporal",
+            fd(
+                MCDRLayout.I32,
+                MCDRLayout.PTR,
+                MCDRLayout.PTR,
+                MCDRLayout.I32,
+                MCDRLayout.PTR,
+                MCDRLayout.PTR,
+                MCDRLayout.I32,
+                MCDRLayout.I32,
+                MCDRLayout.PTR,
+                MCDRLayout.I32,
+            ),
+        )
+        MH_rtsreval =
             skipOptional(
-                "mcdr_dx12DlssdEval",
+                "mcdr_dx12RtSrEval",
                 fd(
                     MCDRLayout.I32,
+                    MCDRLayout.PTR,
                     MCDRLayout.PTR,
                     MCDRLayout.I32,
                     MCDRLayout.I32,
@@ -3812,6 +3962,37 @@ object MCDR_ABI {
                     MCDRLayout.I32,
                 ),
             )
+        MH_dlssdeval =
+            skipOptional(
+                "mcdr_dx12DlssdEval",
+                fd(
+                    MCDRLayout.I32,
+                    MCDRLayout.PTR,
+                    MCDRLayout.PTR,
+                    MCDRLayout.I32,
+                    MCDRLayout.I32,
+                    MCDRLayout.I32,
+                    MCDRLayout.I32,
+                    MCDRLayout.I32,
+                    MCDRLayout.I32,
+                    MCDRLayout.I32,
+                    MCDRLayout.PTR,
+                    MCDRLayout.PTR,
+                    MCDRLayout.I32,
+                ),
+            )
+        MH_dlssdevalexposure = skipOptional("mcdr_dx12DlssdEvalExposure", fd(
+            MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32,
+            MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32,
+            MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR,
+            MCDRLayout.PTR, MCDRLayout.I32,
+        ))
+        MH_rtsrevalexposure = skipOptional("mcdr_dx12RtSrEvalExposure", fd(
+            MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32,
+            MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32,
+            MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR,
+            MCDRLayout.PTR, MCDRLayout.I32,
+        ))
         MH_setreflexmode = skipOptional("mcdr_dx12SetReflexMode", fdv(MCDRLayout.I32))
         MH_setdlssgmode = skipOptional("mcdr_dx12SetDlssgMode", fdv(MCDRLayout.I32, MCDRLayout.I32))
     MH_getdlssgpresented = skipOptional("mcdr_dx12GetDlssgPresented", fd(MCDRLayout.I32))
@@ -4153,6 +4334,8 @@ object MCDR_ABI {
             MCDRLayout.I32, MCDRLayout.I32
         ))
         MH_rttrackstats = skip("mcdr_dx12QueryRtTrackStats", fd(MCDRLayout.I32, MCDRLayout.PTR))
+        MH_sdkresourcestate = skipOptional("mcdr_dx12QuerySdkResourceState",
+            fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
         MH_dispatchcompute = skip("mcdr_dx12DispatchCompute", fd(
             MCDRLayout.I32,
             MCDRLayout.PTR,

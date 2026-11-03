@@ -27,7 +27,7 @@ object D3D12RtShaderSources {
     private val cache = ConcurrentHashMap<String, String>()
 
     /**
-     * 读一份着色器源码（相对 `assets/dxr_mc/shaders/`，例如 `B-Mega/shaders/mega_trace.hlsl`），
+     * 读一份着色器源码（相对 `assets/dxr_mc/shaders/`，例如 `B-DXR/shaders/rt_dxr_lib.hlsl`），
      * `#include` 已展开。找不到就抛 [IllegalStateException]，消息里列出找过的位置。
      */
     fun load(relative: String): String = cache.computeIfAbsent(relative) { expand(relative, 0) }
@@ -71,7 +71,7 @@ object D3D12RtShaderSources {
     }
 
     private fun resolve(name: String, from: String): String? {
-        // 包里的 shader 可以放在任意子目录（B-Mega/shaders/），include 既有同目录也有该目录下的 include/。
+        // 包里的 shader 可以放在任意子目录（B-DXR/shaders/），include 既有同目录也有该目录下的 include/。
         val directory = from.substringBeforeLast('/', "")
         val candidates = buildList {
             if (directory.isNotEmpty()) {

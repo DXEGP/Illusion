@@ -1,7 +1,6 @@
 package dev.nts.expdxr.dxrmc.rt
 
 import com.mojang.renderpearl.api.buffers.GpuBuffer
-import dev.nts.expdxr.RtBackend
 import dev.nts.expdxr.d3d12.extern.MCDR_ABI
 import dev.nts.expdxr.d3d12.render.adapter.D3D12Device
 import dev.nts.expdxr.d3d12.render.core.D3D12GpuBuffer
@@ -16,7 +15,7 @@ import kotlin.math.abs
 import kotlin.math.pow
 
 /**
- * B-Mega 光追主通道（S2 2-d）。
+ * B-DXR 光追主通道（S2 2-d）。
  * 见 docs/rt/README.md
  */
 object D3D12RtTrace {
@@ -40,7 +39,6 @@ object D3D12RtTrace {
     private const val VERTEX_BYTES = 28
     // +0 albedo / +12 emissive / +24 roughness / +28 flags / +32 metalness（docs/rt/README.md §17.2）。
     private const val MATERIAL_BYTES = 40
-    // 段边长：暴力档按 [origin - 0.5, origin + 16.5] 剪枝，自检场景必须整颗落在里面。
     private const val SECTION_SIZE = 16f
     private const val RT_DIR = "dxrmc"
     private const val SELF_TEST_FILE = "rt_selftest.json"
@@ -57,12 +55,6 @@ object D3D12RtTrace {
        创建/释放必须互斥，否则会重复建（泄漏一条）或把正在派的句柄释放掉。 */
     private val pipelineLock = Any()
 
-    @Volatile private var pipeline: Long = 0L
-
-    /** 加速结构变体的追踪管线（`RT_AS`，SRV 多一个 t5）；0 = 还没编译。 */
-    @Volatile private var asPipeline: Long = 0L
-    @Volatile private var asPipelineFailed: Boolean = false
-
     /** 自检当前走到哪一步：失败时靠它定位，光有异常类不够。 */
     private var step = "pipeline"
     /** 自检前的等待 tick 数：世界刚加载完的那几秒排队的工作太多，栅栏等待会把 tick 线程按住。 */
@@ -78,11 +70,7 @@ object D3D12RtTrace {
     @Volatile private var validated: Boolean = false
     @Volatile private var failed: Boolean = false
 
-    fun isActive(): Boolean = D3D12Settings.rtBackend != RtBackend.AUTO.ordinal
-
-    /** 逐帧派发用的计算管线（首次调用即编译）；0 = 编译失败，调用方必须跳过。 */
-    internal fun dispatchPipeline(asPath: Boolean = false): Long =
-        if (asPath) ensureAsPipeline() else ensurePipeline()
+    fun isActive(): Boolean = D3D12Settings.rtEnabled
 
     fun isValidated(): Boolean = validated
 
@@ -107,18 +95,12 @@ object D3D12RtTrace {
     }
 
     private fun writeSelfTestReport(pass: Boolean, detail: String, stepOverride: String? = null) {
-        // 报告里的 tier 是「实际跑的档」：配置写 dxr 但管线没建起来时会退到 accel / brute，
-        // 按配置推断出来的名字会把这次运行说成它没走过的路。
-        val tier = D3D12RtFrame.lastDispatchTier() ?: when {
-            D3D12Settings.rtBackend == RtBackend.DXR.ordinal -> "dxr"
-            D3D12Settings.rtAsTrace -> "accel"
-            else -> "brute"
-        }
+        val tier = D3D12RtFrame.lastDispatchTier() ?: "none"
         val safe = jsonSafe(detail)
         // 一次运行把该看的都写进来：六个场景逐项结论、几何契约、加速结构计数、SBT、逐帧档位。
         // 只看这一个文件就能判断这一轮到底哪一步不对，不必再进游戏第二次。
         val text = "{\"time\":${System.currentTimeMillis()},\"tier\":\"$tier\"," +
-            "\"backend\":${D3D12Settings.rtBackend},\"asTrace\":${D3D12Settings.rtAsTrace}," +
+            "\"backend\":${D3D12Settings.rtBackend}," +
             "\"pass\":$pass,\"step\":\"${stepOverride ?: step}\",\"detail\":\"$safe\"," +
             "\"scenes\":[${sceneNotes.joinToString(",")}]," +
             "\"contract\":\"${jsonSafe(accelReport(D3D12RtBlas.contractSummary(), D3D12RtBlas.selftestContractSummary()))}\"," +
@@ -184,36 +166,20 @@ object D3D12RtTrace {
         if (++selfTestTicks < SELFTEST_DELAY_TICKS) return
         sceneNotes.clear()
         val ok = try {
-            val gpu = ensurePipeline()
-            // 两个场景都要跑：只跑第一个时，失败原因分不清是「没派发出去」还是「只有天空色对不上」。
-            if (gpu == 0L) {
+            if (D3D12RtDxr.pipeline(device) == 0L) {
                 step = "pipeline"
                 false
             } else {
-                // 开跑先留一行：没有这一行就分不清「自检没进来」和「进来但没打印结果」。
-                IllusionLogger.infoMessage("rt self-test: start as=${D3D12Settings.rtAsTrace}")
-                // 探针先跑：它把常量与三张输入缓冲的原值直接写回来，失败时立刻能分清是
-                // 「常量没到」「SRV 表没绑对」还是「着色器逻辑本身错」。
+                IllusionLogger.infoMessage("rt self-test: DXR started")
                 step = "probe"
-                val probe = sceneGuard { validateProbe(device, gpu) }
+                val probe = sceneGuard { validateProbe(device) }
                 step = "empty"
-                val empty = sceneGuard { validateScene(device, emptyScene(), gpu) }
+                val empty = sceneGuard { validateScene(device, emptyScene()) }
                 step = "triangle"
-                val triangle = sceneGuard { validateScene(device, triangleScene(), gpu) }
-                // 阴影场景只比 direct 与命中掩码：一次弹射在 16x16 地面上的掠射方向上会撞到
-                // 「擦边命中/擦边错过」的浮点边界，两个实现都会各自翻转，那不是阴影语义的差异。
+                val triangle = sceneGuard { validateScene(device, triangleScene()) }
                 step = "shadow"
-                val shadow = sceneGuard { validateScene(device, shadowScene(), gpu, compareIndirect = false) }
-                // 加速结构相关的两道只在需要它的档位上跑：MEGA 且 asTrace 关时不该建 AS。
-                val accelOn = D3D12Settings.rtBackend == RtBackend.DXR.ordinal || D3D12Settings.rtAsTrace
-                step = "as_triangle"
-                val accel = !accelOn || sceneGuard { validateAsScene(device) }
-                val dxrOn = D3D12Settings.rtBackend == RtBackend.DXR.ordinal
-                step = "dxr"
-                val dxr = !dxrOn ||
-                    (sceneGuard { validateDxrScene(device, triangleScene(), compareIndirect = true) } &&
-                        sceneGuard { validateDxrScene(device, shadowScene(), compareIndirect = false) })
-                probe && empty && triangle && shadow && accel && dxr
+                val shadow = sceneGuard { validateScene(device, shadowScene(), compareIndirect = false) }
+                probe && empty && triangle && shadow
             }
         } catch (t: SelfTestDeferred) {
             // 队列里还有没提交完的列表时等不到栅栏；这种情况会一直重复，所以要留一个「放弃了」的结论，
@@ -249,14 +215,6 @@ object D3D12RtTrace {
      * 不释放的话换包只改了配置，已编译的管线还挂着旧包的源码。
      */
     fun releasePipeline() = synchronized(pipelineLock) {
-        // compute 管线是原生 Dx12Object*，只能按资源释放；用 D3D12DestroyPipeline 会按 Dx12Pipeline 析构 → AV。
-        for (handle in listOf(pipeline, asPipeline)) {
-            if (handle != 0L) MCDR_ABI.ID3D12DestroyResource(handle)
-        }
-        pipeline = 0L
-        asPipeline = 0L
-        asPipelineFailed = false
-        // 状态对象按包缓存，换包后必须重建。
         D3D12RtDxr.release()
     }
 
@@ -265,51 +223,6 @@ object D3D12RtTrace {
         validated = false
         failed = false
         selfTestTicks = 0
-    }
-
-    private fun ensurePipeline(): Long = synchronized(pipelineLock) {
-        val cached = pipeline
-        if (cached != 0L) return cached
-        val dxil = MCDR_ABI.D3D12CompileShaderDxc(
-            D3D12RtTraceShader.build(), D3D12RtTraceShader.ENTRY, "cs_6_8")
-        if (dxil == null) {
-            IllusionLogger.warnMessage("rt trace: DXC compile failed: ${MCDR_ABI.D3D12LastError()}")
-            return 0L
-        }
-        val handle = MCDR_ABI.D3D12CreateComputePipelineEx(
-            dxil, D3D12RtTraceShader.SRV_COUNT, D3D12RtTraceShader.UAV_COUNT)
-        if (handle == 0L) {
-            IllusionLogger.warnMessage("rt trace: compute pipeline creation failed: ${MCDR_ABI.D3D12LastError()}")
-            return 0L
-        }
-        pipeline = handle
-        return handle
-    }
-
-    /**
-     * 加速结构变体：同一份源码前加 `#define RT_AS 1`，SRV 多一个 `t5`（TLAS）。
-     * 编译或建管线失败只记一次，之后直接返回 0 让调用方退回暴力路径。
-     */
-    private fun ensureAsPipeline(): Long = synchronized(pipelineLock) {
-        val cached = asPipeline
-        if (cached != 0L) return cached
-        if (asPipelineFailed) return 0L
-        val dxil = MCDR_ABI.D3D12CompileShaderDxc(
-            D3D12RtTraceShader.build(asPath = true), D3D12RtTraceShader.ENTRY, "cs_6_8")
-        if (dxil == null) {
-            asPipelineFailed = true
-            IllusionLogger.warnMessage("rt trace: DXC compile failed for the accel variant: ${MCDR_ABI.D3D12LastError()}")
-            return 0L
-        }
-        val handle = MCDR_ABI.D3D12CreateComputePipelineEx(
-            dxil, D3D12RtTraceShader.SRV_COUNT_AS, D3D12RtTraceShader.UAV_COUNT)
-        if (handle == 0L) {
-            asPipelineFailed = true
-            IllusionLogger.warnMessage("rt trace: compute pipeline creation failed for the accel variant: ${MCDR_ABI.D3D12LastError()}")
-            return 0L
-        }
-        asPipeline = handle
-        return handle
     }
 
     // ---- 场景 ----
@@ -334,8 +247,8 @@ object D3D12RtTrace {
 
     private fun emptyScene(): Scene = Scene(
         label = "empty",
-        positions = FloatArray(0),
-        indices = IntArray(0),
+        positions = FloatArray(9),
+        indices = intArrayOf(0, 1, 2),
         origin = RtVec3(0f, 0f, 0f),
         camera = RtVec3(0.25f, 0.25f, 0f),
         right = RtVec3(1f, 0f, 0f),
@@ -355,8 +268,6 @@ object D3D12RtTrace {
      */
     private fun triangleScene(): Scene = Scene(
         label = "triangle",
-        // 顶点必须落在记录那段 16x16x16 的盒子里：暴力档先按段盒剪枝，顶点伸出盒外时整段会被裁掉，
-        // GPU 与 CPU 参考就对不上（见 docs/rt/README.md 16.6 节）。
         positions = floatArrayOf(
             1f, 1f, 2f,
             9f, 1f, 2f,
@@ -403,19 +314,22 @@ object D3D12RtTrace {
 
     // ---- GPU 侧 ----
 
-    private class GpuResult(val direct: FloatArray, val indirect: FloatArray, val aux: FloatArray)
+    private class GpuResult(
+        val direct: FloatArray, val indirect: FloatArray, val aux: FloatArray,
+        val specular: FloatArray, val specularGrazing: FloatArray,
+    )
 
     /**
      * 探针：一次派发把常量与三张输入缓冲的原值写进输出，与期望值逐项比对。
      * 见 docs/rt/README.md
      */
-    private fun validateProbe(device: D3D12Device, gpuPipeline: Long): Boolean {
+    private fun validateProbe(device: D3D12Device): Boolean {
         val scene = triangleScene()
         val result = runGpu(
-            device, scene, gpuPipeline, recordBytes(scene), vertexBytes(scene), indexBytes(scene),
+            device, scene, recordBytes(scene), vertexBytes(scene), indexBytes(scene),
             materialBytes(scene), quadMaterialBytes(scene),
             // debugMode = 8 是探针；recordCount 给非零假值。
-            sceneBytes(scene, debugMode = 8, recordCount = 3), probe = true,
+            sceneBytes(scene, debugMode = 8, recordCount = 3),
         ) ?: return false
         val width = result.direct[0]
         val height = result.direct[1]
@@ -462,7 +376,6 @@ object D3D12RtTrace {
     private fun validateScene(
         device: D3D12Device,
         scene: Scene,
-        gpuPipeline: Long,
         compareIndirect: Boolean = true,
     ): Boolean {
         val records = recordBytes(scene)
@@ -472,16 +385,20 @@ object D3D12RtTrace {
         val quads = quadMaterialBytes(scene)
         val camera = sceneBytes(scene)
 
-        val result = runGpu(device, scene, gpuPipeline, records, vertices, indices, materials, quads, camera)
+        val result = runGpu(device, scene, records, vertices, indices, materials, quads, camera)
             ?: return false
         val cpu = _reference(scene, records, vertices, indices, materials, quads, camera)
 
         var worst = 0f
         var over = 0
         var maskMismatch = 0
+        var materialMismatch = 0
         var gpuHits = 0
         var cpuHits = 0
         var gpuShadowed = 0
+        var invalidSpecular = 0
+        var specularSamples = 0
+        val specularPlanes = listOf(result.specular to cpu.specular, result.specularGrazing to cpu.specularGrazing)
         for (i in 0 until WIDTH * HEIGHT) {
             val cpuHit = cpu.aux[i * 4] > 0f
             val gpuHit = result.aux[i * 4] > 0f
@@ -494,6 +411,14 @@ object D3D12RtTrace {
                 gpuShadowed++
             }
             if (cpuHit != gpuHit) maskMismatch++
+            if (cpuHit && gpuHit && cpu.aux[i * 4 + 3].toRawBits() != result.aux[i * 4 + 3].toRawBits()) {
+                materialMismatch++
+            }
+            if (result.specular[i * 4 + 3] > 0f) specularSamples++
+            if (result.specular[i * 4 + 3] < 0f || result.specularGrazing[i * 4 + 3] != 0f ||
+                (!gpuHit && (0 until 4).any { result.specular[i * 4 + it] != 0f ||
+                    result.specularGrazing[i * 4 + it] != 0f })
+            ) invalidSpecular++
             for (c in 0 until 4) {
                 val at = i * 4 + c
                 val d = abs(result.direct[at] - cpu.direct[at])
@@ -504,19 +429,29 @@ object D3D12RtTrace {
                     if (e > worst) worst = e
                     if (exceeds(e, cpu.indirect[at])) over++
                 }
+                for ([actual, expected] in specularPlanes) {
+                    val difference = abs(actual[at] - expected[at])
+                    if (!actual[at].isFinite() || !expected[at].isFinite()) invalidSpecular++
+                    if (difference > worst) worst = difference
+                    if (exceeds(difference, expected[at])) over++
+                }
             }
         }
         // 两侧都没命中时逐像素比较恒等：没有覆盖的场景证明不了任何事，必须要求真的有命中。
-        val covered = scene.triangleCount == 0 || (gpuHits > 0 && cpuHits > 0)
-        val ok = over == 0 && maskMismatch == 0 && covered
+        val covered = if (scene.label == "empty") gpuHits == 0 && cpuHits == 0 else gpuHits > 0 && cpuHits > 0
+        val ok = over == 0 && maskMismatch == 0 && materialMismatch == 0 && covered &&
+            invalidSpecular == 0 && (scene.label == "empty" || specularSamples > 0)
         noteScene(
             scene.label, ok,
             "maxDiff=$worst over=$over mask=$maskMismatch hits=$gpuHits/$cpuHits shadowed=$gpuShadowed " +
-                "covered=$covered indirect=$compareIndirect")
+                "covered=$covered material=$materialMismatch indirect=$compareIndirect " +
+                "specular=$specularSamples invalid=$invalidSpecular")
         // 一行一个事实：三行分别是对拍误差、命中统计、判定依据（日志规范：正文 ≤60、硬上限 90）。
         val head = "rt trace: scene=${scene.label}"
         logLine("$head maxDiff=$worst over=$over mask=$maskMismatch triangles=${scene.triangleCount}")
         logLine("$head hits gpu=$gpuHits cpu=$cpuHits shadowed=$gpuShadowed covered=$covered")
+        logLine("$head materialMismatch=$materialMismatch")
+        logLine("$head specular=$specularSamples invalid=$invalidSpecular")
         logLine(
             "$head indirect=${if (compareIndirect) "on" else "off"} " +
                 "tol=$TOLERANCE+${RELATIVE_TOLERANCE}rel -> ${if (ok) "pass" else "fail"}",
@@ -561,106 +496,15 @@ object D3D12RtTrace {
 
     private fun allZero(values: FloatArray): Boolean = values.all { it == 0f }
 
-    /** 按场景建齐 CPU 侧缓冲并跑一趟 GPU，供各档对拍复用。 */
-    private fun runScene(
-        device: D3D12Device, scene: Scene, pipeline: Long,
-        accel: D3D12RtAccel? = null, raygen: Boolean = false,
-    ): GpuResult? = runGpu(
-        device, scene, pipeline,
-        recordBytes(scene), vertexBytes(scene), indexBytes(scene),
-        materialBytes(scene), quadMaterialBytes(scene), sceneBytes(scene),
-        accel = accel, raygen = raygen,
-    )
-
-    /**
-     * 同一颗三角形走两条遍历：内联 `RayQuery` 版必须与暴力档逐像素一致。
-     * 见 docs/rt/README.md 14.5 节。
-     */
-    private fun validateAsScene(device: D3D12Device): Boolean {
-        val pipeline = ensureAsPipeline()
-        if (pipeline == 0L) return false
-        val scene = triangleScene()
-        val accel = D3D12RtBlas.newAccel()
-        try {
-            step = "as_triangle:brute"
-            val brute = runScene(device, scene, ensurePipeline()) ?: return false
-            step = "as_triangle:accel"
-            val viaAccel = runScene(device, scene, pipeline, accel) ?: return false
-            D3D12RtBlas.noteSelftest(accel)
-            return comparePaths(brute, viaAccel, "as_triangle paths")
-        } finally {
-            accel.release()
-        }
-    }
-
-    /**
-     * `DispatchRays` 版必须与暴力档逐像素一致；着色器在 `mega_dxr_lib.hlsl` 里共用同一份命中解码。
-     * 见 docs/rt/README.md 16.6 节。
-     */
-    private fun validateDxrScene(device: D3D12Device, scene: Scene, compareIndirect: Boolean): Boolean {
-        val state = D3D12RtDxr.pipeline(device)
-        if (state == 0L) return false
-        val accel = D3D12RtBlas.newAccel()
-        try {
-            step = "dxr ${scene.label}:brute"
-            val brute = runScene(device, scene, ensurePipeline()) ?: return false
-            step = "dxr ${scene.label}:dispatch"
-            val viaDxr = runScene(device, scene, state, accel, raygen = true) ?: return false
-            D3D12RtBlas.noteSelftest(accel)
-            return comparePaths(brute, viaDxr, "dxr ${scene.label} paths", compareIndirect)
-        } finally {
-            accel.release()
-        }
-    }
-
-    /** 两条 GPU 路径的逐像素对拍：命中掩码、命中距离、直接光、弹射三项都要在容差内。 */
-    private fun comparePaths(
-        brute: GpuResult,
-        accel: GpuResult,
-        label: String,
-        compareIndirect: Boolean = true,
-    ): Boolean {
-        var worst = 0f
-        var over = 0
-        var maskMismatch = 0
-        val planes = buildList {
-            add(brute.aux to accel.aux)
-            add(brute.direct to accel.direct)
-            if (compareIndirect) add(brute.indirect to accel.indirect)
-        }
-        for (i in 0 until WIDTH * HEIGHT) {
-            if ((brute.aux[i * 4] > 0f) != (accel.aux[i * 4] > 0f)) maskMismatch++
-            for ((left, right) in planes) {
-                for (c in 0 until 4) {
-                    val d = abs(left[i * 4 + c] - right[i * 4 + c])
-                    if (d > worst) worst = d
-                    if (exceeds(d, right[i * 4 + c])) over++
-                }
-            }
-        }
-        val ok = over == 0 && maskMismatch == 0
-        val line = "rt trace: $label maxDiff=$worst over=$over mask=$maskMismatch " +
-            "tol=$TOLERANCE+${RELATIVE_TOLERANCE}rel"
-        if (ok) {
-            IllusionLogger.infoMessage("$line -> pass")
-        } else {
-            IllusionLogger.warnMessage("$line -> fail")
-        }
-        return ok
-    }
-
     private fun runGpu(
-        device: D3D12Device, scene: Scene, gpuPipeline: Long,
+        device: D3D12Device, scene: Scene,
         records: ByteBuffer, vertices: ByteBuffer, indices: ByteBuffer,
         materials: ByteBuffer, quads: ByteBuffer, camera: ByteBuffer,
-        probe: Boolean = false,
-        accel: D3D12RtAccel? = null,
-        raygen: Boolean = false,
     ): GpuResult? {
-        // 暴力 5 个 SRV，加速结构 / DXR 变体多一个 t5。
+        val accel = D3D12RtBlas.newAccel()
         val sources = ArrayList<D3D12GpuBuffer>(6)
-        val outputs = ArrayList<D3D12GpuBuffer>(3)
-        val readbacks = ArrayList<D3D12GpuBuffer>(3)
+        val outputs = ArrayList<D3D12GpuBuffer>(5)
+        val readbacks = ArrayList<D3D12GpuBuffer>(5)
         val constantHandles = ArrayList<D3D12GpuBuffer>(1)
         var ctx = 0L
         try {
@@ -674,10 +518,10 @@ object D3D12RtTrace {
             }
             step = "${scene.label}:alloc"
             val bytes = (WIDTH * HEIGHT * 16).toLong()
-            repeat(3) { i ->
+            repeat(5) { i ->
                 outputs.add(newBuffer(device, "rt-test-out-$i", UAV_BUFFER_USAGE, bytes) ?: return null)
             }
-            repeat(3) { i ->
+            repeat(5) { i ->
                 readbacks.add(newBuffer(device, "rt-test-read-$i", READ_USAGE, bytes) ?: return null)
             }
 
@@ -698,37 +542,24 @@ object D3D12RtTrace {
             }
             MCDR_ABI.D3D12BeginCommandList(ctx)
             var srvs = LongArray(sources.size) { sources[it].handle() }
-            if (accel != null) {
-                // 加速结构要的是显存缓冲：上传顺序是 records / vertices / indices / materials / quads。
-                if (!accel.prepare(device, ctx, records, 1, sources[1].handle(), sources[2].handle())) {
-                    IllusionLogger.warnMessage("rt trace: accel structure build failed")
-                    return null
-                }
-                val view = accel.view()
-                if (view == 0L) {
-                    IllusionLogger.warnMessage("rt trace: accel structure view missing")
-                    return null
-                }
-                srvs += view                                        // t5 = gTlas
+            if (!accel.prepare(device, ctx, records, 1, sources[1].handle(), sources[2].handle())) {
+                IllusionLogger.warnMessage("rt self-test: acceleration build failed")
+                return null
             }
+            val view = accel.view()
+            if (view == 0L) return null
+            srvs += view
+            D3D12RtBlas.noteSelftest(accel)
             val uavs = LongArray(outputs.size) { outputs[it].handle() }
-            // 常量全部在 WgaFrame 里（416 B 缓冲），这里不再传 root constants。
-            val constants = intArrayOf(0)
             step = "${scene.label}:dispatch"
-            val dispatched = if (raygen) {
-                D3D12RtDxr.dispatch(device, ctx, srvs, uavs, constantBuffer.handle(), 0L, WIDTH, HEIGHT)
-            } else {
-                MCDR_ABI.D3D12DispatchComputeEx(
-                    ctx, gpuPipeline, srvs, uavs, constants, constantBuffer.handle(), 0L,
-                    (WIDTH + 7) / 8, (HEIGHT + 7) / 8, 1,
-                )
-            }
+            val dispatched = D3D12RtDxr.dispatch(
+                device, ctx, srvs, uavs, constantBuffer.handle(), 0L, WIDTH, HEIGHT)
             if (!dispatched) {
                 IllusionLogger.warnMessage("rt trace: dispatch failed: ${MCDR_ABI.D3D12LastError()}")
                 return null
             }
             step = "${scene.label}:readback"
-            for (i in 0 until 3) {
+            for (i in outputs.indices) {
                 MCDR_ABI.D3D12CopyBuffer(ctx, outputs[i].handle(), 0L, readbacks[i].handle(), 0L, bytes)
             }
             val fence = MCDR_ABI.D3D12Submit(ctx)
@@ -737,10 +568,11 @@ object D3D12RtTrace {
                 throw SelfTestDeferred("fence wait timed out")
             }
 
-            val planes = Array(3) { readFloats(readbacks[it], bytes.toInt()) ?: return null }
-            return GpuResult(planes[0], planes[1], planes[2])
+            val planes = Array(5) { readFloats(readbacks[it], bytes.toInt()) ?: return null }
+            return GpuResult(planes[0], planes[1], planes[2], planes[3], planes[4])
         } finally {
             if (ctx != 0L) MCDR_ABI.D3D12DestroyCommandEncoder(ctx)
+            accel.release()
             for (buffer in sources + outputs + readbacks + constantHandles) buffer.close()
         }
     }
@@ -800,8 +632,6 @@ object D3D12RtTrace {
     private fun recordBytes(scene: Scene): ByteBuffer {
         val out = buffer(RECORD_BYTES * 1)
         if (scene.triangleCount == 0) return out
-        // 暴力档先按段盒剪枝、加速结构不剪：顶点整颗落在 [origin, origin + 16] 是两档一致的前提。
-        // 场景写歪时在这里指名顶点，别等到逐像素对不上再回头找。
         for (i in 0 until scene.positions.size / 3) {
             val inside = scene.positions[i * 3] in scene.origin.x..(scene.origin.x + SECTION_SIZE) &&
                 scene.positions[i * 3 + 1] in scene.origin.y..(scene.origin.y + SECTION_SIZE) &&
@@ -847,27 +677,28 @@ object D3D12RtTrace {
     }
 
     private fun materialBytes(scene: Scene): ByteBuffer {
-        val out = buffer(MATERIAL_BYTES)
-        out.putFloat(0, 0.7f)
-        out.putFloat(4, 0.7f)
-        out.putFloat(8, 0.7f)
-        out.putFloat(12, 0f)
-        out.putFloat(16, 0f)
-        out.putFloat(20, 0f)
-        out.putFloat(24, 0.8f)
-        out.putInt(28, 0)
+        val out = buffer(MATERIAL_BYTES * 3)
+        for (material in 0 until 3) {
+            val offset = material * MATERIAL_BYTES
+            out.putFloat(offset, 0.7f)
+            out.putFloat(offset + 4, 0.7f)
+            out.putFloat(offset + 8, 0.7f)
+            out.putFloat(offset + 24, 0.8f)
+        }
         return out
     }
 
     private fun quadMaterialBytes(scene: Scene): ByteBuffer {
         val quads = (scene.triangleCount / 2 + 1).coerceAtLeast(1)
-        return buffer(quads * 2)
+        return buffer(quads * 2).also { out ->
+            for (quad in 0 until quads) out.putShort(quad * 2, (1 + quad % 2).toShort())
+        }
     }
 
     /**
      * 自检场景的 `WgaFrame`。
      *
-     * `debugMode = 9` 是 B-Mega 的自检环境：着色器把天空换成常量 `g_moonRadiance.rgb`
+     * `debugMode = 9` 是 B-DXR 的自检环境：着色器把天空换成常量 `g_moonRadiance.rgb`
      * （场景的 `skyColor`），CPU 参考才对得上；正常出图用 `0`，天空走光影包的解析大气。
      */
     private fun sceneBytes(scene: Scene, debugMode: Int = 9, recordCount: Int = -1): ByteBuffer {
@@ -919,7 +750,10 @@ object D3D12RtTrace {
         var material: Int = 0
     }
 
-    private class CpuResult(val direct: FloatArray, val indirect: FloatArray, val aux: FloatArray)
+    private class CpuResult(
+        val direct: FloatArray, val indirect: FloatArray, val aux: FloatArray,
+        val specular: FloatArray, val specularGrazing: FloatArray,
+    )
 
     private fun _reference(
         scene: Scene, records: ByteBuffer, vertices: ByteBuffer, indices: ByteBuffer,
@@ -928,80 +762,83 @@ object D3D12RtTrace {
         val direct = FloatArray(WIDTH * HEIGHT * 4)
         val indirect = FloatArray(WIDTH * HEIGHT * 4)
         val aux = FloatArray(WIDTH * HEIGHT * 4)
-
+        val specular = FloatArray(WIDTH * HEIGHT * 4)
+        val specularGrazing = FloatArray(WIDTH * HEIGHT * 4)
         val camPos = readVec(camera, 192)
         val sunDir = D3D12RtLightContract.normalize(readVec(camera, 224))
         val sunColor = readVec(camera, 240)
         val skyColor = readVec(camera, 256)
-        val inverse = FloatArray(16)
-        for (i in 0 until 16) inverse[i] = camera.getFloat(128 + i * 4)
+        val inverse = FloatArray(16) { camera.getFloat(128 + it * 4) }
         val recordCount = if (scene.triangleCount == 0) 0 else 1
+        val sampleFrame = camera.getFloat(204).toInt()
 
-        for (y in 0 until HEIGHT) {
-            for (x in 0 until WIDTH) {
-                val pixel = y * WIDTH + x
-                // direct 的 alpha 是命中标记（着色器写 `hitFlag`），indirect 的 alpha 恒为 1。
-                direct[pixel * 4 + 3] = 0f
+        fun bounce(origin: RtVec3, direction: RtVec3): Pair<RtVec3, Float> {
+            val second = trace(recordCount, records, vertices, indices, quads, origin, direction, 1e9f)
+            if (!second.hit) return skyColor to 1e9f
+            val normal = faceNormal(second.normal, direction)
+            val shadowOrigin = origin + direction * second.t + normal * D3D12RtLightContract.rayBias(second.t)
+            val shadow = trace(recordCount, records, vertices, indices, quads, shadowOrigin, sunDir, 1e9f)
+            val materialAt = second.material * MATERIAL_BYTES
+            return shadeBounce(readVec(materials, materialAt), readVec(materials, materialAt + 12),
+                materials.getFloat(materialAt + 24), materials.getFloat(materialAt + 32),
+                normal, sunDir, sunColor, skyColor, if (shadow.hit) 0f else 1f, direction) to second.t
+        }
+
+        fun store(target: FloatArray, pixel: Int, value: RtVec3) {
+            target[pixel * 4] = value.x
+            target[pixel * 4 + 1] = value.y
+            target[pixel * 4 + 2] = value.z
+        }
+
+        for (pixelY in 0 until HEIGHT) {
+            for (pixelX in 0 until WIDTH) {
+                val pixel = pixelY * WIDTH + pixelX
                 indirect[pixel * 4 + 3] = 1f
-                val uvx = (x + 0.5f) / WIDTH
-                val uvy = (y + 0.5f) / HEIGHT
-                val ndcx = uvx * 2f - 1f
-                val ndcy = 1f - uvy * 2f
-                // 必须和着色器同一条路径：逆视图投影 × 裁剪空间向量（HLSL 也是 mul(M, clip)）。
-                val dir = rayDirection(inverse, ndcx, ndcy, camPos)
+                val ndcX = (pixelX + 0.5f) / WIDTH * 2f - 1f
+                val ndcY = 1f - (pixelY + 0.5f) / HEIGHT * 2f
+                val direction = rayDirection(inverse, ndcX, ndcY, camPos)
+                val hit = trace(recordCount, records, vertices, indices, quads, camPos, direction, 1e9f)
+                if (!hit.hit) {
+                    store(indirect, pixel, skyColor)
+                    continue
+                }
+                val normal = faceNormal(hit.normal, direction)
+                val origin = camPos + direction * hit.t + normal * D3D12RtLightContract.rayBias(hit.t)
+                val shadow = trace(recordCount, records, vertices, indices, quads, origin, sunDir, 1e9f)
+                val visible = if (shadow.hit) 0f else 1f
+                aux[pixel * 4] = hit.t
+                aux[pixel * 4 + 1] = visible
+                aux[pixel * 4 + 2] = 1e9f
+                aux[pixel * 4 + 3] = Float.fromBits(hit.material)
+                store(direct, pixel, sunColor * (normal.dot(sunDir).coerceAtLeast(0f) * visible))
+                direct[pixel * 4 + 3] = 1f
 
-                val hit = trace(recordCount, records, vertices, indices, quads, camPos, dir, 1.0e9f)
-                if (hit.hit) {
-                    val normal = faceNormal(hit.normal, dir)
-                    val position = camPos + dir * hit.t
-                    val origin = position + normal * D3D12RtLightContract.rayBias(hit.t)
-                    aux[pixel * 4] = hit.t
-                    aux[pixel * 4 + 1] = normal.x
-                    aux[pixel * 4 + 2] = normal.y
-                    aux[pixel * 4 + 3] = normal.z
-
-                    val shadow = trace(recordCount, records, vertices, indices, quads, origin, sunDir, 1.0e9f)
-                    val visible = if (shadow.hit) 0f else 1f
-                    val sun = sunColor * (maxOf(normal.dot(sunDir), 0f) * visible)
-                    direct[pixel * 4] = sun.x
-                    direct[pixel * 4 + 1] = sun.y
-                    direct[pixel * 4 + 2] = sun.z
-                    direct[pixel * 4 + 3] = 1f
-
-                    val rng = D3D12RtLightContract.Rng(D3D12RtLightContract.seed(x, y, 0, 1, 0, 0))
-                    val bounceDir = D3D12RtLightContract.cosineHemisphere(rng.next2(), normal)
-                    if (normal.dot(bounceDir) > 0f) {
-                        val second = trace(recordCount, records, vertices, indices, quads, origin, bounceDir, 1.0e9f)
-                        if (second.hit) {
-                            val normal2 = faceNormal(second.normal, bounceDir)
-                            val origin2 = origin + bounceDir * second.t +
-                                normal2 * D3D12RtLightContract.rayBias(second.t)
-                            val shadow2 = trace(recordCount, records, vertices, indices, quads, origin2, sunDir, 1.0e9f)
-                            val visible2 = if (shadow2.hit) 0f else 1f
-                            val materialAt = second.material * MATERIAL_BYTES
-                            val albedo2 = readVec(materials, materialAt)
-                            val emissive = readVec(materials, materialAt + 12)
-                            val indirect2 = shadeBounce(albedo2, emissive,
-                                materials.getFloat(materialAt + 24), materials.getFloat(materialAt + 32),
-                                normal2, sunDir, sunColor, skyColor, visible2, bounceDir)
-                            indirect[pixel * 4] = indirect2.x
-                            indirect[pixel * 4 + 1] = indirect2.y
-                            indirect[pixel * 4 + 2] = indirect2.z
-                        } else {
-                            indirect[pixel * 4] = skyColor.x
-                            indirect[pixel * 4 + 1] = skyColor.y
-                            indirect[pixel * 4 + 2] = skyColor.z
-                        }
-                    }
-                } else {
-                    // 相机光线打空：与 rt_main 的 else 分支逐行对齐（天空即环境入射）。
-                    indirect[pixel * 4] = skyColor.x
-                    indirect[pixel * 4 + 1] = skyColor.y
-                    indirect[pixel * 4 + 2] = skyColor.z
+                val diffuseRng = D3D12RtLightContract.Rng(D3D12RtLightContract.seed(pixelX, pixelY, sampleFrame, 1, 0, 0))
+                val diffuseDirection = D3D12RtLightContract.cosineHemisphere(diffuseRng.next2(), normal)
+                if (normal.dot(diffuseDirection) > 0f) {
+                    val [incoming, distance] = bounce(origin, diffuseDirection)
+                    store(indirect, pixel, incoming)
+                    aux[pixel * 4 + 2] = distance
+                }
+                val materialRoughness = materials.getFloat(hit.material * MATERIAL_BYTES + 24)
+                val roughness = if (materialRoughness.isFinite()) materialRoughness.coerceIn(1.5f / 512f, 1f) else 0.8f
+                val alpha = roughness * roughness
+                val view = direction * -1f
+                val specularRng = D3D12RtLightContract.Rng(D3D12RtLightContract.seed(pixelX, pixelY, sampleFrame, 1, 1, 0))
+                val [specularDirection, halfDirection] =
+                    D3D12RtLightContract.sampleGgxVndf(specularRng.next2(), normal, view, alpha)
+                val normalDotLight = normal.dot(specularDirection)
+                if (normalDotLight > 0f) {
+                    val [incoming, distance] = bounce(origin, specularDirection)
+                    val grazing = D3D12RtLightContract.saturate(1f - view.dot(halfDirection)).pow(5f)
+                    val visibility = D3D12RtLightContract.ggxSmithG1(normalDotLight, alpha)
+                    store(specular, pixel, incoming * (visibility * (1f - grazing)))
+                    store(specularGrazing, pixel, incoming * (visibility * grazing))
+                    specular[pixel * 4 + 3] = distance
                 }
             }
         }
-        return CpuResult(direct, indirect, aux)
+        return CpuResult(direct, indirect, aux, specular, specularGrazing)
     }
 
     private fun trace(
@@ -1082,7 +919,7 @@ object D3D12RtTrace {
         RtVec3(buffer.getFloat(offset), buffer.getFloat(offset + 4), buffer.getFloat(offset + 8))
 
     /**
-     * 弹射面的出射辐射度；逐项与 `mega_shade.hlsli` 的 `RtIndirectRadiance` 对齐（§17.2）。
+     * 弹射面的出射辐射度；逐项与 `rt_shade.hlsli` 的 `RtIndirectRadiance` 对齐（§17.2）。
      *
      * 两边算得不一样时自检会报「GPU 与 CPU 参考差很大」，而画面看不出问题 —— 改一边必须改另一边。
      */
@@ -1093,7 +930,7 @@ object D3D12RtTrace {
         val smoothness = 1f - roughness.coerceIn(0f, 1f)
         val diffuse = albedo * (1f - metal)
         val f0 = albedo * metal + RtVec3(0.04f, 0.04f, 0.04f) * (1f - metal)
-        val exponent = 2.0.pow((1.0 + 9.0 * smoothness).toDouble()).toFloat()
+        val exponent = 2.0.pow(1.0 + 9.0 * smoothness).toFloat()
         // 半角向量要自己归一化：RtVec3 故意只放契约里有的运算（contract_check 逐条对拍）。
         val halfRaw = sunDir - viewDir
         val halfLen = halfRaw.length()

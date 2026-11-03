@@ -15,6 +15,7 @@ import dev.nts.expdxr.d3d12.render.adapter.D3D12Device
 import dev.nts.expdxr.d3d12.render.advanced.taa.D3D12TAA
 import dev.nts.expdxr.d3d12.render.advanced.taa.D3D12Temporal
 import dev.nts.expdxr.dxrmc.rt.D3D12RtFrame
+import dev.nts.expdxr.dxrmc.rt.D3D12RtPipelinePlan
 import dev.nts.expdxr.dxrmc.rt.D3D12RtGBuffer
 import dev.nts.expdxr.dxrmc.rt.D3D12RtStats
 import dev.nts.expdxr.d3d12.render.advanced.D3D12PostSharpen
@@ -39,9 +40,7 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
     /** 帧中间追加后处理（光追合光）要建纹理，需要拿到编码器所属的设备。 */
     val device: D3D12Device?
     private val transientMemory: D3D12TransientMemory
-    // 拷贝完成回调是**设备级全局队列**：vanilla 的 Screenshot 只在一个从不 submit 的一次性 encoder 上登记回调，
-    // 回调若存在 encoder 自己身上则永不执行 → 截图缓冲永不 close（每秒 1.6MB READBACK 泄漏）。
-    private val pendingCallbacks: MutableList<Runnable> get() = GLOBAL_CALLBACKS
+    private val pendingCallbacks = mutableListOf<Runnable>()
     private var currentRenderPass: D3D12RenderPassBackend? = null
     /** 当前 submit() 走 ASYNC 路径：begin/allocator reset 由主线程在 [ensureListOpen] 里做，渲染线程只 Close+Execute+Present。 */
     private var inAsyncSubmit = false
@@ -283,16 +282,25 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
      */
     private var gbufferReplayFrames = 0
 
+    /** 重放规模心跳：上次报时的时刻。 */
+    private var gbufferReplayNanos = 0L
+
     private fun recordGBufferPass(pass: D3D12RenderPassBackend) {
         if (!pass.hasGBufferBatches()) {
             return
         }
+        D3D12RtFrame.invalidateOutput()
         // 光追是开发档功能：任何异常都不许冒泡到帧图，游戏必须继续可玩。
         var opened = false
+        val plan = D3D12RtPipelinePlan.configured(pass.areaWidth(), pass.areaHeight())
+        if (!plan.enabled) return
+        val camera = D3D12RtFrame.currentCamera() ?: return
+        val projection = D3D12Temporal.rtReplayProjection(camera.frameNanos,
+            plan.gbufferWidth, plan.gbufferHeight) ?: return
         try {
             // 时间戳的读点放在这里：上一帧已经 present 提交，读回不会把这一帧卡在栅栏上。
             D3D12RtStats.beginFrame(this, pass.areaWidth(), pass.areaHeight())
-            val targets = D3D12RtGBuffer.ensure(this.device, pass.areaWidth(), pass.areaHeight()) ?: return
+            val targets = D3D12RtGBuffer.ensure(this.device, plan.gbufferWidth, plan.gbufferHeight) ?: return
             val colors = LongArray(D3D12RtGBuffer.ATTACHMENTS) { index -> targets.handle(index) }
             val mips = IntArray(D3D12RtGBuffer.ATTACHMENTS)
             // 每帧都清：上一帧的残留会让 debug 视图与 S3 的采样读到过期像素。
@@ -311,16 +319,23 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
             this.ensureListOpen()
             // 深度用 G-Buffer 自己的那份（清成 0 = reverse-Z 的远端）：借主 pass 的深度会因为
             // 同帧二次绘制的浮点不等而整片拒绝，留下地平线窄带与近处楔形的漏画。
+            // 目标是自建的离屏纹理，原点恒为 (0,0)：把主 pass 的 area 原点搬过来会让光栅
+            // 整体偏移、只画进一块，表现为「世界只剩左上角一块」。
             MCDR_ABI.D3D12BeginRenderPass(this.ctx, colors, mips, clearFlags, clearColors,
                 targets.depthHandle(), 0, 1, 0.0,
-                pass.areaX(), pass.areaY(), pass.areaWidth(), pass.areaHeight())
+                0, 0, targets.width, targets.height)
             opened = true
-            pass.replayGBuffer()
-            // 前几帧打出重放的批次/meshlet 规模，用来和主 pass 的 meshlet dispatch 对账。
-            if (this.gbufferReplayFrames++ < 3) {
-                IllusionLogger.infoMessage(
-                    "rt gbuffer: replay batches=${pass.gbufferBatchCount()} " +
-                        "meshlets=${pass.gbufferMeshletCount()}")
+            if (!pass.replayGBuffer(camera.transform.offset, projection)) return
+            if (!D3D12Temporal.commitRtReplay(camera.frameNanos)) return
+            // 重放的批次/meshlet 规模要和主 pass 的 meshlet dispatch 对账：首帧一条，
+            // 之后每 5 秒一条（按帧报会在高帧率下刷屏，meshlet 数在加载期又每帧都变）。
+            val batches = pass.gbufferBatchCount()
+            val meshlets = pass.gbufferMeshletCount()
+            val now = System.nanoTime()
+            val replayFrames = this.gbufferReplayFrames++
+            if (replayFrames == 0 || now - this.gbufferReplayNanos >= 5_000_000_000L) {
+                this.gbufferReplayNanos = now
+                IllusionLogger.infoMessage("rt gbuffer: replay batches=$batches meshlets=$meshlets")
             }
             D3D12RtStats.mark(this, D3D12RtStats.SLOT_GBUFFER)
         } catch (t: Throwable) {
@@ -331,12 +346,9 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
                 MCDR_ABI.D3D12EndRenderPass(this.ctx)
             }
         }
-        // G-Buffer 已经落盘，紧接着跑一次 B-Mega 遍历：这里在 pass 之外，D3D12 允许派发 compute。
-        val width = pass.areaWidth()
-        val height = pass.areaHeight()
+        // G-Buffer 已经落盘，紧接着跑一次 B-DXR 遍历：这里在 pass 之外，D3D12 允许派发 compute。
         try {
-            D3D12RtFrame.dispatch(this.device, this,
-                D3D12RtFrame.currentCamera(width.toFloat() / height), width, height)
+            D3D12RtFrame.dispatch(this.device, this, camera, plan)
         } catch (t: Throwable) {
             D3D12RtFrame.reportFailure(t)
         }
@@ -385,6 +397,10 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
     // ---- copies ----
 
     override fun writeToBuffer(destination: GpuBufferSlice, data: ByteBuffer) {
+        if (D3D12RtFrame.isActive() &&
+            (destination.buffer() as? D3D12GpuBuffer)?.label() == D3D12Temporal.LEVEL_PROJECTION_LABEL) {
+            D3D12RtFrame.captureProjection(data)
+        }
         // 时间性渲染的写出拦截点：关卡投影矩阵（label "Camera projection matrix UBO level"，64B）注入亚像素
         // jitter，相机 UBO（"Global Settings UBO"，56B）捕获 CameraBlockPos/CameraOffset。两者 usage 136 不可映射、
         // 每帧都被重写，所以这是唯一能拿到逐帧新鲜字节的地方。未开启/不是这两个缓冲时返回 null。
@@ -439,13 +455,7 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
         this.ensureListOpen()
         MCDR_ABI.D3D12CopyTextureToBuffer(this.ctx, textureHandle(source), mipLevel, 0,
             x, y, width, height, bufferHandle(destination), offset)
-        if (destination.size() > 1000000L) {
-        }
-        // 回调在下次 submit 后跑（镜像 destroyQueue 的 rotate）。
         synchronized(this.pendingCallbacks) { this.pendingCallbacks.add(callback) }
-        // vanilla 契约：Screenshot.takeScreenshot 只在一个**从不 submit** 的一次性 encoder 上登记回调，期望回调
-        // 在该帧提交时触发。一次性 encoder（device == null）必须在这里立刻提交并同步跑回调，否则每秒一次的
-        // 自动截图都留下一个 1.6MB READBACK 缓冲（vanilla 回调里的 buffer.close() 永不执行）。
         if (this.device == null) {
             this.submit()
         }
@@ -488,6 +498,25 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
 
     // ---- submit lifecycle ----
 
+    private fun completeReadbacks() {
+        if (synchronized(pendingCallbacks) { pendingCallbacks.isEmpty() }) return
+        settlePendingSubmit()
+        val fence = MCDR_ABI.D3D12GetFenceValue(ctx)
+        check(fence > 0L && MCDR_ABI.D3D12WaitForFence(ctx, fence, 10_000_000_000L)) {
+            "readback: GPU completion timed out"
+        }
+        val callbacks = synchronized(pendingCallbacks) {
+            pendingCallbacks.toList().also { pendingCallbacks.clear() }
+        }
+        for (callback in callbacks) {
+            try {
+                callback.run()
+            } catch (failure: Throwable) {
+                IllusionLogger.warnMessage("readback: callback failed (${failure.javaClass.simpleName})")
+            }
+        }
+    }
+
     override fun submit() {
         // ASYNC 路径：主线程录制完 → 通知渲染线程 → 等 RECORDING_READY → 通知命令就绪 → 渲染线程
         // Close+Execute+Present；结算推迟到下一帧（[settlePendingSubmit]）。
@@ -507,20 +536,7 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
             MCDR_ABI.D3D12BeginCommandList(this.ctx)
             MCDR_ABI.D3D12Submit(this.ctx)
             this.transientMemory.rotate()
-            val run: List<Runnable> = synchronized(this.pendingCallbacks) {
-                ArrayList(this.pendingCallbacks).also { this.pendingCallbacks.clear() }
-            }
-            if (run.isNotEmpty()) {
-            }
-            for (callback in run) {
-                // 回调里抛异常会被吞掉，外层的截图缓冲就不会 close —— 必须打出来。
-                try {
-                    callback.run()
-                } catch (t: Throwable) {
-                    IllusionLogger.warnMessage("post-submit callback failed: " + t)
-                    t.printStackTrace()
-                }
-            }
+            completeReadbacks()
             return
         }
 
@@ -551,20 +567,7 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
             MCDR_ABI.D3D12BeginCommandList(this.ctx)
             MCDR_ABI.D3D12Submit(this.ctx)
             this.transientMemory.rotate()
-            val run: List<Runnable> = synchronized(this.pendingCallbacks) {
-                ArrayList(this.pendingCallbacks).also { this.pendingCallbacks.clear() }
-            }
-            if (run.isNotEmpty()) {
-            }
-            for (callback in run) {
-                // 回调里抛异常会被吞掉，外层的截图缓冲就不会 close —— 必须打出来。
-                try {
-                    callback.run()
-                } catch (t: Throwable) {
-                    IllusionLogger.warnMessage("post-submit callback failed: " + t)
-                    t.printStackTrace()
-                }
-            }
+            completeReadbacks()
             return
         }
 
@@ -577,19 +580,7 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
 
         // post-submit 清理。
         this.transientMemory.rotate()
-        // 跑上一帧 copyTextureToBuffer 排队的回调。
-        val run: List<Runnable> = synchronized(this.pendingCallbacks) {
-            ArrayList(this.pendingCallbacks).also { this.pendingCallbacks.clear() }
-        }
-        for (callback in run) {
-            // 回调里抛异常会被吞掉，外层的截图缓冲就不会 close —— 必须打出来。
-            try {
-                callback.run()
-            } catch (t: Throwable) {
-                IllusionLogger.warnMessage("post-submit callback failed: " + t)
-                t.printStackTrace()
-            }
-        }
+        completeReadbacks()
         // 每 PROF_INTERVAL 帧输出一次各阶段耗时均值（ms）。
         if (prof) {
             ++gProfAsyncFrames
@@ -680,7 +671,6 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
     }
 
     companion object {
-        private val GLOBAL_CALLBACKS: MutableList<Runnable> = ArrayList()
 
         // 帧时间插桩（PROF=1 才启用，正常游玩零开销）：量化 submit() 内部各同步阶段耗时。
         private const val PROF_INTERVAL = 300

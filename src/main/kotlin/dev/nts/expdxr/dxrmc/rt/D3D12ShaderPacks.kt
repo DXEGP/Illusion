@@ -22,22 +22,25 @@ object D3D12ShaderPacks {
     const val NONE: String = ""
 
     /** 清单读不出来时的兜底包名：跟随 jar 内置的默认包。 */
-    const val DEFAULT_PACK: String = "B-Mega"
+    const val DEFAULT_PACK: String = "B-DXR"
 
     private const val BUNDLED_ROOT = "assets/dxr_mc/shaders"
     private const val MANIFEST = "packs.txt"
 
-    /** B-Mega 后端建管线要用的入口文件（相对包内的 `shaders/`）。 */
+    /** B-DXR 后端建管线要用的入口文件（相对包内的 `shaders/`）。 */
     private val REQUIRED_ENTRIES = listOf(
-        "mega_trace.hlsl",
-        "mega_resolve.hlsl",
-        "mega_debug.hlsl",
-        "mega_gbuffer_ps.hlsl",
+        "rt_dxr_lib.hlsl",
+        "rt_resolve.hlsl",
+        "rt_exposure.hlsl",
+        "rt_debug.hlsl",
+        "rt_gbuffer_ps.hlsl",
+        "rt_material_guide.hlsl",
+        "rt_nrd_remodulate.hlsl",
     )
 
     enum class Kind { BUNDLED, USER }
 
-    /** 一个光影包。[missing] 为空才算能被 B-Mega 后端跑起来。 */
+    /** 一个光影包。[missing] 为空才算能被 B-DXR 后端跑起来。 */
     class Pack(
         val name: String,
         val kind: Kind,
@@ -87,7 +90,7 @@ object D3D12ShaderPacks {
     /** 用户在界面里选的那个（`NONE` = 无光影），与 [activeName] 的区别是允许「没选包」。 */
     fun selected(): String = configured()
 
-    /** 包内着色器的加载键（相对 `assets/dxr_mc/shaders/`），例如 `B-Mega/shaders/mega_trace.hlsl`。 */
+    /** 包内着色器的加载键（相对 `assets/dxr_mc/shaders/`），例如 `B-DXR/shaders/rt_dxr_lib.hlsl`。 */
     fun sourcePath(file: String): String = "${activeName()}/shaders/$file"
 
     /**
@@ -105,20 +108,14 @@ object D3D12ShaderPacks {
             require(pack.compatible) { "shaderpack $name is missing ${pack.missing.joinToString()}" }
             name
         }
-        // 后端与档位都是包自己声明的（configs.json 的 `backend` / `mode`）；没声明才回落 MEGA / FULL。
         val backend = if (target == NONE) RtBackend.AUTO else declaredBackend(target)
         val mode = if (target == NONE) RtMode.OFF else declaredMode(target)
-        // 加速结构开关也是包属性（configs.json 的 `asTrace`）：换包时按新包的声明重置，
-        // 否则上一个包打开的 AS 会跟着跑到不声明它的包上。
-        val asTrace = target != NONE && declaredAsTrace(target)
         val changed = configured() != target ||
             IllusionConfig.RAYTRACING_BACKEND.get() != backend ||
-            IllusionConfig.RAYTRACING_MODE.get() != mode ||
-            IllusionConfig.RAYTRACING_AS_TRACE.get() != asTrace
+            IllusionConfig.RAYTRACING_MODE.get() != mode
         IllusionConfig.SHADERPACK_ACTIVE.set(target)
         IllusionConfig.RAYTRACING_BACKEND.set(backend)
         IllusionConfig.RAYTRACING_MODE.set(mode)
-        IllusionConfig.RAYTRACING_AS_TRACE.set(asTrace)
         if (IllusionConfig.SPEC.isLoaded) IllusionConfig.SPEC.save()
         D3D12RtShaderSources.invalidate()
         if (changed) {
@@ -126,7 +123,7 @@ object D3D12ShaderPacks {
             D3D12RtTrace.resetSelfTest()
             IllusionLogger.infoMessage(
                 "shaderpack: applied \"${target.ifEmpty { "none" }}\" " +
-                    "backend=${backend.name} mode=${mode.name} as=$asTrace"
+                    "backend=${backend.name} mode=${mode.name}"
             )
         }
         return changed
@@ -156,13 +153,13 @@ object D3D12ShaderPacks {
     private fun configured(): String =
         if (!IllusionConfig.SPEC.isLoaded) DEFAULT_PACK else IllusionConfig.SHADERPACK_ACTIVE.get().trim()
 
-    /** 包在 `configs.json` 里给 `backend` 声明的值；读不到或写坏一律 MEGA。 */
+    /** 包在 `configs.json` 里给 `backend` 声明的值；读不到或写坏一律 DXR。 */
     private fun declaredBackend(pack: String): RtBackend {
         val attribute = D3D12PackConfig.attributes(pack).firstOrNull { it.configKey == "raytracing/backend" }
-            ?: return RtBackend.MEGA
+            ?: return RtBackend.DXR
         // 只认包明确表过的值：否则会把上一个包留下的全局 backend 当成这个包的声明。
         val declared = D3D12PackConfig.storedValue(attribute, pack) ?: attribute.defaultText
-        return RtBackend.entries.firstOrNull { it.name == declared } ?: RtBackend.MEGA
+        return RtBackend.entries.firstOrNull { it.name == declared } ?: RtBackend.DXR
     }
 
     /** 包在 `configs.json` 里给 `mode` 声明的档位；读不到或写坏一律 FULL（选中包就是要出图）。 */
@@ -171,14 +168,6 @@ object D3D12ShaderPacks {
             ?: return RtMode.FULL
         val declared = D3D12PackConfig.storedValue(attribute, pack) ?: attribute.defaultText
         return RtMode.entries.firstOrNull { it.name == declared } ?: RtMode.FULL
-    }
-
-    /** 包在 `configs.json` 里给 `asTrace` 声明的值；没声明就是关（默认档不建加速结构）。 */
-    private fun declaredAsTrace(pack: String): Boolean {
-        val attribute = D3D12PackConfig.attributes(pack).firstOrNull { it.configKey == "raytracing/asTrace" }
-            ?: return false
-        val declared = D3D12PackConfig.storedValue(attribute, pack) ?: attribute.defaultText
-        return declared.equals("true", ignoreCase = true)
     }
 
     /**
@@ -194,21 +183,15 @@ object D3D12ShaderPacks {
         if (all().none { it.name == pack && it.compatible }) return false
         val backend = declaredBackend(pack)
         val mode = declaredMode(pack)
-        val asTrace = declaredAsTrace(pack)
-        val current = Triple(
+        val current = Pair(
             IllusionConfig.RAYTRACING_BACKEND.get(),
             IllusionConfig.RAYTRACING_MODE.get(),
-            IllusionConfig.RAYTRACING_AS_TRACE.get(),
         )
-        if (current == Triple(backend, mode, asTrace)) return false
+        if (current == Pair(backend, mode)) return false
         IllusionConfig.RAYTRACING_BACKEND.set(backend)
         IllusionConfig.RAYTRACING_MODE.set(mode)
-        IllusionConfig.RAYTRACING_AS_TRACE.set(asTrace)
         IllusionConfig.SPEC.save()
-        IllusionLogger.infoMessage(
-            "shaderpack: reconciled \"$pack\" backend=${backend.name} mode=${mode.name} " +
-                "as=$asTrace (was ${current.first.name} / ${current.second.name} / ${current.third})"
-        )
+        IllusionLogger.infoMessage("shaderpack: reconciled $pack (${backend.name}, ${mode.name})")
         return true
     }
 

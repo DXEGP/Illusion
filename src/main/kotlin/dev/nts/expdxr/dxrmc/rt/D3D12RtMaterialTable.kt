@@ -60,7 +60,10 @@ object D3D12RtMaterialTable {
         val metalness: Float,
         val emissive: Float,
         val flags: Int,
-    )
+        val maps: D3D12RtMaterialMaps.Look,
+    ) {
+        var textureOffset = 0
+    }
 
     /** 一次烘焙的不可变结果：精灵表 + UV 候选桶 + 顶点格式偏移。 */
     private class Snapshot(
@@ -71,6 +74,11 @@ object D3D12RtMaterialTable {
         val stride: Int,
         val uvOffset: Int,
         val colorOffset: Int,
+        val textureBytes: ByteArray,
+        val firstSprite: TextureAtlasSprite?,
+        val mapsEnabled: Boolean,
+        val packPath: String,
+        val parallaxDepth: Float,
     ) {
         val size: Int get() = sprites.size
     }
@@ -118,10 +126,14 @@ object D3D12RtMaterialTable {
         val atlas = blocksAtlas() ?: return
         val current = snapshot
         // 按 Atlas 对象身份判断：getTextures() 每次返回新的 unmodifiableMap 包装，比 Map 身份永远不等。
-        if (current != null && current.atlas === atlas && current.size == atlas.textures.size) {
+        val textures = atlas.textures
+        if (current != null && current.atlas === atlas && current.size == textures.size &&
+            current.firstSprite === textures.values.firstOrNull() &&
+            current.mapsEnabled == D3D12Settings.materialsEnabled &&
+            current.packPath == D3D12Settings.materialsPackPath &&
+            current.parallaxDepth == D3D12Settings.materialsParallaxDepth) {
             return
         }
-        val textures = atlas.textures
         if (!bake(atlas, textures)) {
             return
         }
@@ -165,6 +177,11 @@ object D3D12RtMaterialTable {
             stride = format.vertexSize,
             uvOffset = format.getElement(DefaultVertexFormat.UV0_SEMANTIC_NAME)?.offset() ?: -1,
             colorOffset = format.getElement(DefaultVertexFormat.COLOR_SEMANTIC_NAME)?.offset() ?: -1,
+            textureBytes = packTextures(sprites, D3D12Settings.materialsParallaxDepth),
+            firstSprite = textures.values.firstOrNull(),
+            mapsEnabled = D3D12Settings.materialsEnabled,
+            packPath = D3D12Settings.materialsPackPath,
+            parallaxDepth = D3D12Settings.materialsParallaxDepth,
         )
         synchronized(entryLock) {
             materialIds.clear()
@@ -172,8 +189,8 @@ object D3D12RtMaterialTable {
             entryCount = 1
             writeEntry(FALLBACK, DEFAULT_ALBEDO, DEFAULT_ALBEDO, DEFAULT_ALBEDO,
                 0f, 0f, 0f, DEFAULT_ROUGHNESS, 0f, 0)
+            snapshot = baked
         }
-        snapshot = baked
         bakes.incrementAndGet()
         revision.incrementAndGet()
         spriteTotal.set(sprites.size.toLong())
@@ -259,15 +276,20 @@ object D3D12RtMaterialTable {
             }
         }
         val look = lookOf(path)
-        // 材质图优先：装了 labPBR 包就用包里的光滑度/金属度，没有就退回启发式。
-        val maps = D3D12RtMaterialMaps.look(contents.name()).spec
-        val roughness = maps?.roughness ?: look.roughness
-        val metalness = maps?.metalness ?: 0f
+        val sourceMaps = D3D12RtMaterialMaps.look(contents.name(), width, height)
+        val albedoMap = if (sourceMaps.spec != null || sourceMaps.normal != null) {
+            D3D12RtMaterialMaps.Image(width, height, IntArray(width * height) { pixel ->
+                sprite.getPixelARGB(0, pixel % width, pixel / width)
+            })
+        } else null
+        val maps = D3D12RtMaterialMaps.Look(sourceMaps.spec, sourceMaps.normal, albedoMap)
+        val roughness = look.roughness
+        val metalness = 0f
         if (weight <= 0.0) {
             return@runCatching Sprite(
                 sprite.u0, sprite.v0, sprite.u1, sprite.v1,
                 DEFAULT_ALBEDO, DEFAULT_ALBEDO, DEFAULT_ALBEDO,
-                roughness, metalness, look.emissive, look.flags,
+                roughness, metalness, look.emissive, look.flags, maps,
             )
         }
         val translucent = transparent * 3 >= samples
@@ -276,10 +298,40 @@ object D3D12RtMaterialTable {
             (red / weight).toFloat(), (green / weight).toFloat(), (blue / weight).toFloat(),
             roughness, metalness, look.emissive,
             if (translucent) look.flags or FLAG_TRANSLUCENT else look.flags,
+            maps,
         )
     }.getOrNull()
 
     private fun linear(value: Float): Double = value.toDouble().pow(2.2)
+
+    private fun packTextures(sprites: Array<Sprite?>, parallaxDepth: Float): ByteArray {
+        val mapped = sprites.filterNotNull().filter { it.maps.spec != null || it.maps.normal != null }
+        val size = mapped.sumOf { sprite ->
+            64L + 4L * ((sprite.maps.spec?.pixels?.size ?: 0) + (sprite.maps.normal?.pixels?.size ?: 0) +
+                (sprite.maps.albedo?.pixels?.size ?: 0))
+        }
+        require(size <= Int.MAX_VALUE) { "Material textures exceed buffer capacity" }
+        val data = ByteBuffer.allocate(size.toInt()).order(ByteOrder.LITTLE_ENDIAN)
+        for (sprite in mapped) {
+            val base = data.position()
+            sprite.textureOffset = base + 1
+            data.putFloat(sprite.u0).putFloat(sprite.v0)
+                .putFloat(1f / (sprite.u1 - sprite.u0)).putFloat(1f / (sprite.v1 - sprite.v0))
+            val opaque = sprite.maps.albedo?.pixels?.all { it ushr 24 == 255 } == true
+            data.putFloat(base + 52, if (opaque) parallaxDepth else 0f)
+            val minimumHeight = sprite.maps.normal?.pixels?.minOfOrNull { it ushr 24 } ?: 255
+            data.putFloat(base + 56, 1f - minimumHeight / 255f)
+            data.position(base + 64)
+            for ([index, image] in listOf(sprite.maps.spec, sprite.maps.normal, sprite.maps.albedo).withIndex()) {
+                val at = base + 16 + index * 12
+                data.putInt(at, if (image == null) 0 else data.position() - base)
+                data.putInt(at + 4, image?.width ?: 0)
+                data.putInt(at + 8, image?.height ?: 0)
+                image?.pixels?.forEach { data.putInt(it) }
+            }
+        }
+        return data.array()
+    }
 
     /** 粗糙度 / 自发光强度 / 材质位；先认透明与发光，再按材质族。路径形如 `block/stone_bricks`。 */
     private fun lookOf(path: String): Look = when {
@@ -381,6 +433,7 @@ object D3D12RtMaterialTable {
     }
 
     private fun appendEntry(s: Snapshot, sprite: Int, key: Long, argb: Int): Int = synchronized(entryLock) {
+        if (snapshot !== s) return FALLBACK
         materialIds[key]?.let { return it }
         val baked = s.sprites[sprite]
         if (baked == null || entryCount >= MAX_ENTRIES) {
@@ -396,6 +449,7 @@ object D3D12RtMaterialTable {
             baked.albedoR * tintR, baked.albedoG * tintG, baked.albedoB * tintB,
             baked.albedoR * baked.emissive, baked.albedoG * baked.emissive, baked.albedoB * baked.emissive,
             baked.roughness, baked.metalness, baked.flags,
+            baked.textureOffset,
         )
         materialIds[key] = index
         // 新条目必须让上传镜像重建，否则光追读到的材质缓冲停在首帧那份（弹射项 albedo 全 0）。
@@ -405,7 +459,7 @@ object D3D12RtMaterialTable {
 
     private fun writeEntry(index: Int, r: Float, g: Float, b: Float,
                            er: Float, eg: Float, eb: Float, roughness: Float,
-                           metalness: Float, flags: Int) {
+                           metalness: Float, flags: Int, textureOffset: Int = 0) {
         val at = index * ENTRY_BYTES
         entries.putFloat(at, r)
         entries.putFloat(at + 4, g)
@@ -417,6 +471,7 @@ object D3D12RtMaterialTable {
         // flags 留在 +28、金属度追加在 +32：老偏移一个都不动，着色器只多读一个字。
         entries.putInt(at + 28, flags)
         entries.putFloat(at + 32, metalness)
+        entries.putInt(at + 36, textureOffset)
         entries.position((index + 1) * ENTRY_BYTES)
     }
 
@@ -426,7 +481,19 @@ object D3D12RtMaterialTable {
 
     /** 材质记录的只读视图（`limit` = 已写字节数），给上传用。 */
     fun entryBytes(): ByteBuffer = synchronized(entryLock) {
-        entries.duplicate().order(ByteOrder.LITTLE_ENDIAN).also { it.flip() }
+        val records = entries.duplicate().order(ByteOrder.LITTLE_ENDIAN).also { it.flip() }
+        val maps = snapshot?.textureBytes ?: byteArrayOf()
+        val recordBytes = records.remaining()
+        ByteBuffer.allocate(recordBytes + maps.size).order(ByteOrder.LITTLE_ENDIAN).apply {
+            put(records)
+            for (index in 0 until entryCount) {
+                val at = index * ENTRY_BYTES + 36
+                val relative = getInt(at)
+                if (relative != 0) putInt(at, recordBytes + relative - 1)
+            }
+            put(maps)
+            flip()
+        }
     }
 
     @JvmStatic
@@ -437,7 +504,7 @@ object D3D12RtMaterialTable {
         "quads=${quadsClassified.get()} spriteMiss=${spriteMisses.get()} full=${tableFull.get()} " +
         "bakes=${bakes.get()} bakeUs=${bakeNanos.get() / 1000}"
 
-    /** 诊断重置用；正常路径靠 `atlas` 的对象身份变化自己重建。 */
+    /** 世界切换或诊断重置后，下次 tick 重新烘焙材质表。 */
     @JvmStatic
     fun clear() {
         snapshot = null
@@ -447,6 +514,7 @@ object D3D12RtMaterialTable {
             entryCount = 1
             writeEntry(FALLBACK, DEFAULT_ALBEDO, DEFAULT_ALBEDO, DEFAULT_ALBEDO,
                 0f, 0f, 0f, DEFAULT_ROUGHNESS, 0f, 0)
+            revision.incrementAndGet()
         }
     }
 }

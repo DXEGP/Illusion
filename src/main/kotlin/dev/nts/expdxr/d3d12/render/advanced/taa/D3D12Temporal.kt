@@ -7,6 +7,8 @@ import dev.nts.expdxr.d3d12.extern.MCDR_ABI
 import dev.nts.expdxr.d3d12.render.advanced.vrs.D3D12RenderScale
 import dev.nts.expdxr.d3d12.render.core.D3D12GpuBuffer
 import dev.nts.expdxr.dxrmc.sr.dlss.DeepLearningSuperSampling
+import dev.nts.expdxr.dxrmc.rt.D3D12RtFrame
+import dev.nts.expdxr.dxrmc.rt.D3D12RtPipelinePlan
 import net.minecraft.client.Minecraft
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
@@ -16,9 +18,6 @@ import java.nio.ByteOrder
 /**
  * Temporal (TAAU) base state: sub-pixel jitter, previous-frame/history management, per-object records.
  *
- * Jitter goes into the **level** projection only, columns [8]/[9] (`clip.w = -view.z`), never into the 3D
- * HUD; history must always keep the **unjittered** matrix or the velocity field is polluted. Halton(2,3)
- * in pixels, `[-0.5, +0.5)`, injected only when something consumes it ([hasJitterConsumer]).
  * See docs/antialiasing/README.md §3.
  */
 object D3D12Temporal {
@@ -45,15 +44,19 @@ object D3D12Temporal {
      * roll even with the dev switch [enabled] off, or TAA degrades into a static blur.
      */
     @JvmStatic
-    fun isActive(): Boolean = enabled || D3D12TAA.isSelected() || DeepLearningSuperSampling.isEnabled()
+    fun isActive(): Boolean = enabled || D3D12Settings.rtEnabled ||
+        D3D12TAA.isSelected() || DeepLearningSuperSampling.isEnabled()
 
     /**
      * Whether any temporal resolve really consumes the sub-pixel jitter; injecting it without a consumer
      * makes the whole image wobble. The velocity/history rolls still follow [isActive].
      */
-    private fun hasJitterConsumer(): Boolean =
+    private fun hasJitterConsumer(): Boolean = if (D3D12Settings.rtEnabled) {
+        D3D12RtFrame.hasTemporalResolve()
+    } else {
         D3D12TAA.isSelected() ||
             (DeepLearningSuperSampling.isEnabled() && !DeepLearningSuperSampling.isStalled())
+    }
 
     /** Whether the jitter is really written into the projection (the capture path ignores it). */
     @Volatile
@@ -105,16 +108,25 @@ object D3D12Temporal {
         loggedPhaseCount = reported
     }
 
-    /**
-     * Frame stamp ([Minecraft.getFrameTimeNs]) of the last level-projection upload; one frame may upload it
-     * several times, and advancing per upload would give two jitters within one frame.
-     */
     private var uploadFrameNs: Long = Long.MIN_VALUE
+    private var clockFrameId = Long.MIN_VALUE
+    private var clockFrameNanos = 0L
+
+    @get:Synchronized
+    val frameTimestampNanos: Long
+        get() {
+            if (clockFrameId != presentedFrameId) {
+                clockFrameNanos = System.nanoTime()
+                clockFrameId = presentedFrameId
+            }
+            return clockFrameNanos
+        }
 
     private var jitterX: Double = 0.0
     private var jitterY: Double = 0.0
     private var previousJitterX: Double = 0.0
     private var previousJitterY: Double = 0.0
+    private var jitterActive = false
 
     /**
      * This frame's sub-pixel offset in pixels, `[-0.5, 0.5)`; the velocity output is already jittered, so the
@@ -129,6 +141,8 @@ object D3D12Temporal {
 
     /** This frame's **unjittered** level projection (column-major, 16 floats, byte-identical to the uniform). */
     private var projection: FloatArray? = null
+
+    private var rtProjection: FloatArray? = null
 
     /** Previous frame's unjittered level projection. */
     private var previousProjection: FloatArray? = null
@@ -166,10 +180,6 @@ object D3D12Temporal {
     private var stateCameraView: FloatArray? = null
     private var previousStateCameraView: FloatArray? = null
 
-    /** Cached Halton(2) / Halton(3) values, generated lazily. */
-    private var halton2: DoubleArray = DoubleArray(0)
-    private var halton3: DoubleArray = DoubleArray(0)
-
     /**
      * History generation, bumped by [reset]; consumers must drop their cross-frame history when it changes,
      * or a teleport smears for dozens of frames.
@@ -191,7 +201,12 @@ object D3D12Temporal {
         jitterY = 0.0
         previousJitterX = 0.0
         previousJitterY = 0.0
+        jitterActive = false
+        injectedFrameId = Long.MIN_VALUE
+        injectedJitterActive = false
+        lastRollFrameId = -1L
         projection = null
+        rtProjection = null
         previousProjection = null
         viewProj = null
         previousViewProj = null
@@ -229,17 +244,10 @@ object D3D12Temporal {
         previousStateProjection = stateProjection
         stateProjection = null
 
-        val n = jitterSamples
-        ensureHalton(n)
-        val index = (frameIndex % n).toInt()
-        // Halton (0,1) -> centred pixel offset [-0.5, +0.5); without a consumer the jitter must be exactly 0.
-        if (hasJitterConsumer() && jitterEnabled) {
-            jitterX = halton2[index] - 0.5
-            jitterY = halton3[index] - 0.5
-        } else {
-            jitterX = 0.0
-            jitterY = 0.0
-        }
+        val sample = D3D12TemporalSampling.sample(frameIndex, jitterSamples, hasJitterConsumer() && jitterEnabled)
+        jitterX = sample.x
+        jitterY = sample.y
+        jitterActive = sample.enabled
         frameIndex++
         // Velocity textures roll on the same beat.
         D3D12Velocity.beginFrame()
@@ -260,28 +268,45 @@ object D3D12Temporal {
             return pristine
         }
         // Advance at most once per frame (see [uploadFrameNs]).
-        val stamp = Minecraft.getInstance().frameTimeNs
+        val stamp = frameTimestampNanos
         if (stamp != uploadFrameNs) {
             uploadFrameNs = stamp
             beginFrame()
         }
         // Prefer the CPU render state (authoritative); the UBO bytes only serve as a fallback.
         projection = stateProjection?.copyOf() ?: pristine.copyOf()
-        // Only a real temporal consumer gets jittered (SMAA/OFF must stay pristine).
-        if (!hasJitterConsumer() || !jitterEnabled) {
-            return pristine.copyOf()
-        }
         return jitterProjection(pristine, clipJitterX(width), clipJitterY(height))
     }
 
-    /**
-     * Adds a clip-space offset to the projection ([8] = m[0][2], [9] = m[1][2]); `clip.w = -view.z`, so `m[0][2] -= c`.
-     */
     fun jitterProjection(pristine: FloatArray, clipX: Double, clipY: Double): FloatArray {
-        val out = pristine.copyOf()
-        out[8] = (out[8] - clipX).toFloat()
-        out[9] = (out[9] - clipY).toFloat()
-        return out
+        return D3D12TemporalSampling.jitterProjection(pristine, clipX, clipY)
+    }
+
+    @Synchronized
+    fun frameJitter(frameNanos: Long): D3D12TemporalSampling.Sample =
+        if (uploadFrameNs == frameNanos && injectedFrameId == presentedFrameId && injectedJitterActive) {
+            D3D12TemporalSampling.Sample(injectedJitterX, injectedJitterY, true)
+        } else {
+            D3D12TemporalSampling.Sample(0.0, 0.0, false)
+        }
+
+    @Synchronized
+    fun rtReplayProjection(frameNanos: Long, width: Int, height: Int): FloatArray? {
+        if (uploadFrameNs != frameNanos || lastRollFrameId != presentedFrameId ||
+            !D3D12Settings.rtEnabled || width <= 0 || height <= 0) return null
+        val pristine = rtProjection ?: return null
+        return jitterProjection(pristine, clipJitterX(width), clipJitterY(height))
+    }
+
+    @Synchronized
+    fun commitRtReplay(frameNanos: Long): Boolean {
+        if (uploadFrameNs != frameNanos || lastRollFrameId != presentedFrameId ||
+            !D3D12Settings.rtEnabled || rtProjection == null) return false
+        injectedJitterX = jitterX
+        injectedJitterY = jitterY
+        injectedJitterActive = jitterActive
+        injectedFrameId = presentedFrameId
+        return true
     }
 
     /** This frame's jitter in pixels, `[-0.5, +0.5)`; 0 when disabled. */
@@ -357,7 +382,7 @@ object D3D12Temporal {
         if (data.remaining() != 64) {
             return null
         }
-val size = renderSize() ?: return null
+        val size = renderSize() ?: return null
         val pristine = readFloats(data, 0, 16) ?: return null
         // Frame identity = present count, not a time window: at low frame rates a second upload in the same
         // frame would roll the jitter again and the raster and the resolve end up disagreeing.
@@ -372,9 +397,20 @@ val size = renderSize() ?: return null
             onLevelProjectionUpload(pristine, size[0], size[1])
         }
 
-        // Remember the jitter really fed to the raster, so the DLSS side can compare reported vs rendered.
+        return projectionPayload(pristine, jittered, data)
+    }
+
+    private fun projectionPayload(pristine: FloatArray, jittered: FloatArray, data: ByteBuffer): ByteBuffer? {
+        if (D3D12Settings.rtEnabled) {
+            rtProjection = pristine
+            injectedFrameId = Long.MIN_VALUE
+            injectedJitterActive = false
+            return null
+        }
+        rtProjection = null
         injectedJitterX = jitterX
         injectedJitterY = jitterY
+        injectedJitterActive = jitterActive
         injectedFrameId = presentedFrameId
 
         // Rewrite the caller's buffer in place (offsets relative to `position`): a fresh buffer breaks the
@@ -439,6 +475,7 @@ val size = renderSize() ?: return null
     private var injectedJitterX: Double = 0.0
     private var injectedJitterY: Double = 0.0
     private var injectedFrameId: Long = Long.MIN_VALUE
+    private var injectedJitterActive = false
 
     /** Frame identity of the last history roll; repeated uploads in one frame do not roll again. */
     private var lastRollFrameId: Long = -1L
@@ -452,6 +489,10 @@ val size = renderSize() ?: return null
     private fun renderSize(): IntArray? {
         return try {
             val window = Minecraft.getInstance().window
+            if (D3D12Settings.rtEnabled && window.width > 0 && window.height > 0) {
+                val plan = D3D12RtPipelinePlan.configured(window.width, window.height)
+                return intArrayOf(plan.renderWidth, plan.renderHeight)
+            }
             val width = D3D12RenderScale.scaled(window.width)
             val height = D3D12RenderScale.scaled(window.height)
             if (width <= 0 || height <= 0) null else intArrayOf(width, height)
@@ -775,25 +816,4 @@ val size = renderSize() ?: return null
         return out
     }
 
-    /** Halton series: van der Corput radical inverse (bit flip for base 2, the general algorithm for base 3). */
-    private fun ensureHalton(n: Int) {
-        if (halton2.size >= n && halton3.size >= n) {
-            return
-        }
-        val size = if (n > DEFAULT_JITTER_SAMPLES) n else DEFAULT_JITTER_SAMPLES
-        halton2 = DoubleArray(size) { i -> radicalInverse(i + 1L, 2) }
-        halton3 = DoubleArray(size) { i -> radicalInverse(i + 1L, 3) }
-    }
-
-    private fun radicalInverse(index: Long, base: Int): Double {
-        var result = 0.0
-        var fraction = 1.0
-        var i = index
-        while (i > 0L) {
-            fraction /= base
-            result += fraction * (i % base)
-            i /= base
-        }
-        return result
-    }
 }

@@ -596,6 +596,7 @@ private const val DEFAULT_RENDER_PERCENT = 75
     /** 帧内挂点（`GameRendererSmaaWorldMixin`：SMAA 之后、`prepareForGui` 之前）。DLSS 原样委托。 */
     @JvmStatic
     fun applyIfEnabled() {
+        if (D3D12Settings.rtEnabled) return
         when (backendId()) {
             MCDR_ABI.SR_BACKEND_NONE -> releaseIfCreated()
             MCDR_ABI.SR_BACKEND_DLSS -> {

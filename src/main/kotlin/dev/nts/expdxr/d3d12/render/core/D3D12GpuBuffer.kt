@@ -5,7 +5,6 @@ import com.mojang.renderpearl.backend.common.BaseGpuBuffer
 import dev.nts.expdxr.d3d12.extern.MCDR_ABI
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.concurrent.atomic.AtomicLong
 /**
  * D3D12 缓冲。heap 类型由 native 按 usage 选（MAP_WRITE→UPLOAD，MAP_READ→READBACK，其余 DEFAULT），
  * [map] 返回持久映射内存上的 direct ByteBuffer。
@@ -51,7 +50,6 @@ class D3D12GpuBuffer(private val usageFlags: Int, private val bufferSize: Long, 
     }
 
     companion object {
-        private val G_CLOSE_LOG = java.util.concurrent.atomic.AtomicInteger()
         /**
          * `Map` 失败最常见的原因是设备已被移除（`0x887A0005`）：那一刻起每个 GPU 调用都会失败，
          * 崩溃点只是恰好落在第一个 `Map` 上。单独识别它，避免被误读成"某个 buffer 有问题"。
@@ -117,10 +115,6 @@ class D3D12GpuBuffer(private val usageFlags: Int, private val bufferSize: Long, 
             return
         }
         this.closed = true
-        // 临时取证：谁在关缓冲、关了几次。
-        if (label.contains("Screenshot") || (usageFlags and 8 != 0 && G_CLOSE_LOG.getAndIncrement() < 4)) {
-            System.err.println("GpuBuffer.close label='$label' size=$bufferSize")
-        }
         MCDR_ABI.ID3D12DestroyResource(this.handle)
     }
 

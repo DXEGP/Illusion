@@ -31,6 +31,7 @@
     "render.LevelRendererRtDebugViewMixin",
     "render.ChunkSectionsToRenderSamplerMixin",
     "render.GuiRendererTargetMixin",
+    "render.ScreenshotMixin",
     "render.CubeMapTargetMixin",
     "render.GameRendererBlurTargetMixin",
     "render.MinecraftRenderFrameProfMixin",

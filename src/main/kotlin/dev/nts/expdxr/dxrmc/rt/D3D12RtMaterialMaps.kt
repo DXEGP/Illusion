@@ -11,20 +11,18 @@ import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * labPBR 材质图接入（见 `docs/rt/README.md` §17）：按精灵名找 `_s` / `_n`，解码成材质表要的数值。
+ * labPBR 材质图接入（见 `docs/rt/README.md` §17）：按精灵名找 `_s` / `_n`，保留 ARGB 像素。
  *
  * 两个来源：`[materials] packPath` 指向的目录（开发期直连材质包仓库，发行版不带），或游戏里
  * 启用的资源包（玩家自己启用的 PBR 材质包）。两者都取不到时必须返回空的 [Look] 退化：材质表
  * 保留内置启发式，绝不能让「没有材质包」变成报错或全黑。
  */
 internal object D3D12RtMaterialMaps {
-    /** 一张精灵的 labPBR 参数；`roughness` = 1 - 光滑度（R），`metalness` = F0 通道（G）。 */
-    class Maps(val roughness: Float, val metalness: Float)
+    class Image(val width: Int, val height: Int, val pixels: IntArray)
 
-    /** 一次查询的结果；`spec` 为空表示没有 `_s`，`normal` 表示旁边还有一张 `_n`。 */
-    class Look(val spec: Maps?, val normal: Boolean)
+    class Look(val spec: Image?, val normal: Image?, val albedo: Image? = null)
 
-    private val NONE = Look(null, false)
+    private val NONE = Look(null, null)
 
     private val cache = ConcurrentHashMap<String, Look>()
 
@@ -46,7 +44,6 @@ internal object D3D12RtMaterialMaps {
         }
     }
 
-    /** 这次重烘的命中情况，一行；`_n` 目前只探测不解码（§17.3 才接法线扰动）。 */
     fun summary(): String {
         val text = "rt materials: spec=$specHits normal=$normalHits of $looked from $source"
         IllusionLogger.infoMessage(text)
@@ -58,16 +55,18 @@ internal object D3D12RtMaterialMaps {
      *
      * 没有映射时缓存空的 [Look]：一个世界几万个精灵，重复 IO 会把重烘拖成卡顿。
      */
-    fun look(id: Identifier): Look {
+    fun look(id: Identifier, frameWidth: Int, frameHeight: Int): Look {
         if (source == "off") return NONE
         val key = id.namespace + ":" + id.path
         cache[key]?.let { return it }
         looked++
-        val spec = readMap(id, "_s")?.use { stream -> decode(stream)?.use { average(it) } }
-        // 只关心有没有这张图：必须 use 一下，否则每张精灵漏一个文件句柄。
-        val normal = readMap(id, "_n")?.use { true } ?: false
+        fun image(suffix: String): Image? = readMap(id, suffix)?.use { stream ->
+            readImage(stream, frameWidth, frameHeight)
+        }
+        val spec = image("_s")
+        val normal = image("_n")
         if (spec != null) specHits++
-        if (normal) normalHits++
+        if (normal != null) normalHits++
         val result = Look(spec, normal)
         cache[key] = result
         return result
@@ -96,31 +95,12 @@ internal object D3D12RtMaterialMaps {
     private fun decode(stream: InputStream): NativeImage? =
         runCatching { NativeImage.read(stream) }.getOrNull()
 
-    /**
-     * `_s` 的通道均值：R 光滑度、G 的 F0/金属、B 孔隙（孔隙还没接）。
-     *
-     * `NativeImage` 的像素是 ABGR 打包（A 在最高字节），与直觉的 ARGB 相反，取通道别取反。
-     */
-    private fun average(image: NativeImage): Maps? {
-        val width = image.width
-        val height = image.height
-        if (width <= 0 || height <= 0) return null
-        var red = 0.0
-        var green = 0.0
-        var count = 0
-        for (y in 0 until height) {
-            for (x in 0 until width) {
-                val pixel = image.getPixel(x, y)
-                if ((pixel ushr 24) and 0xFF == 0) continue
-                red += (pixel and 0xFF) / 255.0
-                green += ((pixel ushr 8) and 0xFF) / 255.0
-                count++
-            }
+    internal fun readImage(stream: InputStream, frameWidth: Int, frameHeight: Int): Image? =
+        decode(stream)?.use { image ->
+            val height = (image.width.toLong() * frameHeight / frameWidth).toInt().coerceIn(1, image.height)
+            Image(image.width, height, IntArray(image.width * height) { index ->
+                image.getPixel(index % image.width, index / image.width)
+            })
         }
-        if (count == 0) return null
-        return Maps(
-            roughness = (1.0 - red / count).toFloat().coerceIn(0f, 1f),
-            metalness = (green / count).toFloat().coerceIn(0f, 1f),
-        )
-    }
+
 }

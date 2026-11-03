@@ -41,6 +41,8 @@ internal object D3D12RtMotion {
         depth: D3D12GpuTexture?,
         cbv: Long,
         cbvOffset: Long,
+        jitterDeltaX: Float = 0f,
+        jitterDeltaY: Float = 0f,
     ): D3D12GpuTexture? {
         if (encoder == null || depth == null || cbv == 0L) return null
         val started = System.nanoTime()
@@ -58,8 +60,8 @@ internal object D3D12RtMotion {
         )
         val motionSrvs = longArrayOf(depth.handle())
         val motionUavs = longArrayOf(motion.handle())
-        // b1 只有 8 个 32 位槽：深度尺度按浮点位传，其余留空。
-        val constants = intArrayOf(D3D12RtGBuffer.DEPTH_SCALE.toRawBits())
+        val constants = intArrayOf(D3D12RtGBuffer.DEPTH_SCALE.toRawBits(),
+            jitterDeltaX.toRawBits(), jitterDeltaY.toRawBits())
         val ok = MCDR_ABI.D3D12DispatchComputeEx(
             encoder.nativeHandle(), pipeline, motionSrvs, motionUavs, constants, cbv, cbvOffset,
             (width + THREADS - 1) / THREADS, (height + THREADS - 1) / THREADS, 1,
@@ -85,6 +87,7 @@ internal object D3D12RtMotion {
             return null
         }
         target = created
+        current?.close()
         targetWidth = width
         targetHeight = height
         IllusionLogger.infoMessage("rt: motion ${width}x$height")

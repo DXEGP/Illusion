@@ -69,15 +69,11 @@ enum class RtMode {
 /**
  * `[raytracing] backend` — which ray-tracing backend the path tracer drives.
  *
- * AUTO leaves the choice to the capability string: WG when its probes are green, DXR when inline
- * ray queries are available, MEGA otherwise. The three backends produce the same image by
- * contract, so this only picks a cost profile - picking a backend the machine cannot run falls
- * back to the next one instead of failing.
+ * AUTO selects the available hardware implementation. WG currently falls back to DXR.
+ * Hardware ray tracing is required; unsupported devices keep the vanilla renderer.
  */
 enum class RtBackend {
     AUTO,
-
-    MEGA,
 
     DXR,
 
@@ -129,6 +125,15 @@ enum class RtDebugView {
 
     DIRECT,
 
+    /** 覆盖率：G-Buffer 写过的像素白，其余黑。 */
+    COVERAGE,
+
+    /** 阴影掩码：被太阳挡住红、没挡住深灰。 */
+    SHADOW,
+
+    /** 整屏常量品红：只验证「合光 + 上屏」这条通路。 */
+    COMPOSITE_MARK,
+
     INDIRECT,
 
     CACHE_CONFIDENCE,
@@ -154,7 +159,7 @@ enum class RtDebugView {
  *
  * The three named tracks trade coupling for control: `RR` hands denoise and upscale to one
  * DLSS-D call at render resolution, `NRD_SR` denoises first and lets a separate super-resolution
- * pass scale up, `MEGAKERNEL` is the un-denoised reference. See docs/rt/README.md §18.
+ * pass scale up, `RAW` is the un-denoised reference. See docs/rt/README.md §18.
  */
 enum class RtDenoise {
     OFF,
@@ -163,7 +168,12 @@ enum class RtDenoise {
 
     NRD_SR,
 
-    MEGAKERNEL,
+    RAW,
+}
+
+enum class RtExposureMode {
+    MANUAL,
+    AUTO,
 }
 
 /** `[debug] meshDiagnostics` — one-shot isolation test for "texture write vs read-back". */
@@ -226,6 +236,10 @@ object IllusionConfig {
     /** `[raytracing] renderScale` — render resolution as a fraction of the display, in percent. */
     val RAYTRACING_RENDER_SCALE: ModConfigSpec.IntValue
 
+    val RAYTRACING_EXPOSURE_MODE: ModConfigSpec.EnumValue<RtExposureMode>
+    val RAYTRACING_EXPOSURE_EV: ModConfigSpec.DoubleValue
+    val RAYTRACING_EXPOSURE_SPEED: ModConfigSpec.DoubleValue
+
     val RAYTRACING_QUALITY_PROFILE: ModConfigSpec.EnumValue<RtQualityProfile>
 
     val RAYTRACING_SPP: ModConfigSpec.IntValue
@@ -237,7 +251,6 @@ object IllusionConfig {
     val RAYTRACING_VOXEL_TRUST_RADIUS: ModConfigSpec.DoubleValue
 
     val RAYTRACING_HZB: ModConfigSpec.ConfigValue<Boolean>
-    val RAYTRACING_AS_TRACE: ModConfigSpec.ConfigValue<Boolean>
 
     val RAYTRACING_HISTORY_FRAMES: ModConfigSpec.IntValue
 
@@ -250,6 +263,7 @@ object IllusionConfig {
 
     /** `[materials] packPath` — 直接读的材质包目录；空 = 用游戏里启用的资源包。 */
     val MATERIALS_PACK_PATH: ModConfigSpec.ConfigValue<String>
+    val MATERIALS_PARALLAX_DEPTH: ModConfigSpec.DoubleValue
 
     /** `[shaderpack] active` — 当前生效的光影包名（空 = 无光影，光追保持关闭）。 */
     val SHADERPACK_ACTIVE: ModConfigSpec.ConfigValue<String>
@@ -622,22 +636,20 @@ object IllusionConfig {
 
         RAYTRACING_BACKEND = BUILDER
             .comment(
-                "Which ray-tracing backend runs the path tracer (AUTO / MEGA / DXR / WG).",
-                "The three backends share one output contract, so this is a cost choice, not a",
-                "feature switch: a backend whose probes are not green is skipped and the next",
-                "one is used. AUTO picks WG when its probes pass, else DXR, else MEGA."
+                "Hardware ray-tracing backend (AUTO / DXR / WG).",
+                "AUTO uses DXR. WG currently falls back to DXR until its implementation is ready.",
+                "Ray tracing stays off when hardware DXR is unavailable."
             )
             .translation("dxr_mc.configuration.raytracing.backend")
             .defineEnum("backend", RtBackend.AUTO)
 
         RAYTRACING_DENOISE = BUILDER
             .comment(
-                "How the noisy image is denoised and upscaled (OFF / RR / NRD_SR / MEGAKERNEL).",
-                "RR couples denoise and upscale into one DLSS-D call at render resolution;",
-                "NRD_SR denoises first and upscales afterwards with the SR pass; MEGAKERNEL",
-                "keeps the raw path-traced frame as the reference to compare against.",
-                "Off by default: no denoiser is wired in yet, so every value but OFF and",
-                "MEGAKERNEL resolves to the raw frame."
+                "How the noisy image is denoised and upscaled (OFF / RR / NRD_SR / RAW).",
+                "RR combines DLSS-D denoising and upscaling. NRD_SR uses NRD with independent SR.",
+                "RAW keeps hardware path tracing without denoising or temporal reconstruction.",
+                "Off by default. RR needs the Streamline DLSS-D runtime; when Streamline",
+                "rejects the plugin the track stays on NRD for the rest of the session."
             )
             .translation("dxr_mc.configuration.raytracing.denoise")
             .defineEnum("denoise", RtDenoise.OFF)
@@ -645,12 +657,30 @@ object IllusionConfig {
         RAYTRACING_RENDER_SCALE = BUILDER
             .comment(
                 "Path-traced render resolution as a percentage of the display, 25 to 100.",
-                "Below 100 the trace targets and the G-buffer shrink together; the resolve pass",
-                "upscales to the display size. The denoise row of docs/rt/README.md §18 says",
-                "which track allows which value; MEGAKERNEL is the only track that ignores it."
+                "Below 100 the trace targets and the G-buffer shrink together. RR or spatial",
+                "upsampling produces the display size. The denoise row of docs/rt/README.md §18 says",
+                "which track allows which value. OFF keeps native resolution; RAW scales."
             )
             .translation("dxr_mc.configuration.raytracing.render_scale")
             .defineInRange("renderScale", 100, 25, 100)
+
+        RAYTRACING_EXPOSURE_MODE = BUILDER
+            .comment("Exposure metering: MANUAL uses a fixed multiplier; AUTO adapts to traced surfaces.",
+                "Both modes apply exposure once before tone mapping. Takes effect immediately.")
+            .translation("dxr_mc.configuration.raytracing.exposure_mode")
+            .defineEnum("exposureMode", RtExposureMode.MANUAL)
+
+        RAYTRACING_EXPOSURE_EV = BUILDER
+            .comment("Exposure compensation in stops, -8 to 8. Each +1 doubles brightness.",
+                "AUTO targets middle gray 0.18, with a final multiplier clamped to 1/256 through 256.")
+            .translation("dxr_mc.configuration.raytracing.exposure_ev")
+            .defineInRange("exposureEv", 0.0, -8.0, 8.0)
+
+        RAYTRACING_EXPOSURE_SPEED = BUILDER
+            .comment("Automatic exposure response rate per second, 0.1 to 10.",
+                "Higher values adapt faster. World changes and camera cuts reset adaptation.")
+            .translation("dxr_mc.configuration.raytracing.exposure_speed")
+            .defineInRange("exposureSpeed", 1.5, 0.1, 10.0)
 
         RAYTRACING_QUALITY_PROFILE = BUILDER
             .comment(
@@ -658,7 +688,7 @@ object IllusionConfig {
                 "VALIDATION is the reproducible profile: 1 spp, fixed seed, no temporal",
                 "accumulation - the one CI compares against the CPU reference. The other two",
                 "only change sampling, never which passes run.",
-                "The B-Mega backend ignores this today: one bounce at 1 spp, no profile."
+                "The B-DXR backend ignores this today: one bounce at 1 spp, no profile."
             )
             .translation("dxr_mc.configuration.raytracing.quality_profile")
             .defineEnum("qualityProfile", RtQualityProfile.BALANCED)
@@ -668,7 +698,7 @@ object IllusionConfig {
                 "Samples per pixel for the primary hit, 1 to 16.",
                 "1 is the validation profile; raising it trades frame time for noise. This is an",
                 "architecture limit, not a target: the resolver must stay correct at 1.",
-                "The B-Mega backend ignores this today and always traces 1 sample."
+                "The B-DXR backend ignores this today and always traces 1 sample."
             )
             .translation("dxr_mc.configuration.raytracing.spp")
             .defineInRange("spp", 1, 1, 16)
@@ -678,7 +708,7 @@ object IllusionConfig {
                 "Maximum path length (1 = direct lighting only, up to 8).",
                 "Bounce count is authored in the shader; this clamps it from the JVM side so a",
                 "lower value also lowers the recursion depth registered for the work graph.",
-                "The B-Mega backend ignores this today: its shader always takes one bounce."
+                "The B-DXR backend ignores this today: its shader always takes one bounce."
             )
             .translation("dxr_mc.configuration.raytracing.max_bounces")
             .defineInRange("maxBounces", 2, 1, 8)
@@ -688,7 +718,7 @@ object IllusionConfig {
                 "How the next bounce direction is chosen (BSDF / COSINE / RESERVOIR).",
                 "BSDF is the reference (importance sampled, correct PDF); COSINE trades accuracy",
                 "for cheaper shadowed diffuse; RESERVOIR is the spatiotemporal reuse path.",
-                "The B-Mega backend ignores this today and always samples the cosine lobe."
+                "The B-DXR backend ignores this today and always samples the cosine lobe."
             )
             .translation("dxr_mc.configuration.raytracing.sampling_mode")
             .defineEnum("samplingMode", RtSamplingMode.BSDF)
@@ -699,21 +729,10 @@ object IllusionConfig {
                 "Only applies to geometry classes the capability matrix marks as expressible in",
                 "both tracks; inside the radius the voxel DDA answers, outside it the triangle",
                 "track does. 0 disables the voxel track entirely.",
-                "The B-Mega backend runs the triangle track only, so this has no effect yet."
+                "The B-DXR backend runs the triangle track only, so this has no effect yet."
             )
             .translation("dxr_mc.configuration.raytracing.voxel_trust_radius")
             .defineInRange("voxelTrustRadius", 8.0, 0.0, 32.0)
-
-        RAYTRACING_AS_TRACE = BUILDER
-            .comment(
-                "Trace the compute path against the acceleration structure instead of the",
-                "mirrored section AABB.",
-                "Same kernel and same shading; only the visibility test changes, so the",
-                "image stays identical while traversal moves to hardware. Off by default:",
-                "the BLAS build costs a few hundred microseconds per frame."
-            )
-            .translation("dxr_mc.configuration.raytracing.as_trace")
-            .define("asTrace", false)
 
         RAYTRACING_HZB = BUILDER
             .comment(
@@ -766,8 +785,8 @@ object IllusionConfig {
 
         MATERIALS_ENABLED = BUILDER
             .comment(
-                "Read `_s` / `_n` maps beside each texture and use them for roughness and metal.",
-                "Off keeps the built-in table: constant roughness, no metal (`_s` ignored)."
+                "Apply `_s` / `_n` maps per hit: roughness, F0, metal, emission and tangent normals.",
+                "Off uses built-in material factors and geometric normals."
             )
             .translation("dxr_mc.configuration.materials.enabled")
             .define("enabled", true)
@@ -780,6 +799,11 @@ object IllusionConfig {
             )
             .translation("dxr_mc.configuration.materials.pack_path")
             .define("packPath", "")
+
+        MATERIALS_PARALLAX_DEPTH = BUILDER
+            .comment("Height-map relief in blocks. Zero disables parallax and relief self-shadowing.")
+            .translation("dxr_mc.configuration.materials.parallax_depth")
+            .defineInRange("parallaxDepth", 0.25, 0.0, 0.5)
 
         BUILDER.pop()
 
@@ -794,12 +818,12 @@ object IllusionConfig {
         SHADERPACK_ACTIVE = BUILDER
             .comment(
                 "Name of the shader pack that supplies the ray-tracing HLSL.",
-                "Applying a pack also sets `[raytracing] backend` to MEGA; applying `none` puts it",
+                "Applying a pack sets its declared hardware backend; applying `none` puts it",
                 "back to AUTO. Pipelines keep the bytecode they were built with, so the change",
                 "lands on the next world load."
             )
             .translation("dxr_mc.configuration.shaderpack.active")
-            .define("active", "B-Mega")
+            .define("active", "B-DXR")
 
         BUILDER.pop()
 

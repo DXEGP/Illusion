@@ -22,12 +22,12 @@ object D3D12RtGBufferShader {
     private const val PS_ENTRY_MARK = "main(SPIRV_Cross_Input"
 
     /** 多目标输出那一段在 shaderpack 里：`%WORLD%` / `%ALBEDO%` / `%ROUGHNESS%` / `%DEPTH_SCALE%` 由这里替换。 */
-    private const val PS_TEMPLATE = "mega_gbuffer_ps.hlsl"
-    private const val VARYING_TEMPLATE = "mega_gbuffer_varying.hlsl"
-    private const val MS_PATCH_TEMPLATE = "mega_gbuffer_ms_patch.hlsl"
-    private const val ALBEDO_SAMPLE = "mega_gbuffer_albedo_sample.hlsl"
-    private const val ALBEDO_CONSTANT = "mega_gbuffer_albedo_constant.hlsl"
-    private const val ALBEDO_TINT = "mega_gbuffer_tint.hlsl"
+    private const val PS_TEMPLATE = "rt_gbuffer_ps.hlsl"
+    private const val VARYING_TEMPLATE = "rt_gbuffer_varying.hlsl"
+    private const val MS_PATCH_TEMPLATE = "rt_gbuffer_ms_patch.hlsl"
+    private const val ALBEDO_SAMPLE = "rt_gbuffer_albedo_sample.hlsl"
+    private const val ALBEDO_CONSTANT = "rt_gbuffer_albedo_constant.hlsl"
+    private const val ALBEDO_TINT = "rt_gbuffer_tint.hlsl"
 
     // spvc 的声明带 space 限定（`register(t6, space0)`），漏掉它会一路退回常量反照率。
     private val TEXTURE_DECL = Regex("Texture2D\\s*<[^>]+>\\s+(\\w+)\\s*:\\s*register\\(t(\\d+)(?:\\s*,\\s*space\\d+)?\\)")
@@ -60,7 +60,9 @@ object D3D12RtGBufferShader {
         val varying = D3D12RtShaderSources.loadSnippet(D3D12ShaderPacks.sourcePath(VARYING_TEMPLATE))
             .replace("%WORLD%", WORLD_POS)
             .replace("%SEMANTIC%", semantic.toString()) + "\n"
-        val meshInjected = injectIntoStruct(mesh, "SPIRV_Cross_Output", varying)
+        val meshInjected = injectIntoStruct(
+            mesh.replace("float4 gVrsBand;", "float4 gVrsBand;\n    float4 gRtCameraOffset;"),
+            "SPIRV_Cross_Output", varying)
             ?: return fail("mesh output struct missing")
 
         val positionField = D3D12MeshVertexDecode.parseInputFields(vsHlsl)
@@ -70,19 +72,13 @@ object D3D12RtGBufferShader {
         // 相机相对坐标：与 meshlet AS 的剔除口径一致，也保证 S3 的光线原点不会离 0 太远。
         val camera = D3D12MeshletShader.cameraUniformNames(vsHlsl)
         val worldPos = if (camera != null) {
-            "$chunkPos - float3(${camera.first}) + ${camera.second}"
+            "$chunkPos - float3(${camera.first}) + ${camera.second} - gRtCameraOffset.xyz"
         } else {
             chunkPos
         }
 
         val callSite = "verts[vid] = vs_main(vin);"
         if (!meshInjected.contains(callSite)) return fail("meshlet call site missing")
-        val patch = D3D12RtShaderSources.loadSnippet(D3D12ShaderPacks.sourcePath(MS_PATCH_TEMPLATE))
-            .replace("%CALL%", "vs_main(vin)")
-            .replace("%WORLD_VALUE%", worldPos)
-            .replace("%WORLD%", WORLD_POS) + "\n"
-        val meshSource = meshInjected.replace(callSite, patch)
-
         val entryAt = psHlsl.indexOf(PS_ENTRY_MARK)
         if (entryAt < 0) return fail("ps entry marker missing")
         val prefix = psHlsl.substring(0, psHlsl.lastIndexOf('\n', entryAt) + 1)
@@ -92,6 +88,18 @@ object D3D12RtGBufferShader {
 
         val uvField = findField(psFields, "UV0", "uv0", "texCoord", "UV")
         val colorField = findField(psFields, "Color", "color", "tint")
+        val inputColor = findField(D3D12MeshVertexDecode.parseInputFields(vsHlsl), "Color", "color", "tint")
+        val tintAssignment = if (colorField != null && inputColor != null) {
+            "gbufMerged.$colorField = vin.$inputColor;"
+        } else {
+            ""
+        }
+        val patch = D3D12RtShaderSources.loadSnippet(D3D12ShaderPacks.sourcePath(MS_PATCH_TEMPLATE))
+            .replace("%CALL%", "vs_main(vin)")
+            .replace("%WORLD_VALUE%", worldPos)
+            .replace("%WORLD%", WORLD_POS)
+            .replace("%TINT_ASSIGNMENT%", tintAssignment) + "\n"
+        val meshSource = meshInjected.replace(callSite, patch)
         val texture = TEXTURE_DECL.find(psPrefix)
         val sampler = pickSampler(psPrefix, texture?.groupValues?.get(2))
 

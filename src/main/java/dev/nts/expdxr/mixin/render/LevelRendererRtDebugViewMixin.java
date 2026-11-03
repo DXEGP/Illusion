@@ -4,7 +4,6 @@ import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import com.mojang.renderpearl.api.textures.GpuTexture;
 import com.mojang.renderpearl.api.textures.GpuTextureView;
-import dev.nts.expdxr.RtBackend;
 import dev.nts.expdxr.RtDebugView;
 import dev.nts.expdxr.d3d12.backend.D3D12CommandEncoderBackend;
 import dev.nts.expdxr.d3d12.render.adapter.D3D12Device;
@@ -40,7 +39,7 @@ public class LevelRendererRtDebugViewMixin {
     private void dxr_mc$blitDebugView(GpuBufferSlice slice, boolean bl, ChunkSectionsToRender sections,
                                       FeatureRenderDispatcher.PreparedFrame frame, boolean bl2,
                                       boolean bl3, CallbackInfo ci) {
-        if (D3D12Settings.INSTANCE.getRtBackend() == RtBackend.AUTO.ordinal()) {
+        if (!D3D12Settings.INSTANCE.getRtEnabled()) {
             return;
         }
         // 光追链是开发档功能：异常只记日志，绝不冒泡打断整帧。
@@ -49,6 +48,14 @@ public class LevelRendererRtDebugViewMixin {
         } catch (Throwable t) {
             D3D12RtFrame.reportFailure(t);
         }
+    }
+
+    /**
+     * 上屏前必须同尺寸：窗口刚改过尺寸的那一帧，源纹理还是旧尺寸，1:1 搬过去会只在左上角
+     * 留下一块旧画面并看起来像被裁掉。等下一帧两边重建完再搬。
+     */
+    private static boolean dxr_mc$sameSize(D3D12GpuTexture a, D3D12GpuTexture b) {
+        return a.getWidth(0) == b.getWidth(0) && a.getHeight(0) == b.getHeight(0);
     }
 
     private void dxr_mc$blit() {
@@ -74,23 +81,104 @@ public class LevelRendererRtDebugViewMixin {
             return;
         }
         int view = D3D12Settings.INSTANCE.getRtDebugView();
+        if (view == RtDebugView.HIT_DISTANCE.ordinal()) {
+            // 命中距离灰度：判断射线到底有没有打到几何，比辐亮度更直接。
+            D3D12GpuTexture hit = D3D12RtFrame.INSTANCE.composite(encoder,
+                    D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.ALBEDO),
+                    D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.EMISSIVE),
+                    destination, 2);
+            if (hit != null && dxr_mc$sameSize(hit, destination)) {
+                encoder.recordTextureBlit(hit, destination);
+                D3D12RtStats.INSTANCE.mark(encoder, D3D12RtStats.SLOT_BLIT);
+            }
+            return;
+        }
+        if (view == RtDebugView.COVERAGE.ordinal()) {
+            // 覆盖率：白 = G-Buffer 写过，黑 = 没写过。追踪没东西时先看这张。
+            D3D12GpuTexture covered = D3D12RtFrame.INSTANCE.composite(encoder,
+                    D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.ALBEDO),
+                    D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.EMISSIVE),
+                    destination, 3);
+            if (covered != null && dxr_mc$sameSize(covered, destination)) {
+                encoder.recordTextureBlit(covered, destination);
+                D3D12RtStats.INSTANCE.mark(encoder, D3D12RtStats.SLOT_BLIT);
+            }
+            return;
+        }
+        if (view == RtDebugView.DIRECT.ordinal()) {
+            // 只显示追踪出来的辐亮度：分辨「追踪没出东西」与「追踪有东西但画面接近原版」。
+            D3D12GpuTexture rawView = D3D12RtFrame.INSTANCE.composite(encoder,
+                    D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.ALBEDO),
+                    D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.EMISSIVE),
+                    destination, 1);
+            if (rawView != null && dxr_mc$sameSize(rawView, destination)) {
+                encoder.recordTextureBlit(rawView, destination);
+                D3D12RtStats.INSTANCE.mark(encoder, D3D12RtStats.SLOT_BLIT);
+            }
+            return;
+        }
+        if (view == RtDebugView.SHADOW.ordinal()) {
+            // 阴影掩码：这一张有没有光追，一眼就能看出来。
+            D3D12GpuTexture mask = D3D12RtFrame.INSTANCE.composite(encoder,
+                    D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.ALBEDO),
+                    D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.EMISSIVE),
+                    destination, 5);
+            if (mask != null && dxr_mc$sameSize(mask, destination)) {
+                encoder.recordTextureBlit(mask, destination);
+                D3D12RtStats.INSTANCE.mark(encoder, D3D12RtStats.SLOT_BLIT);
+            }
+            return;
+        }
+        if (view == RtDebugView.INDIRECT.ordinal()) {
+            // 只显示间接项：直射正常但间接缺，追踪就可能「看着像原版」。
+            D3D12GpuTexture indirectView = D3D12RtFrame.INSTANCE.composite(encoder,
+                    D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.ALBEDO),
+                    D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.EMISSIVE),
+                    destination, 4);
+            if (indirectView != null && dxr_mc$sameSize(indirectView, destination)) {
+                encoder.recordTextureBlit(indirectView, destination);
+                D3D12RtStats.INSTANCE.mark(encoder, D3D12RtStats.SLOT_BLIT);
+            }
+            return;
+        }
+        if (view == RtDebugView.COMPOSITE_MARK.ordinal()) {
+            // 整屏品红：只看这条通路通不通（合光 -> 上屏），不看辐亮度内容。
+            D3D12GpuTexture mark = D3D12RtFrame.INSTANCE.composite(encoder,
+                    D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.ALBEDO),
+                    D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.EMISSIVE),
+                    destination, 6);
+            if (mark != null && dxr_mc$sameSize(mark, destination)) {
+                boolean ok = encoder.recordTextureBlit(mark, destination);
+                if (ok) {
+                    D3D12RtStats.INSTANCE.mark(encoder, D3D12RtStats.SLOT_BLIT);
+                }
+                dxr_mc$noteBlit(ok, mark);
+            }
+            return;
+        }
         if (view == RtDebugView.NONE.ordinal()) {
             // 默认视图：albedo * (direct + indirect) + emissive，合光后再上屏。
             D3D12GpuTexture composite = D3D12RtFrame.INSTANCE.composite(encoder,
                     D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.ALBEDO),
                     D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.EMISSIVE),
                     destination);
-            if (composite != null) {
-                encoder.recordTextureBlit(composite, destination);
-                D3D12RtStats.INSTANCE.mark(encoder, D3D12RtStats.SLOT_BLIT);
+            if (composite != null && dxr_mc$sameSize(composite, destination)) {
+                boolean ok = encoder.recordTextureBlit(composite, destination);
+                if (ok) {
+                    D3D12RtStats.INSTANCE.mark(encoder, D3D12RtStats.SLOT_BLIT);
+                }
+                dxr_mc$noteBlit(ok, composite);
+            } else {
+                dxr_mc$noteBlit(false, composite);
             }
             return;
         }
         if (view == RtDebugView.ROUGHNESS.ordinal()) {
             // 粗糙度在 g_NormalRoughness.w，单通道得先拉成灰度再铺（blit 只采三通道）。
             D3D12GpuTexture packed = D3D12RtFrame.INSTANCE.debugChannel(encoder,
-                    D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.NORMAL_ROUGHNESS), 3);
-            if (packed != null && encoder.recordTextureBlit(packed, destination)) {
+                    D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.NORMAL_ROUGHNESS), 3,
+                    destination.getWidth(0), destination.getHeight(0));
+            if (packed != null && dxr_mc$sameSize(packed, destination) && encoder.recordTextureBlit(packed, destination)) {
                 D3D12RtStats.INSTANCE.mark(encoder, D3D12RtStats.SLOT_BLIT);
             }
             return;
@@ -98,8 +186,9 @@ public class LevelRendererRtDebugViewMixin {
         if (view == RtDebugView.NORMAL.ordinal()) {
             // 世界空间法线在 -1..1，直接 blit 会被目标格式截成 0/1（地面整片黑），先编到 0..1。
             D3D12GpuTexture packed = D3D12RtFrame.INSTANCE.debugChannel(encoder,
-                    D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.NORMAL_ROUGHNESS), 4);
-            if (packed != null && encoder.recordTextureBlit(packed, destination)) {
+                    D3D12RtGBuffer.INSTANCE.texture(D3D12RtGBuffer.NORMAL_ROUGHNESS), 4,
+                    destination.getWidth(0), destination.getHeight(0));
+            if (packed != null && dxr_mc$sameSize(packed, destination) && encoder.recordTextureBlit(packed, destination)) {
                 D3D12RtStats.INSTANCE.mark(encoder, D3D12RtStats.SLOT_BLIT);
             }
             return;
@@ -138,6 +227,25 @@ public class LevelRendererRtDebugViewMixin {
         if (encoder.recordTextureBlit(source, destination)) {
             D3D12RtStats.INSTANCE.mark(encoder, D3D12RtStats.SLOT_BLIT);
         }
+    }
+
+    /** 上屏失败的头几次各打一行：次数本身不刷屏，能区分「合光没产出」与「产出但没搬上屏」。 */
+    private static int dxr_mc$blitTries;
+
+    private static int dxr_mc$blitFails;
+
+    private static void dxr_mc$noteBlit(boolean ok, D3D12GpuTexture source) {
+        dxr_mc$blitTries++;
+        if (ok) {
+            return;
+        }
+        dxr_mc$blitFails++;
+        if (dxr_mc$blitFails > 3) {
+            return;
+        }
+        String size = source == null ? "none" : source.getWidth(0) + "x" + source.getHeight(0);
+        dev.nts.expdxr.misc.IllusionLogger.INSTANCE.warnMessage(
+                "rt blit: " + dxr_mc$blitTries + " tries, " + dxr_mc$blitFails + " fail, last " + size);
     }
 
     private static boolean dxr_mc$warnedNoBlit;

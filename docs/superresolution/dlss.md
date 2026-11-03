@@ -102,6 +102,14 @@ Performance 时打出一条「DLSS 无法运行」的假警告。
 
 ## 5. 每帧：输入怎么摆
 
+native 在创建特征前结束 render pass；预检拒绝空资源、非纹理对象和输入/输出别名。
+实际 Streamline/NGX 求值时，经统一 SDK scope 接管内部选中的四张资源，
+成功、失败与提前返回都归还、恢复 draw heap 并清空 PSO 缓存。
+深度快照、MV 中间纹理和 handover 同样受归属约束；宿主随后拷回并把 GUI 输出恢复为 `RENDER_TARGET`。
+Streamline 的 `slSetConstants` 返回失败时，native 在资源接管前返回 0，不再继续求值或提交 FG 输入，
+并清零输出交接状态；下一个新帧可以正常重试。同帧同 viewport 提交不同常量的 SDK 错误码为 `0x1B`。
+资源必须存活到 GPU fence 完成，归属归还不代表 GPU 已经用完。
+
 ### 5.1 `DLSS_INPUT` 载荷
 
 `MCDRLayout.DLSS_INPUT` 与 `MCDR\include\mcdr_abi.h` 的同名结构逐字段对应（C 侧 `sizeof = 112`）：
@@ -142,13 +150,16 @@ Performance 时打出一条「DLSS 无法运行」的假警告。
 ### 5.3 深度快照
 
 颜色只有到「世界层画完、GUI 未画」那一刻才完整，但深度在那之前已经被清过。JVM 侧没有任何**单一**
-挂点能同时满足两者，所以拆成两步：
+挂点能同时满足两者，按以下时序执行：
 
-1. main pass 的 RETURN（世界几何刚画完、所有清深度之前）：`mcdr_dx12SnapshotDlssDepth(ctx, depth)`，
-   native 把深度拷进自己的 D32 快照，并**自己负责把调用方深度状态恢复**；
-2. evaluate 时（`GuiRenderer.render` 之前）：优先用快照，而不是载荷里的 `pInDepth`。
+1. `GameRenderer.render` HEAD：`pclFrameBegin()` 使上帧快照失效，再执行 DLSS 的抗锯齿状态协调。
+2. main pass 的 RETURN（世界几何刚画完、所有清深度之前）：`mcdr_dx12SnapshotDlssDepth(ctx, depth)`，
+   native 把深度拷进私有快照，并**自己负责把调用方深度状态恢复**；完整录制成功后才使快照有效。
+3. evaluate 时（`GuiRenderer.render` 之前）：NGX/Streamline 共用选择器，要求本帧捕获成功、源与 `pInDepth` 相同、尺寸与输入一致；条件不满足时使用当前 `pInDepth`。
 
 快照与 `pInDepth` 取自**同一个表达式**（`mainRenderTarget().depthTexture`），否则「快照」和「输入」不是一回事。
+帧起点必须早于捕获，不能挂在后续 `clearDepthTexture` 前；Reflex 关闭也要执行快照失效。
+捕获参数失败、关闭 DLSS 与设备 shutdown 同样使快照失效；漏捕获帧不能沿用旧世界深度。
 
 旧 DLL 没有这个导出时返回 `Int.MIN_VALUE`，JVM 静默退回被清过的深度，只记一行说明——
 不会因此拒绝运行，只是画质降级。

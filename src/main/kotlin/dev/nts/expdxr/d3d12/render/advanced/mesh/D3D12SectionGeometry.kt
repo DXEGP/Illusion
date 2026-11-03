@@ -1,10 +1,12 @@
 package dev.nts.expdxr.d3d12.render.advanced.mesh
 
 import dev.nts.expdxr.dxrmc.rt.D3D12RtGeometryPool
+import dev.nts.expdxr.dxrmc.rt.D3D12RtMaterialTable
 import net.minecraft.core.SectionPos
 import dev.nts.expdxr.misc.settings.D3D12Settings
 import org.slf4j.LoggerFactory
 import java.nio.ByteBuffer
+import java.util.IdentityHashMap
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicIntegerArray
@@ -47,11 +49,6 @@ object D3D12SectionGeometry {
         val meshletBytes: Int get() = meshlets.size * D3D12MeshletBuilder.MESHLET_DESC_BYTES
     }
 
-    /**
-     * 一个 section 的几何快照。`generation` 是全局计数器（判断"这帧看到的是不是同一版本"）；
-     * `geometryVersion` 是**逐 section** 的版本号，只在真正影响三角形的输入变化时 +1
-     * （层集合、任一层的 indexCount / 顶点字节数 / 索引字节数），同数据重传不动它。
-     */
     data class SectionGeometry(
         val key: Long,
         val epoch: Int,
@@ -64,9 +61,26 @@ object D3D12SectionGeometry {
     }
 
     private val sections = ConcurrentHashMap<Long, SectionGeometry>()
+    private data class PendingLayer(
+        val layer: String,
+        val indexCount: Int,
+        val vertex: ByteBuffer,
+        val index: ByteBuffer?,
+        val indexSource: IndexSource,
+        val indexStrideBytes: Int,
+    )
+
+    private data class PendingUpload(
+        val sectionNode: Long,
+        val epoch: Int,
+        val layers: MutableMap<String, PendingLayer> = linkedMapOf(),
+    )
+
+    private val pendingUploads = IdentityHashMap<Any, PendingUpload>()
+    @Volatile
     private var epoch: Int = 0
     private var generation: Long = 0
-    private var levelIdentity: Int = 0
+    private var levelIdentity: Any? = null
 
     /** 采集计数与成本。 */
     private val uploads = AtomicLong()
@@ -125,39 +139,85 @@ object D3D12SectionGeometry {
             firstViolation = message
         }
     }
-    /** 两次上传的三角形相关输入是否完全一致（决定 `geometryVersion` 要不要 +1）。 */
-    private fun sameGeometry(before: Map<String, LayerUpload>, after: Map<String, LayerUpload>): Boolean {
-        if (before.keys != after.keys) return false
-        for ((layer, a) in before) {
-            val b = after[layer] ?: return false
-            if (a.indexCount != b.indexCount || a.vertexBytes != b.vertexBytes || a.indexBytes != b.indexBytes) return false
-            if (a.indexSource != b.indexSource || a.indexStrideBytes != b.indexStrideBytes) return false
-        }
+    fun epoch(): Int = epoch
+
+    @JvmStatic
+    @Synchronized
+    fun observeLevel(level: Any?): Boolean {
+        if (levelIdentity === level) return false
+        sections.clear()
+        pendingUploads.clear()
+        levelIdentity = level
+        epoch++
+        D3D12RtGeometryPool.clear(epoch)
+        D3D12RtMaterialTable.clear()
         return true
     }
-
-    fun epoch(): Int = epoch
 
 
     fun find(sectionNode: Long): SectionGeometry? = sections[sectionNode]
 
-    /** S2 导出缓存只关心"变没变"，拿到当前版本号即可。 */
     @JvmStatic
     fun geometryVersionOf(sectionNode: Long): Int = sections[sectionNode]?.geometryVersion ?: -1
+
+    @JvmStatic
+    @Synchronized
+    fun stageUpload(sectionNode: Long, meshIdentity: Any, layer: String, indexCount: Int,
+                    levelIdentity: Any?, vertex: ByteBuffer?, indexSource: IndexSource,
+                    indexStrideBytes: Int, index: ByteBuffer?) {
+        observeLevel(levelIdentity)
+        if (levelIdentity == null || vertex == null) return
+        val pending = pendingUploads.getOrPut(meshIdentity) { PendingUpload(sectionNode, epoch) }
+        if (pending.sectionNode != sectionNode || pending.epoch != epoch || layer in pending.layers) return
+        fun copy(bytes: ByteBuffer): ByteBuffer = ByteBuffer.allocate(bytes.remaining())
+            .order(bytes.order()).apply { put(bytes.duplicate()); flip() }
+        pending.layers[layer] = PendingLayer(layer, indexCount, copy(vertex), index?.let(::copy),
+            indexSource, indexStrideBytes)
+    }
+
+    @JvmStatic
+    @Synchronized
+    fun commitUpload(sectionNode: Long, meshIdentity: Any, levelIdentity: Any?) {
+        observeLevel(levelIdentity)
+        if (levelIdentity == null) return
+        val pending = pendingUploads.remove(meshIdentity)
+        val accepted = pending?.takeIf { it.epoch == epoch && it.sectionNode == sectionNode }
+        D3D12RtGeometryPool.replaceSection(sectionNode, accepted?.layers?.keys ?: emptySet()) {
+            sections.remove(sectionNode)
+            if (accepted != null) {
+                for (upload in accepted.layers.values) {
+                    captureUpload(sectionNode, upload.layer, upload.indexCount,
+                        upload.vertex.remaining(), upload.index?.remaining() ?: 0, levelIdentity,
+                        upload.vertex, upload.indexSource, upload.indexStrideBytes, upload.index)
+                }
+            }
+        }
+    }
+
+    @JvmStatic
+    @Synchronized
+    fun discardUpload(meshIdentity: Any) {
+        pendingUploads.remove(meshIdentity)
+    }
+
+    @JvmStatic
+    @Synchronized
+    fun removeSection(sectionNode: Long) {
+        pendingUploads.entries.removeAll { it.value.sectionNode == sectionNode }
+        D3D12RtGeometryPool.replaceSection(sectionNode) { sections.remove(sectionNode) }
+    }
 
     /**
      * 记录一次上传；`levelIdentity` 变化时清空注册表并推进 epoch。渲染线程与 worker 线程都会调用。
      */
     @JvmStatic
+    @Synchronized
     fun captureUpload(sectionNode: Long, layer: String, indexCount: Int, vertexBytes: Int,
-                      indexBytes: Int, levelIdentity: Int, vertex: ByteBuffer?,
+                      indexBytes: Int, levelIdentity: Any?, vertex: ByteBuffer?,
                       indexSource: IndexSource, indexStrideBytes: Int, index: ByteBuffer? = null) {
         val started = System.nanoTime()
-        if (levelIdentity != this.levelIdentity) {
-            sections.clear()
-            this.levelIdentity = levelIdentity
-            epoch++
-        }
+        observeLevel(levelIdentity)
+        if (levelIdentity == null) return
         // 切分是旁路数据：`[mesh] terrain` 打开时每次上传都切（派发要全量段表），否则只做前
         // [MESHLET_SHADOW_UPLOADS] 次统计。失败 / 缓冲为空都静默跳过 —— 绝不能影响上传本身。
         val shadowLimit = if (D3D12Settings.meshTerrain) Int.MAX_VALUE else MESHLET_SHADOW_UPLOADS
@@ -192,12 +252,8 @@ object D3D12SectionGeometry {
             LinkedHashMap(existing.layers)
         }
         layers[layer] = upload
-        val version = if (existing != null && sameGeometry(existing.layers, layers)) {
-            existing.geometryVersion
-        } else {
-            versionBumps.incrementAndGet()
-            (existing?.geometryVersion ?: 0) + 1
-        }
+        val version = (++generation).toInt()
+        versionBumps.incrementAndGet()
         val custom = layers.values.any { it.indexSource == IndexSource.CUSTOM_SLICE }
         if (custom) {
             customIndexLayers.incrementAndGet()
@@ -205,7 +261,7 @@ object D3D12SectionGeometry {
         val geometry = SectionGeometry(
             key = sectionNode,
             epoch = epoch,
-            generation = ++generation,
+            generation = generation,
             geometryVersion = version,
             capturedAtNanos = started,
             layers = layers,

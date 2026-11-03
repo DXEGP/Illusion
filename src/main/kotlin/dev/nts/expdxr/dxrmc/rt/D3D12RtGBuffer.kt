@@ -1,12 +1,14 @@
 package dev.nts.expdxr.dxrmc.rt
 
 import com.mojang.renderpearl.api.GpuFormat
+import com.mojang.renderpearl.api.buffers.GpuBufferSlice
 import com.mojang.renderpearl.api.textures.GpuTexture
 import dev.nts.expdxr.RtBackend
 import dev.nts.expdxr.RtDebugView
 import dev.nts.expdxr.d3d12.backend.D3D12CompiledRenderPipeline
 import dev.nts.expdxr.d3d12.render.adapter.D3D12Device
 import dev.nts.expdxr.d3d12.render.core.D3D12GpuTexture
+import dev.nts.expdxr.d3d12.render.core.D3D12GpuTextureView
 import dev.nts.expdxr.misc.IllusionLogger
 import dev.nts.expdxr.misc.settings.D3D12Settings
 
@@ -60,6 +62,8 @@ object D3D12RtGBuffer {
         val meshletsOffset: Long,
         val meshletsLength: Long,
         val meshletCount: Int,
+        val uniforms: Map<String, GpuBufferSlice>,
+        val textureViews: Map<String, D3D12GpuTextureView>,
     )
 
     /** 五张附件 + 自己的深度；尺寸随主渲染目标变化，变了就整组重建。 */
@@ -203,7 +207,6 @@ object D3D12RtGBuffer {
     }
 
     private fun create(device: D3D12Device, width: Int, height: Int): Targets {
-        // SRV 给后面的光追阶段读，RTV 给这次 pass 写。
         val usage = GpuTexture.USAGE_TEXTURE_BINDING or GpuTexture.USAGE_RENDER_ATTACHMENT
         val formats = arrayOf(
             GpuFormat.RGBA8_UNORM,
@@ -218,7 +221,8 @@ object D3D12RtGBuffer {
         var depth: D3D12GpuTexture? = null
         try {
             for (index in 0 until ATTACHMENTS) {
-                created.add(device.createTexture(labels[index], usage, formats[index],
+                val attachmentUsage = usage or D3D12GpuTexture.USAGE_STORAGE
+                created.add(device.createTexture(labels[index], attachmentUsage, formats[index],
                     width, height, 1, 1) as? D3D12GpuTexture
                     ?: throw IllegalStateException("${labels[index]} allocate failed"))
             }

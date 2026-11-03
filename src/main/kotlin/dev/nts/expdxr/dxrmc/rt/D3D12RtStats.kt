@@ -15,7 +15,6 @@ import kotlin.math.round
  * 见 docs/rt/README.md
  */
 object D3D12RtStats {
-    /** 0 = 帧起点、1 = G-Buffer 结束、2 = 光追派发结束、3 = 降噪结束、4 = 合光结束、5 = 上屏结束。 */
     private const val POOL_SIZE = 8
 
     private const val SLOT_START = 0
@@ -29,11 +28,15 @@ object D3D12RtStats {
     /** 降噪派发结束；降噪没跑时由调用方紧跟着光追打点（这一段就算 0）。 */
     const val SLOT_DENOISE = 3
 
-    /** 合光派发结束。 */
-    const val SLOT_COMPOSITE = 4
+    const val SLOT_SR = 4
+
+    const val SLOT_COMPOSITE = 5
 
     /** 上屏 blit 结束（也是窗口帧数 +1 的位置）。 */
-    const val SLOT_BLIT = 5
+    const val SLOT_BLIT = 6
+
+    /** 槽位总数；读查询与缓冲都要它，写死数字会让两者悄悄对不上。 */
+    private const val SLOT_COUNT = SLOT_BLIT + 1
 
     /** 统计窗口：太短会把日志刷满，太长则第一个窗口要等半分钟才见得到数。 */
     private const val WINDOW_NANOS = 5_000_000_000L
@@ -44,9 +47,12 @@ object D3D12RtStats {
     private var frequency = 0L
     private var windowStartNanos = 0L
     private var windowFrames = 0L
+
+    /** 本窗口打过的最深槽位；`total` 以它为终点。 */
+    private var deepestSlot = SLOT_START
     private var warnings = 0
 
-    private val timestamps = LongArray(5)
+    private val timestamps = LongArray(SLOT_COUNT)
 
     /** 本窗口累计的编码耗时（纳秒）与 compute 派发次数：CPU 提交时间是六类基线之一。 */
     private var cpuNanosTotal = 0L
@@ -75,8 +81,7 @@ object D3D12RtStats {
     private var blasEncodeMicros = 0L
     private var blasBuildPeakMicros = 0L
 
-    // 本窗口跑的哪条追踪档：brute（compute 暴力）/ as（compute + 内联 RayQuery）/ dxr（DispatchRays）。
-    private var tier = "brute"
+    private var tier = "none"
 
     private fun ensurePool(): Boolean {
         if (pool != 0L) return true
@@ -100,6 +105,7 @@ object D3D12RtStats {
             flush()
             windowStartNanos = now
             windowFrames = 0L
+            deepestSlot = SLOT_START
             cpuNanosTotal = 0L
             dispatchesTotal = 0L
             blasBuilds = 0L
@@ -111,6 +117,8 @@ object D3D12RtStats {
         }
         frameWidth = width
         frameHeight = height
+        // 帧计数放在这里：一帧开始就一定记到 START，上屏那一步失败也不会让整份统计停更。
+        windowFrames++
         mark(encoder, SLOT_START)
     }
 
@@ -119,8 +127,10 @@ object D3D12RtStats {
         if (encoder == null || pool == 0L) return
         encoder.ensureListOpen()
         MCDR_ABI.D3D12WriteTimestamp(encoder.nativeHandle(), pool, slot)
-        if (slot == SLOT_BLIT) {
-            windowFrames++
+        // 记下最深的一档：上屏那一步失败时窗口里只剩前几档，总时间要按它算，
+        // 否则整份统计被 `total <= 0` 判废、一行都不落盘（发生过一次，JSON 静默停更）。
+        if (slot > deepestSlot) {
+            deepestSlot = slot
         }
     }
 
@@ -187,8 +197,8 @@ object D3D12RtStats {
     }
 
     private fun flush() {
-        MCDR_ABI.D3D12ReadQueryValues(pool, SLOT_START, 6, timestamps)
-        val total = ms(SLOT_START, SLOT_BLIT)
+        MCDR_ABI.D3D12ReadQueryValues(pool, SLOT_START, SLOT_COUNT, timestamps)
+        val total = ms(SLOT_START, deepestSlot)
         if (total <= 0.0) {
             // 时间戳还没 retired（刚切分辨率、或读回失败）：这一窗口作废，别把 0 写进基线。
             return
@@ -196,7 +206,8 @@ object D3D12RtStats {
         val gbuffer = ms(SLOT_START, SLOT_GBUFFER)
         val trace = ms(SLOT_GBUFFER, SLOT_TRACE)
         val denoise = ms(SLOT_TRACE, SLOT_DENOISE)
-        val composite = ms(SLOT_DENOISE, SLOT_COMPOSITE)
+        val superResolution = ms(SLOT_DENOISE, SLOT_SR)
+        val composite = ms(SLOT_SR, SLOT_COMPOSITE)
         val blit = ms(SLOT_COMPOSITE, SLOT_BLIT)
         val line = buildString {
             append("{\"time\":\"").append(Instant.now()).append("\",")
@@ -212,6 +223,7 @@ object D3D12RtStats {
             append("\"gbuffer_ms\":").append(gbuffer).append(',')
             append("\"trace_ms\":").append(trace).append(',')
             append("\"denoise_ms\":").append(denoise).append(',')
+            append("\"sr_ms\":").append(superResolution).append(',')
             append("\"composite_ms\":").append(composite).append(',')
             append("\"blit_ms\":").append(blit).append(',')
             append("\"total_ms\":").append(total).append(',')
@@ -280,6 +292,7 @@ object D3D12RtStats {
         frequency = 0L
         windowStartNanos = 0L
         windowFrames = 0L
+        deepestSlot = SLOT_START
         traceWidth = 0
         traceHeight = 0
         recordCount = 0

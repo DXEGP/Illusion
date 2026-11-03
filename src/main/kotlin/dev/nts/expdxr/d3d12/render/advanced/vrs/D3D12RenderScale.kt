@@ -4,6 +4,7 @@ import com.mojang.blaze3d.systems.RenderSystem
 import com.mojang.serialization.Codec
 import dev.nts.expdxr.Illusion
 import dev.nts.expdxr.d3d12.render.adapter.D3D12AdapterInfo
+import dev.nts.expdxr.misc.settings.D3D12Settings
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.util.Optional
@@ -195,7 +196,7 @@ object D3D12RenderScale {
 
     /** 是否真的在缩放；false 时调用方可以整条短路。 */
     @JvmStatic
-    fun isEnabled(): Boolean = percent != 100
+    fun isEnabled(): Boolean = !D3D12Settings.rtEnabled && percent != 100
 
     /**
      * 滑条取值域（形状照 vanilla 的 `OptionInstance.IntRange`）：`fromSliderValue` 吸附到当前步进的倍数
@@ -357,6 +358,13 @@ object D3D12RenderScale {
         rebuildMainTarget()
     }
 
+    fun reconcileRayTracing() {
+        val enabled = D3D12Settings.rtEnabled
+        if (renderScaleRtEnabled == enabled) return
+        renderScaleRtEnabled = enabled
+        rebuildMainTarget()
+    }
+
     /**
      * 帧边界上按新比例重建（供渲染线程内的调用方使用）：帧中间直接改 [setPercent] 只改字段，主目标附件仍是
      * 旧比例，而本帧后半段创建的世界层目标已按新比例分配 → `Depth texture: size does not match`。
@@ -481,7 +489,7 @@ object D3D12RenderScale {
 
     @JvmStatic
     fun scaled(value: Int): Int {
-        return scaledAt(value, percent)
+        return scaledAt(value, if (D3D12Settings.rtEnabled) DEFAULT_PERCENT else percent)
     }
 
     /**
@@ -491,6 +499,9 @@ object D3D12RenderScale {
      */
     @Volatile
     private var appliedPercent: Int = DEFAULT_PERCENT
+
+    @Volatile
+    private var renderScaleRtEnabled = false
 
     /** 只打一次取证行（每帧两次调用，不能刷屏）。 */
     @Volatile
@@ -532,11 +543,12 @@ object D3D12RenderScale {
     fun worldLayerSize(value: Int): Int {
         // 按**已生效**的比例算：否则主目标还是旧尺寸、世界层已是新尺寸，OIT 的 pass 立刻崩。
         val applied = appliedPercent
-        if (applied != percent && !loggedPendingPercent) {
+        val requested = if (D3D12Settings.rtEnabled) DEFAULT_PERCENT else percent
+        if (applied != requested && !loggedPendingPercent) {
             loggedPendingPercent = true
             Illusion.LOGGER.info(
                 "world {}% applied, requested {}%; switch at frame end",
-                applied, percent,
+                applied, requested,
             )
         }
         val result = attachmentDimensionAt(value, applied)
@@ -558,9 +570,10 @@ object D3D12RenderScale {
     @JvmStatic
     fun scaledForAttachment(value: Int): Int {
         // 这里是主目标附件真的被创建的那条路径，所以"已生效的比例"在这里更新，世界层随之换到同一个数。
-        appliedPercent = percent
+        renderScaleRtEnabled = D3D12Settings.rtEnabled
+        appliedPercent = if (renderScaleRtEnabled) DEFAULT_PERCENT else percent
         loggedPendingPercent = false
-        val result = attachmentDimension(value)
+        val result = attachmentDimensionAt(value, appliedPercent)
         if (result != value) {
             // 只有真正缩放时才打；主目标每次（重）建纹理最多四行（两个附件 × 宽高）。
             Illusion.LOGGER.info("main target attachments {} -> {} (renderScale={}%)", value, result, percent)
@@ -578,9 +591,6 @@ object D3D12RenderScale {
      * [scaledForAttachment] / [worldLayerSize] 共用的换算，**不写日志**；> 100% 时不越过设备 maxTextureSize
      * （vanilla 的尺寸检查只按未缩放值算，越过去会 OOM 并掉到 854x480 兜底）。
      */
-    private fun attachmentDimension(value: Int): Int = attachmentDimensionAt(value, percent)
-
-    /** [attachmentDimension] 的显式比例版本。 */
     private fun attachmentDimensionAt(value: Int, p: Int): Int {
         val scaled = scaledAt(value, p)
         if (scaled <= value) {

@@ -52,6 +52,9 @@ object D3D12RtGeometryPool {
     }
 
     private val records = ConcurrentHashMap<Long, Record>()
+    private var mirroredRecords: List<Record> = emptyList()
+    private var mirroredSlice: MirrorSlice? = null
+    private var geometryEpoch = 0
     private var vertices: ByteBuffer = ByteBuffer.allocate(1 shl 20).order(ByteOrder.LITTLE_ENDIAN)
     private var indices: ByteBuffer = ByteBuffer.allocate(1 shl 18).order(ByteOrder.LITTLE_ENDIAN)
     private var materials: ByteBuffer = ByteBuffer.allocate(1 shl 18).order(ByteOrder.LITTLE_ENDIAN)
@@ -108,6 +111,10 @@ object D3D12RtGeometryPool {
         }
         val indexBytes = effectiveIndexCount.toLong() * indexStride
         val materialBytes = quadCount.toLong() * MATERIAL_BYTES
+        if (previous != null && matchesGeometry(previous, vertex, index, effectiveIndexCount, indexStride)) {
+            skipped.incrementAndGet()
+            return false
+        }
         if (vertices.position().toLong() + vertexBytes > VERTEX_CAP ||
             indices.position().toLong() + indexBytes > INDEX_CAP ||
             materials.position().toLong() + materialBytes > MATERIAL_CAP
@@ -164,10 +171,76 @@ object D3D12RtGeometryPool {
     fun revision(): Long = revision.get()
 
     @JvmStatic
+    @Synchronized
+    fun replaceSection(sectionNode: Long, layers: Set<String> = emptySet(), publish: () -> Unit) {
+        val retained = layers.map { D3D12SectionGeometry.Layer.of(it).ordinal }.toSet()
+        val removed = records.entries.removeAll {
+            it.value.sectionNode == sectionNode && it.value.layer !in retained
+        }
+        try {
+            publish()
+        } finally {
+            if (removed) revision.incrementAndGet()
+        }
+    }
+
+    private fun matchesGeometry(previous: Record, vertex: ByteBuffer, index: ByteBuffer?,
+                                indexCount: Int, indexStride: Int): Boolean {
+        if (previous.vertexCount * STRIDE != vertex.remaining() || previous.indexCount != indexCount ||
+            previous.indexStride != indexStride) return false
+        val incoming = vertex.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        for (vertexIndex in 0 until previous.vertexCount) {
+            val oldOffset = previous.vertexOffset.toInt() + vertexIndex * STRIDE
+            val newOffset = incoming.position() + vertexIndex * STRIDE
+            for (component in 0 until 24 step Long.SIZE_BYTES) {
+                if (vertices.getLong(oldOffset + component) != incoming.getLong(newOffset + component)) return false
+            }
+        }
+        val oldIndices = indices.duplicate().apply {
+            position(previous.indexOffset.toInt())
+            limit(position() + indexCount * indexStride)
+        }
+        if (index != null) return index.remaining() == oldIndices.remaining() && oldIndices == index
+        val pattern = intArrayOf(0, 1, 2, 0, 2, 3)
+        oldIndices.order(ByteOrder.LITTLE_ENDIAN)
+        for (indexNumber in 0 until indexCount) {
+            val actual = if (indexStride == 4) oldIndices.int else oldIndices.short.toInt() and 0xffff
+            if (actual != indexNumber / QUAD_INDICES * QUAD_VERTICES + pattern[indexNumber % QUAD_INDICES]) return false
+        }
+        return true
+    }
+
+    @JvmStatic
     fun recordCount(): Int = records.size
 
     @JvmStatic
     fun records(): Collection<Record> = records.values
+
+    @JvmStatic
+    @Synchronized
+    fun isCurrent(sectionNode: Long, layer: Int, geometryVersion: Int): Boolean =
+        records[sectionNode * 8 + layer]?.geometryVersion == geometryVersion
+
+    @Synchronized
+    fun changedSections(published: ByteBuffer, current: ByteBuffer): Set<Long> {
+        val before = published.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        val after = current.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        val versions = mutableMapOf<Long, Int>()
+        val changed = mutableSetOf<Long>()
+        for (base in 0 until before.limit() step RECORD_BYTES) {
+            val node = before.getLong(base + 56)
+            val key = node * 8 + before.getInt(base + 12)
+            val version = before.getInt(base + 44)
+            versions[key] = version
+            if (records[key]?.geometryVersion != version) changed += node
+        }
+        for (base in 0 until after.limit() step RECORD_BYTES) {
+            val node = after.getLong(base + 56)
+            val key = node * 8 + after.getInt(base + 12)
+            if (versions[key] != after.getInt(base + 44)) changed += node
+        }
+        return changed
+    }
 
     @JvmStatic
     fun triangleCount(): Long = records.values.sumOf { it.indexCount.toLong() / 3 }
@@ -213,6 +286,7 @@ object D3D12RtGeometryPool {
             updated++
         }
         revision.incrementAndGet()
+        mirroredSlice = null
         return updated
     }
 
@@ -300,6 +374,8 @@ object D3D12RtGeometryPool {
      * 见 docs/rt/README.md
      */
     class MirrorSlice(
+        val geometryEpoch: Int,
+        val geometryRevision: Long,
         val records: ByteBuffer,
         val vertices: ByteBuffer,
         val indices: ByteBuffer,
@@ -313,6 +389,8 @@ object D3D12RtGeometryPool {
      * 见 docs/rt/README.md
      */
     private fun pad4(bytes: Long): Int = ((bytes + 3L) and -4L).toInt()
+
+    private val contractLog = java.util.concurrent.atomic.AtomicBoolean(false)
 
     @JvmStatic
     @Synchronized
@@ -357,6 +435,9 @@ object D3D12RtGeometryPool {
         if (chosen.isEmpty()) {
             return null
         }
+        mirroredSlice?.let { cached ->
+            if (mirroredRecords == chosen) return cached
+        }
         // raw SRV 的元素粒度是 4 字节（NumElements = size/4），长度不是 4 的倍数时最后几个字节读不到：
         // 索引按 u16 计，奇数个索引就只有 2 字节余量，会把三条边之一读成 0 得到退化三角形。
         val recordsOut = ByteBuffer.allocate(chosen.size * RECORD_BYTES).order(ByteOrder.LITTLE_ENDIAN)
@@ -384,8 +465,20 @@ object D3D12RtGeometryPool {
             recordsOut.putLong(r.sectionNode)
             appendSlice(vertices, r.vertexOffset, vertexBytes, verticesOut)
             appendSlice(indices, r.indexOffset, indexBytes, indicesOut)
-            appendSlice(materials, r.materialOffset * MATERIAL_BYTES, quadBytes, quadsOut)
+            appendSlice(materials, r.materialOffset, quadBytes, quadsOut)
             triangles += r.triangles
+        }
+        // 一次性对账：记录原点与顶点坐标必须分别是「世界坐标」与「段内局部坐标」，
+        // 两者语义搞反了（或都加了原点）会让几何整体跑到别处，射线一条都打不到。
+        if (contractLog.compareAndSet(false, true) && verticesOut.position() >= 12) {
+            val first = recordsOut.getInt(0)
+            val second = recordsOut.getInt(4)
+            val third = recordsOut.getInt(8)
+            val vx = verticesOut.getFloat(0)
+            val vy = verticesOut.getFloat(4)
+            val vz = verticesOut.getFloat(8)
+            dev.nts.expdxr.misc.IllusionLogger.infoMessage(
+                "rt mirror: origin=($first,$second,$third) vertex=($vx,$vy,$vz)")
         }
         if (recordsOut.position() == 0) {
             return null
@@ -394,7 +487,11 @@ object D3D12RtGeometryPool {
         verticesOut.flip()
         indicesOut.flip()
         quadsOut.flip()
-        return MirrorSlice(recordsOut, verticesOut, indicesOut, quadsOut, chosen.size, triangles)
+        return MirrorSlice(geometryEpoch, revision.get(), recordsOut, verticesOut, indicesOut,
+            quadsOut, chosen.size, triangles).also {
+            mirroredRecords = chosen
+            mirroredSlice = it
+        }
     }
 
     private fun appendSlice(src: ByteBuffer, offset: Long, length: Long, dst: ByteBuffer) {
@@ -429,11 +526,14 @@ object D3D12RtGeometryPool {
 
     @JvmStatic
     @Synchronized
-    fun clear() {
+    fun clear(epoch: Int) {
+        geometryEpoch = epoch
         if (records.isNotEmpty()) {
             resets.incrementAndGet()
         }
         full = false
+        mirroredRecords = emptyList()
+        mirroredSlice = null
         hidden.set(0)
         revision.incrementAndGet()
         records.clear()

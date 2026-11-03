@@ -11,25 +11,14 @@ import java.util.ArrayList
 import java.util.ArrayDeque
 import java.util.Deque
 
-/**
- * D3D12 版 [TransientMemory]：帧内 bump 分配 + [FRAMES_IN_FLIGHT] 帧延迟释放（镜像官方 Vulkan 实现）。
- *
- * staging 上传走 512KiB 块分配器：一次上传只切一块、返回块内切片，块随帧 [rotate] 释放。
- * `allocateGpuMapped` 用 3 路常驻 UPLOAD ring（[uboRing]，随 [close] 释放、不参与 [frames] 队列）。
- * 见 docs/misc/backend-and-device.md §4。
- */
 class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Runnable) : TransientMemory {
-    private val frames: Deque<MutableList<D3D12GpuBuffer>> = ArrayDeque()
-    private var frame: MutableList<D3D12GpuBuffer> = ArrayList()
+    private data class RetiredBuffer(val buffer: D3D12GpuBuffer, val fence: Long)
+
+    private val frames: Deque<MutableList<RetiredBuffer>> = ArrayDeque()
+    private var frame = mutableListOf<RetiredBuffer>()
     private var closed: Boolean = false
 
-    private val uboRing: Array<D3D12GpuBuffer?> = arrayOfNulls(UBO_RING_COUNT)
-    /** 当前路的已用字节数；超出 BLOCK_SIZE 时切下一路。 */
-    private var uboRingIdx: Int = 0
-    private var uboRingOffset: Long = 0
-
-    private val stagingPools: List<ArrayDeque<D3D12GpuBuffer>> = listOf(
-        ArrayDeque<D3D12GpuBuffer>(), ArrayDeque<D3D12GpuBuffer>(), ArrayDeque<D3D12GpuBuffer>())
+    private val stagingPools = List(STAGING_POOL_COUNT) { ArrayDeque<RetiredBuffer>() }
     /** 各池当前常驻字节数（与 [stagingPools] 一一对应，用于容量控制）。 */
     private val stagingPoolBytes: LongArray = LongArray(STAGING_POOL_COUNT)
     private var stagingPoolIdx: Int = 0
@@ -37,21 +26,19 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
     /** 当前块能否归还进池：超大块不入池，走 frame 生命周期释放。 */
     private var stagingBlockPooled: Boolean = false
     private var stagingBlockUsed: Long = 0L
+    private var stagingBlockFence: Long = 0L
     /** 本帧「写满被替换下来」的入池块，[rotate] 时一并归还池。 */
-    private val retiredPooledStagingBlocks: MutableList<D3D12GpuBuffer> = ArrayList()
+    private val retiredPooledStagingBlocks = mutableListOf<RetiredBuffer>()
 
-    init {
-        // 这三路是**常驻**缓冲，归 uboRing 所有，绝不能 register 进 frame：frame 队列在第 3 次
-        // rotate() 时整体 close（FRAMES_IN_FLIGHT=2），之后 allocateGpuMapped 会 map 到已销毁对象。
-        for (i in 0 until UBO_RING_COUNT) {
-            uboRing[i] = D3D12GpuBuffer(
-                GpuBuffer.USAGE_MAP_WRITE or GpuBuffer.USAGE_COPY_SRC, UBO_RING_BLOCK_SIZE
-            )
-        }
+    private fun recordingFence(): Long {
+        check(!this.closed) { "Transient memory is closed" }
+        this.ensureListOpen.run()
+        check(MCDR_ABI.D3D12IsListOpen(this.ctx)) { "Transient command list is closed" }
+        return MCDR_ABI.D3D12GetFenceValue(this.ctx) + 1L
     }
 
-    private fun register(buffer: D3D12GpuBuffer) {
-        this.frame.add(buffer)
+    private fun register(buffer: D3D12GpuBuffer, fence: Long) {
+        this.frame.add(RetiredBuffer(buffer, fence))
     }
 
     override fun allocateCpu(size: Long, alignment: Long, minimumAllocation: Long, elementSize: Long): ByteBuffer {
@@ -69,30 +56,15 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
 
     override fun allocateGpu(size: Long, alignment: Long,
         usage: @GpuBuffer.Usage Int, minimumAllocation: Long, elementSize: Long): GpuBufferSlice {
+        val fence = recordingFence()
         val buffer = D3D12GpuBuffer(usage or GpuBuffer.USAGE_COPY_DST, size)
-        this.register(buffer)
+        this.register(buffer, fence)
         return buffer.slice()
     }
 
     override fun allocateGpuMapped(size: Long, alignment: Long,
         usage: @GpuBuffer.Usage Int, minimumAllocation: Long, elementSize: Long): GpuBufferSlice.MappedView {
-        // 在 ring 当前路内 bump 分配；放不下就切下一路，旧路留给 GPU 读完才由 rotate 回收。
-        check(!this.closed) { "allocateGpuMapped called on a closed D3D12TransientMemory" }
-        var remaining = UBO_RING_BLOCK_SIZE - uboRingOffset
-        if (size > remaining) {
-            // 当前路剩余空间不足，切换到下一路
-            uboRingIdx = (uboRingIdx + 1) % UBO_RING_COUNT
-            uboRingOffset = 0
-            remaining = UBO_RING_BLOCK_SIZE
-        }
-        val buf = uboRing[uboRingIdx]!!
-        // ring 只由 close() 销毁；还关着说明归属记错了，宁可抛异常也别 map 已销毁缓冲。
-        check(!buf.isClosed()) {
-            "allocateGpuMapped: ring buffer slot ${this.uboRingIdx} is already closed"
-        }
-        val offset = uboRingOffset
-        uboRingOffset += size
-        return buf.map(offset, size, false, true)
+        return allocateStaging(size, alignment, usage, minimumAllocation, elementSize)
     }
 
     override fun uploadStaging(data: MutableList<ByteBuffer>, alignment: Long,
@@ -157,10 +129,11 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
         if (this.stagingBlock === block) {
             this.stagingBlock = null
             this.stagingBlockUsed = 0L
+            this.stagingBlockFence = 0L
             this.stagingBlockPooled = false
         }
         // 若已作为「写满」退役进待归还表，先摘出来，否则 rotate() 会把它还进池、下次又取到同一块。
-        this.retiredPooledStagingBlocks.removeIf { it === block }
+        this.retiredPooledStagingBlocks.removeIf { it.buffer === block }
         try {
             block.close()
         } catch (t: Throwable) {
@@ -223,55 +196,56 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
      * 新块优先复用本路池的空闲块，池空或过小才新建；超大块不入池，登记进本帧延迟释放。
      */
     private fun allocateInStagingBlock(size: Long, alignment: Long): Long {
-        val align = alignment.coerceAtLeast(MIN_BLOCK_ALIGNMENT)
+        check(!this.closed) { "Transient memory is closed" }
+        require(size in 0L..Int.MAX_VALUE.toLong()) { "Invalid mapped allocation size" }
+        require(alignment > 0L) { "Mapped allocation alignment must be positive" }
+        val factor = MIN_BLOCK_ALIGNMENT / alignment.takeLowestOneBit().coerceAtMost(MIN_BLOCK_ALIGNMENT)
+        require(alignment <= Long.MAX_VALUE / factor) { "Mapped allocation alignment overflow" }
+        val align = alignment * factor
+        val fence = recordingFence()
         if (this.stagingBlock == null) {
             this.stagingBlock = acquireStagingBlock(size, align)
         }
         var offset = roundUp(this.stagingBlockUsed, align)
-        if (offset + size > this.stagingBlock!!.size()) {
-            // 当前块写满：入池块暂存待 rotate 归还，超大块已登记 frame，均无需在此 close。
+        if (size > this.stagingBlock!!.size() - offset) {
             if (this.stagingBlockPooled) {
-                this.retiredPooledStagingBlocks.add(this.stagingBlock!!)
+                this.retiredPooledStagingBlocks.add(RetiredBuffer(this.stagingBlock!!, this.stagingBlockFence))
+            } else {
+                this.register(this.stagingBlock!!, this.stagingBlockFence)
             }
             this.stagingBlock = acquireStagingBlock(size, align)
             offset = 0L
         }
         this.stagingBlockUsed = offset + size
+        this.stagingBlockFence = fence
         return offset
     }
 
-    /**
-     * 取一块 staging（UPLOAD heap）并设置 [stagingBlockPooled]：≤ [MAX_POOLED_BLOCK_SIZE] 优先复用本路池中
-     * 足够大的块（入池管理、不登记 frame）；更大则不入池，新建后登记进本帧延迟释放。
-     */
     private fun acquireStagingBlock(size: Long, align: Long): D3D12GpuBuffer {
         val blockSize = roundUp(size, align).coerceAtLeast(STAGING_BLOCK_SIZE)
         if (blockSize > MAX_POOLED_BLOCK_SIZE) {
             this.stagingBlockPooled = false
-            val big = D3D12GpuBuffer(
+            return D3D12GpuBuffer(
                 GpuBuffer.USAGE_MAP_WRITE or GpuBuffer.USAGE_COPY_SRC, blockSize
             )
-            this.register(big)
-            return big
         }
         this.stagingBlockPooled = true
         val pool = this.stagingPools[this.stagingPoolIdx]
-        val pooled = pool.pollFirst()
-        if (pooled != null) {
-            this.stagingPoolBytes[this.stagingPoolIdx] -= pooled.size()
-            if (pooled.isClosed()) {
-                // 池里绝不该有关闭的块（close() 只发生在 frames 超限与 close()）：出现即归属记错，丢弃并新建。
-                IllusionLogger.warnFormat(
-                    "transientMemory: the staging pool handed out an already-closed "
-                        + "block 0x%x (%d bytes); discarding it instead of mapping it%n",
-                    pooled.handle(), pooled.size())
-                System.err.flush()
-            } else if (pooled.size() >= size) {
-                return pooled
-            } else {
-                // 池中块过小（仅本路块尺寸演化时出现）：已退役 ≥STAGING_POOL_COUNT 帧，close 安全。
-                pooled.close()
+        val candidates = pool.iterator()
+        while (candidates.hasNext()) {
+            val candidate = candidates.next()
+            val buffer = candidate.buffer
+            if (buffer.isClosed()) {
+                candidates.remove()
+                this.stagingPoolBytes[this.stagingPoolIdx] -= buffer.size()
+                IllusionLogger.warnMessage("transient memory: pooled buffer is closed")
+                continue
             }
+            if (!MCDR_ABI.D3D12WaitForFence(this.ctx, candidate.fence, 0L)) continue
+            candidates.remove()
+            this.stagingPoolBytes[this.stagingPoolIdx] -= buffer.size()
+            if (buffer.size() >= size) return buffer
+            buffer.close()
         }
         return D3D12GpuBuffer(
             GpuBuffer.USAGE_MAP_WRITE or GpuBuffer.USAGE_COPY_SRC, blockSize
@@ -281,10 +255,11 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
     /** 把一组 CPU 缓冲写进一块 UPLOAD staging，再一次 CopyBufferRegion 进单个 GPU 缓冲（仅供 uploadGpu）。 */
     private fun upload(data: MutableList<ByteBuffer>, usage: Int, total: Long): GpuBufferSlice {
         require(total != 0L) { "Cannot upload zero bytes" }
+        val fence = recordingFence()
         val staging = D3D12GpuBuffer(
             GpuBuffer.USAGE_MAP_WRITE or GpuBuffer.USAGE_COPY_SRC, total
         )
-        this.register(staging)
+        this.register(staging, fence)
         staging.map(0L, total, false, true).use { view ->
             val dst = view.data()
             for (buffer in data) {
@@ -292,8 +267,7 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
             }
         }
         val gpu = D3D12GpuBuffer(usage or GpuBuffer.USAGE_COPY_DST, total)
-        this.register(gpu)
-        this.ensureListOpen.run()  // 帧外上传（资源重载）需先打开命令列表
+        this.register(gpu, fence)
         MCDR_ABI.D3D12CopyBuffer(this.ctx, staging.handle(), 0L, gpu.handle(), 0L, total)
         return gpu.slice()
     }
@@ -306,10 +280,11 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
         if (total == 0L) {
             return mutableListOf<GpuBufferSlice>()
         }
+        val fence = recordingFence()
         val staging = D3D12GpuBuffer(
             GpuBuffer.USAGE_MAP_WRITE or GpuBuffer.USAGE_COPY_SRC, total
         )
-        this.register(staging)
+        this.register(staging, fence)
         staging.map(0L, total, false, true).use { view ->
             val dst = view.data()
             for (buffer in data) {
@@ -317,8 +292,7 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
             }
         }
         val gpu = D3D12GpuBuffer(usage or GpuBuffer.USAGE_COPY_DST, total)
-        this.register(gpu)
-        this.ensureListOpen.run()  // 帧外上传（资源重载）需先打开命令列表
+        this.register(gpu, fence)
         MCDR_ABI.D3D12CopyBuffer(this.ctx, staging.handle(), 0L, gpu.handle(), 0L, total)
 
         val result = mutableListOf<GpuBufferSlice>()
@@ -331,10 +305,6 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
         return result
     }
 
-    /**
-     * 每次 submit() 由编码器调用：本帧缓冲入队，保持 [FRAMES_IN_FLIGHT] 帧存活（对齐 native 的
-     * value-2 围栏等待）后释放最旧一帧；同时旋转 UBO ring，使新帧 uniform 不覆盖仍在读的旧帧。
-     */
     fun rotate() {
         if (this.closed) {
             return
@@ -344,29 +314,29 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
         this.frames.addLast(this.frame)
         this.frame = ArrayList()
         while (this.frames.size > FRAMES_IN_FLIGHT) {
-            for (buffer in this.frames.removeFirst()) {
-                buffer.close()
+            val retired = this.frames.first
+            val fence = retired.maxOfOrNull { it.fence } ?: 0L
+            if (fence > 0L && !MCDR_ABI.D3D12WaitForFence(this.ctx, fence, 0L)) break
+            for (block in this.frames.removeFirst()) {
+                block.buffer.close()
             }
         }
-        // 每帧切到下一路，确保不同帧的 uniform 数据不重叠。
-        this.uboRingIdx = (this.uboRingIdx + 1) % UBO_RING_COUNT
-        this.uboRingOffset = 0
     }
 
-    /**
-     * 把本帧入池块归还本路池并轮转 [stagingPoolIdx]：该路下次被取用是 [STAGING_POOL_COUNT] 帧后，
-     * 晚于 [FRAMES_IN_FLIGHT]，复用时 GPU 早已执行完引用它的拷贝。超出 [MAX_POOL_BYTES_PER_POOL] 的不入池。
-     */
     private fun recycleStagingBlocks() {
-        if (this.stagingBlockPooled && this.stagingBlock != null) {
-            this.retiredPooledStagingBlocks.add(this.stagingBlock!!)
+        this.stagingBlock?.let { block ->
+            if (this.stagingBlockPooled) {
+                this.retiredPooledStagingBlocks.add(RetiredBuffer(block, this.stagingBlockFence))
+            } else {
+                this.register(block, this.stagingBlockFence)
+            }
         }
         val pool = this.stagingPools[this.stagingPoolIdx]
         var bytes = this.stagingPoolBytes[this.stagingPoolIdx]
         for (block in this.retiredPooledStagingBlocks) {
-            if (bytes + block.size() <= MAX_POOL_BYTES_PER_POOL) {
+            if (bytes + block.buffer.size() <= MAX_POOL_BYTES_PER_POOL) {
                 pool.offerLast(block)
-                bytes += block.size()
+                bytes += block.buffer.size()
             } else {
                 this.frame.add(block)
             }
@@ -375,6 +345,7 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
         this.stagingPoolBytes[this.stagingPoolIdx] = bytes
         this.stagingBlock = null
         this.stagingBlockUsed = 0L
+        this.stagingBlockFence = 0L
         this.stagingBlockPooled = false
         this.stagingPoolIdx = (this.stagingPoolIdx + 1) % STAGING_POOL_COUNT
     }
@@ -388,36 +359,29 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
             IllusionLogger.debugMessage("transientMemory.close: current=${this.frame.size}"
                 + " queuedFrames=${this.frames.size}")
         }
-        for (buffer in this.frame) {
-            buffer.close()
+        for (block in this.frame) {
+            block.buffer.close()
         }
         this.frame = ArrayList()
         for (old in this.frames) {
-            for (buffer in old) {
-                buffer.close()
+            for (block in old) {
+                block.buffer.close()
             }
         }
         this.frames.clear()
         // 池内块与未归还的当前块/退役块不在 frames 队列里，必须显式释放。
         for (pool in this.stagingPools) {
-            for (buffer in pool) {
-                buffer.close()
+            for (block in pool) {
+                block.buffer.close()
             }
             pool.clear()
         }
-        if (this.stagingBlockPooled && this.stagingBlock != null) {
-            this.stagingBlock!!.close()
-        }
-        for (buffer in this.retiredPooledStagingBlocks) {
-            buffer.close()
+        this.stagingBlock?.close()
+        for (block in this.retiredPooledStagingBlocks) {
+            block.buffer.close()
         }
         this.retiredPooledStagingBlocks.clear()
         this.stagingBlock = null
-        // ring 不归 frames 队列，必须显式释放；置 null 让之后的 allocateGpuMapped 立刻 NPE 而不是用野指针。
-        for (i in 0 until UBO_RING_COUNT) {
-            uboRing[i]?.close()
-            uboRing[i] = null
-        }
         if (IllusionLogger.debugEnabled()) {
             IllusionLogger.debugMessage("transientMemory.close: done")
         }
@@ -425,10 +389,6 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
 
     companion object {
         const val FRAMES_IN_FLIGHT: Int = 2
-        /** allocateGpuMapped 的 ring 路数；每路 4KiB，足够多组 std140 uniform 块。 */
-        private const val UBO_RING_COUNT: Int = 3
-        private const val UBO_RING_BLOCK_SIZE: Long = 4096L
-
         /** staging 块基准大小（对齐官方 TransientBlockAllocator 的 512KiB）。 */
         private const val STAGING_BLOCK_SIZE: Long = 512L * 1024L
 
@@ -438,8 +398,6 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
          */
         private const val MIN_BLOCK_ALIGNMENT: Long = 512L
 
-        // staging 块池（UPLOAD heap）：3 路轮转，帧 N 用完的块归还 P[N%3]，最早帧 N+3 才再被取用
-        // （3 > FRAMES_IN_FLIGHT=2，复用时 GPU 早已执行完帧 N 的拷贝），避免每帧新建 committed buffer。
         private const val STAGING_POOL_COUNT: Int = 3
         /** 单路池常驻字节上限：超出者不入池，改走 frame 延迟释放。 */
         private const val MAX_POOL_BYTES_PER_POOL: Long = 4L * 1024L * 1024L
@@ -450,7 +408,10 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
         private const val MAX_STAGING_MAP_RETRIES: Int = 1
 
         private fun roundUp(value: Long, alignment: Long): Long {
-            return (value + alignment - 1L) / alignment * alignment
+            val remainder = value % alignment
+            val padding = if (remainder == 0L) 0L else alignment - remainder
+            require(value <= Long.MAX_VALUE - padding) { "Mapped allocation size overflow" }
+            return value + padding
         }
 
     }

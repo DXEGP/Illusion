@@ -633,6 +633,7 @@ object DeepLearningSuperSampling {
      */
     @JvmStatic
     fun captureMotionVectors() {
+        if (D3D12Settings.rtEnabled) return
         // FSR / XeSS 也要这份数据，所以闸门是「DLSS 开着 或 另一家超分在跑」。
         if (!isEnabled() && !SuperResolution.needsVelocityPass()) {
             return
@@ -663,6 +664,7 @@ object DeepLearningSuperSampling {
      */
     @JvmStatic
     fun captureDepthSnapshot() {
+        if (D3D12Settings.rtEnabled) return
         if (!isEnabled()) {
             // 关掉 DLSS 时把结论串复位，重新开启时能再报一次（否则沿用上次的"旧 DLL"结论）。
             lastDepthSnapshotState = null
@@ -800,6 +802,7 @@ object DeepLearningSuperSampling {
 
     @JvmStatic
     fun applyIfEnabled() {
+        if (D3D12Settings.rtEnabled) return
         // 闸门只看 DLSS 自己的开关（`dxrMcDlss`）；关掉时把数据面与状态复位。抗锯齿在本类这侧只是被锁成 OFF。
         if (!isEnabled()) {
             leaveDlssMode()

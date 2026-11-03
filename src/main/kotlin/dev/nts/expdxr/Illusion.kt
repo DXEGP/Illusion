@@ -9,6 +9,7 @@ import dev.nts.expdxr.d3d12.debug.D3D12VrsDebugEntry
 import dev.nts.expdxr.d3d12.extern.MCDR_ABI
 import dev.nts.expdxr.d3d12.render.adapter.D3D12AdapterInfo
 import dev.nts.expdxr.dxrmc.rt.D3D12RtMaterialTable
+import dev.nts.expdxr.dxrmc.rt.D3D12RtConfigMigration
 import dev.nts.expdxr.d3d12.render.advanced.vrs.D3D12VariableShadingRate
 import dev.nts.expdxr.misc.IllusionLogger
 import net.neoforged.bus.api.IEventBus
@@ -34,6 +35,7 @@ class Illusion(modEventBus: IEventBus, modContainer: ModContainer) {
     }
 
     init {
+        D3D12RtConfigMigration.migrate(FMLPaths.CONFIGDIR.get().resolve("dxr_mc-client.toml"))
         modContainer.registerConfig(ModConfig.Type.CLIENT, IllusionConfig.SPEC)
         // F3 里的 VRS 行是独立的 debug entry，由 F3+F6 的 DebugOptionsScreen 开关。
         D3D12VrsDebugEntry.register(modEventBus)

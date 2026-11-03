@@ -15,11 +15,6 @@ internal object D3D12RtGuide {
     /** 一项引导数据：[source] 只有 `gbuffer` 与 `motion` 两种，前者按 G-Buffer 附件取。 */
     class Slot(val name: String, val format: String, val source: String)
 
-    /**
-     * 五个槽位的固定顺序。
-     * `specular` 今天是常数：G-Buffer 的 PS 拿不到材质表（mesh 根签名 extras 表固定 3 个 range），
-     * 所以那张附件里恒为 0.04，真值要等材质金属度进 PS 之后才有。见 docs/rt/README.md §19.7
-     */
     val SLOTS: List<Slot> = listOf(
         Slot("albedo", "RGBA8", "gbuffer"),
         Slot("specular", "RGBA8", "gbuffer"),
@@ -62,6 +57,6 @@ internal object D3D12RtGuide {
             IllusionLogger.infoMessage("rt guide: incomplete, motion or gbuffer missing")
             return
         }
-        IllusionLogger.infoMessage("rt guide: ${handles.size} slot(s), specular constant 0.04")
+        IllusionLogger.infoMessage("rt guide: ${handles.size} slot(s), material factors ready")
     }
 }

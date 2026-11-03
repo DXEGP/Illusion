@@ -38,24 +38,14 @@ public class GameRendererSmaaWorldMixin {
         // DeepLearningSuperSampling.replayCrosshair();
     }
 
-    /**
-     * 每帧兜底：抗锯齿锁与进出 DLSS 模式的状态机。速度 pass 已移到 `LevelRendererMainPassDepthMixin`
-     * —— 此处按执行序排在三次清深度之后，深度恒为 0，运动矢量会被写成整张 0。
-     */
-    @Inject(method = "render",
-            at = @At(value = "INVOKE",
-                     target = "Lcom/mojang/renderpearl/api/commands/CommandEncoder;" +
-                             "clearDepthTexture(Lcom/mojang/renderpearl/api/textures/GpuTexture;D)V",
-                     shift = At.Shift.BEFORE),
-            remap = false)
-    private void dxr_mc$dlssBeforeDepthClear(CallbackInfo ci) {
+    @Inject(method = "render", at = @At("HEAD"), remap = false)
+    private void dxr_mc$dlssFrameBegin(CallbackInfo ci) {
         // 这两件都是 DLSS 自家记账；选了 FSR / XeSS 时不该再让 DLSS 推自己的开关 —— 会每帧付一次
         // NGX 可用性探测，还与 `[sr] backend` 打架。
         if (SuperResolution.backendId() != MCDR_ABI.SR_BACKEND_DLSS) {
             return;
         }
-        DeepLearningSuperSampling.reconcileAntiAliasingEveryFrame();
-        // Reflex PCL stats
         DeepLearningSuperSampling.pclFrameBegin();
+        DeepLearningSuperSampling.reconcileAntiAliasingEveryFrame();
     }
 }

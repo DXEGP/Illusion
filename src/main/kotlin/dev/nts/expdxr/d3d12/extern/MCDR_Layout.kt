@@ -19,6 +19,9 @@ import java.util.*
  * Java 侧的 static import 解析不到）。
  */
 object MCDRLayout {
+    const val SDK_RESOURCE_STATE_VALUE_COUNT = 8
+    const val NRD_JITTER_FLOAT_COUNT = 4
+    const val RT_EXPOSURE_FLOAT_COUNT = 2
 
     // ---- scalar layouts (JAVA_* already carry the native byte order on Windows x64) ----
     @JvmField

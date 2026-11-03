@@ -63,10 +63,10 @@ Blaze3D 接口层
       ▼
   CommandEncoderBackend ── D3D12CommandEncoderBackend
       ├── ctx : Long                   native CommandContext*
-      ├── transientMemory              UBO ring(3×4096B) + staging 池(3 块，512KB 起)
+      ├── transientMemory              映射上传块（512KiB 起）+ 按 fence 回收的三路池
       ├── currentRenderPass ────────► D3D12RenderPassBackend    每次 createRenderPass 新建
       ├── pendingSubmit                异步渲染线程握手中（多帧飞行）
-      └── companion GLOBAL_CALLBACKS   设备级围栏回调队列
+      └── pendingCallbacks            当前编码器的读回完成回调
       │
       ├── createRenderPass() ───────► D3D12RenderPassBackend
       │        renderArea · outputWidth/Height · hasDepth · colorTargetHandle · flipY
@@ -353,23 +353,20 @@ if (caps != null) IllusionLogger.infoMessage("rt caps: ${caps.preferredBackend} 
 
 ## 4. 内存策略
 
-### 4.1 瞬时内存的三层
+### 4.1 瞬时内存
 
-`D3D12TransientMemory` 镜像官方 `VulkanTransientMemory` 的接口，但实现完全不同 —— Vulkan 那边靠
-`VmaAllocation`，D3D12 这边靠三种手写分配器：
+`D3D12TransientMemory` 实现原版瞬时内存接口。映射常量与 staging 上传共用 UPLOAD 块，
+按编码器的完成 fence 决定复用与释放：
 
 | 分配器 | 用途 | 容量 | 生命周期 |
 | --- | --- | --- | --- |
-| UBO ring | 每帧 `setUniform` 的常量缓冲 | 3 × 4096 B 常驻缓冲 | 归 ring 自己，随 `close()` 释放，**永不进 frame 列表** |
-| staging 块 | 上传源（UPLOAD 堆） | 512 KB 起，超过 8 MB 不入池 | 3 个池，每池上限 4 MB |
-| frame 列表 | 无法复用的 GPU 缓冲 | — | 超过 2 帧（`FRAMES_IN_FLIGHT`）后 close |
+| 映射上传块 | `allocateGpuMapped`、`allocateStaging` 与 staging 上传 | 512 KiB 起，超过 8 MiB 不入池 | 3 个池，每池上限 4 MiB；完成 fence 后复用 |
+| frame 列表 | 独立 GPU 缓冲、超大块与池满后的块 | — | 超过 2 次轮转且所属 fence 完成后 close |
 
 关键常量：
 
 ```
-FRAMES_IN_FLIGHT        = 2        // 帧列表保留几帧
-UBO_RING_COUNT          = 3        // 与帧列表解耦，3 个槽轮转
-UBO_RING_BLOCK_SIZE     = 4096L    // 单个 UBO ring 缓冲大小
+FRAMES_IN_FLIGHT        = 2        // 帧列表最少保留两次轮转，释放仍需 fence 完成
 STAGING_BLOCK_SIZE      = 512 KiB  // 一个 staging 块的初始大小
 MIN_BLOCK_ALIGNMENT     = 512L     // D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT
 STAGING_POOL_COUNT      = 3
@@ -380,26 +377,29 @@ MAX_STAGING_MAP_RETRIES = 1
 
 ### 4.2 分块与回收
 
-staging 块是 **bump 分配器**（只向前推进，不回收块内单块）：
+映射上传块只向前分配。`alignment` 必须为正，实际对齐取请求值与 512 B 的最小公倍数；
+单次映射长度限制为 `0..Int.MAX_VALUE`。块内放不下时获取另一个足够大的块，不回绕覆盖已返回的切片：
 
 ```
 allocateInStagingBlock(size, alignment):
-    align  = alignment.coerceAtLeast(512)          // 纹理上传要求 512 的倍数
+    align  = lcm(alignment, 512)                  // 同时满足请求与纹理上传对齐
     offset = roundUp(used, align)
     if (offset + size > block.size()) { 换块；offset = 0 }
 ```
 
-换块时旧块进 `retiredPooledStagingBlocks`，`rotate()` 里的 `recycleStagingBlocks()` 决定它的去向：
-放回池（总字节 ≤ 4 MB）或进 frame 列表（等 2 帧后 close）。池号 `(idx + 1) % 3`，所以一个块被复用
-时已经过了 3 帧 > 2 帧，GPU 侧早执行完了。
+分配前调用 `ensureListOpen`，结算上一笔异步提交，再记录 `D3D12GetFenceValue(ctx) + 1` 作为
+当前列表的目标 fence。每块保存最后一次分配对应的目标值，不能在异步 `rotate()` 时猜测已提交值。
+
+换块时旧块进 `retiredPooledStagingBlocks`；`rotate()` 将块及 fence 放回本路池，超过池上限的块进入
+frame 列表。获取池内块必须先通过 `D3D12WaitForFence(ctx, fence, 0)`；未完成的块保留，改用其他块或
+新建，不为复用阻塞 GPU。池号轮转本身不能证明 GPU 已执行完毕。
+
+frame 列表超过两次轮转后，只有最旧列表中的全部目标 fence 完成才关闭缓冲。超大块和池满后的块遵守
+相同规则；native 资源销毁继续走延迟释放。`close()` 释放分配器持有的全部缓冲。
 
 为什么是 512 而不是 256：纹理上传走 `PLACED_FOOTPRINT`，`Offset` 必须是
 `D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT`（512）的倍数；用 256 对齐会让 `CopyTextureRegion` 的
 校验失败或内容错位 —— 后者更难查，因为不报错。
-
-为什么 UBO ring 不能进 frame 列表：ring 是常驻缓冲，一旦进了 frame 列表，第 3 次 `rotate()` 就会把它
-close 掉，之后 `D3D12MapBuffer` 返回 null → `IllegalStateException`。这是「看起来只是内存管理的写法」
-而实际会让第 3 帧必崩的典型。
 
 ### 4.3 `allocateCpu` 为什么用堆缓冲
 
@@ -436,12 +436,16 @@ copyBufferToTexture(...)   // 必须先 ensureListOpen()：分配 staging 不录
 
 ### 4.5 读回路径
 
-- `copyTextureToBuffer(tex, dst, offset, callback, mip)`：目标必须是 READBACK 堆缓冲
-  （`USAGE_MAP_READ`），回调进 `GLOBAL_CALLBACKS`。`device == null`（一次性编码器）时立刻
-  `submit()`，随后同步跑回调。
+- `copyTextureToBuffer(tex, dst, offset, callback, mip)`：CPU 读取的目标使用 READBACK 堆
+  （`USAGE_MAP_READ`）。回调归属于录制拷贝的编码器，提交后等待该编码器本次 fence 完成才执行。
+  异步提交先等待渲染线程提交完成，再等待 GPU；没有读回回调时不增加等待。
+  `device == null`（一次性编码器）立即提交；帧共享编码器在正常帧提交时处理。
+- native 保持从上到下的紧凑行序。行距不满足 256 B 对齐或目标偏移不满足 512 B 对齐时，
+  先拷贝到对齐的 DEFAULT 中转缓冲，再按行 `CopyBufferRegion` 到目标；中转资源保留至槽位 fence 完成。
 - `D3D12GpuQueryPool` 的读取是**阻塞**的：native 把时间戳 resolve 到 readback 缓冲、提交、等围栏，
   然后返回。它不适合放在热路径上按帧调用。
-- 截图路径的读回回调必须挂在设备级全局队列，见 §5。
+- `ScreenshotMixin` 仅对 D3D12 纹理取消原版截图写像素时的上下翻转，兼容截图缩小倍率。
+  不改变通用纹理读回方向。`_port/screenshot_readback_check.py` 检查实际 GPU 数据与完成回调。
 
 ### 4.6 mapped 内存的约束
 
@@ -452,7 +456,7 @@ copyBufferToTexture(...)   // 必须先 ensureListOpen()：分配 staging 不录
 | 长度上限 | `length <= Int.MAX_VALUE`（`MemorySegment` 的 size 是 long，但 map 出来的是 `ByteBuffer`） |
 | 字节序 | `map()` 内强制 `LITTLE_ENDIAN`。`NewDirectByteBuffer` 默认是 **BIG_ENDIAN**，不改的话所有 UBO 都是坏的（矩阵全垃圾、颜色目标全黑） |
 | 必须 unmap | `MappedView.close()` → `D3D12UnmapBuffer`；忘记关会在下次 `Map` 同一资源时撞上 D3D12 的限制 |
-| 关闭后不可用 | `map` 前 `check(!isClosed())`；ring 槽位被 close 时抛 `"allocateGpuMapped: ring buffer slot N is already closed"` |
+| 关闭后不可用 | 瞬时映射分配前检查 `closed`；关闭后抛 `"Transient memory is closed"` |
 | 256 字节 CBV 对齐 | 任何作为 CBV 的偏移（含 meshlet 的 globals）必须 `% 256 == 0`，见 §5 |
 
 ---
@@ -488,7 +492,7 @@ copyBufferToTexture(...)   // 必须先 ensureListOpen()：分配 staging 不录
 
 以下五条写法与上表数值同等严格：
 
-- **拷贝完成回调必须挂到设备级全局队列 `GLOBAL_CALLBACKS`**：任何一次 `submit()` 都会抽干它；挂在单个编码器上的调用若不提交，回调永不执行，READBACK 缓冲每次泄漏。
+- **拷贝完成回调只由所属编码器执行**：提交和 GPU 完成是两个条件，必须等待本次 fence；其他编码器提交不得取走回调。
 - **先 `setPipeline()` 再 `pushDescriptors()`**：绑定表是「条目序号 → register 序号」，由管线布局决定；没有管线时只能记日志跳过（SKIP）。
 - **meshlet 先换 PSO 再 `pushDescriptors()`**：`SetGraphicsRootSignature` 会清掉已绑的根描述符表，顺序反了地形整片消失且不报错。
 - **`copyBufferToTexture()` 先 `ensureListOpen()`**：分配 staging 不录制命令，帧外（资源重载）调用不自查就会命中 `dx12CopyBufferToTexture: no open command list`。
@@ -538,7 +542,7 @@ copyBufferToTexture(...)   // 必须先 ensureListOpen()：分配 staging 不录
 | 缺绑定 | `IllegalStateException("Uniform '…' was not set before core")`、`"Texture '…' was not bound before core"` |
 | 拷贝时列表已关 | native `"dx12CopyBufferToTexture: no open command list"` |
 | staging 块不可映射 | 先 WARN 一次并换块重试；超限抛 `IllegalStateException("staging block … could not be mapped at …")` |
-| UBO ring 槽位已关闭 | `IllegalStateException("allocateGpuMapped: ring buffer slot N is already closed")` |
+| 瞬时分配器已关闭 | `IllegalStateException("Transient memory is closed")` |
 | 上传零字节 | `IllegalArgumentException("Cannot upload zero bytes")` |
 | 视图计数为负 | `IllegalStateException("Too many views removed from texture")` |
 | 查询越界 | `IndexOutOfBoundsException("Query range … exceeds pool size …")` |
@@ -572,7 +576,7 @@ copyBufferToTexture(...)   // 必须先 ensureListOpen()：分配 staging 不录
 | `d3d12\render\adapter\D3D12Device.kt` | 设备门面：资源工厂、管线缓存、着色器编译、关闭顺序 |
 | `d3d12\render\adapter\D3D12AdapterInfo.kt` | 适配器信息（手写 JSON 解析）与 F3 显示数据源 |
 | `d3d12\render\adapter\D3D12RenderProf.kt` | 阶段计时（每 300 帧一行），供 Java mixin 静态调用 |
-| `d3d12\render\core\D3D12TransientMemory.kt` | 瞬时内存：UBO ring、staging 块分配器、帧列表与回收 |
+| `d3d12\render\core\D3D12TransientMemory.kt` | 瞬时内存：映射上传块、帧列表与 fence 回收 |
 | `d3d12\render\core\D3D12GpuBuffer.kt` | 缓冲对象与 `map()`（含字节序修正与设备丢失识别） |
 | `d3d12\render\core\D3D12GpuTexture.kt` | 纹理对象与视图引用计数 |
 | `d3d12\render\core\D3D12GpuTextureView.kt` | 纹理视图（带 `baseMip`） |

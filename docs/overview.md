@@ -14,10 +14,10 @@ Illusion（幻光影现）是 Minecraft NeoForge 模组，把渲染后端换成�
 - native 侧是 C++23 动态库 **MCDR**（同一仓库的 `MCDR\` 目录），通过 **Java FFM API** 调用，
   **不使用 JNI**。
 - 高级特性：DLSS / FSR / XeSS 超分，DLSS-G / FSR-FG / XeSS-FG 帧生成，NVIDIA Reflex，
-  TAA / SMAA，mesh shader（meshlet），VRS 与渲染比例；光线追踪有三条出图链（导出 → G-Buffer → 追踪 → 合光上屏）：
-  **B-Mega** 段 AABB + 三角形暴力求交、**B-Mega AS** 同一 kernel 改走 inline `RayQuery`（`MEGA` 档 + `asTrace = true`），
-  以及 **B-DXR** 状态对象 + SBT + `DispatchRays`（`backend = DXR`）；三条路的命中解码与光照共用光影包里的
-  `mega_shade.hlsli`，自检逐像素对拍。Work Graph 后端仍未接。
+  TAA / SMAA，mesh shader（meshlet），VRS 与渲染比例；光线追踪使用 **B-DXR** 硬件路径：
+  导出几何 → G-Buffer → BLAS/TLAS → 状态对象 + SBT + `DispatchRays` → 降噪与合光。
+  `RAW` 保留硬件追踪并跳过降噪；Work Graph 调度尚未实现，选择 WG 时回退 DXR。
+  设备不支持硬件 DXR 时关闭光追。场景自检使用独立 CPU 参考，视觉效果由用户分别验收。
 - 光影包从「视频设置 → 光影包」里选；`[raytracing]` 那组键是**包作用域**的，入口只有「光影包 → 光影包设置」，
   由包自己的 `shaders/configs.json` 声明（见 `rt/README.md` 的 11.6 节）。
 

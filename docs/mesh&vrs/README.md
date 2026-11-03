@@ -35,21 +35,24 @@
 
 ### 2.1 数据从哪来：段上传时采集
 
-- 采集点是 `SectionRenderDispatcher$RenderSection.addSectionBuffersToUberBuffer` 的 HEAD
-  （mixin `SectionUploadCaptureMixin`）。原版每次把一段某一层（solid / cutout / translucent）
-  写进共享的 Uber 缓冲时，这里顺手记一条。
+- `SectionUploadCaptureMixin` 在 `addSectionBuffersToUberBuffer` HEAD 按 mesh 对象暂存各层 CPU 字节，
+  同一层的上传重试复用暂存数据；在 `setSectionMesh` RETURN 与原版网格一起提交整段。
+  提交时替换完整层集合，删除缺失层；空网格与 reset 移除该段，`releaseSectionMesh` 丢弃取消任务的暂存数据。
 - 采集内容按层：`indexCount`、`vertexBytes`、`indexBytes`，以及切好的 meshlet 列表。
 - **不缓存 GPU 句柄**：Uber 缓冲会扩容和整理，句柄每批都要重新从派发路径拿。
-- 注册表按 section key 存，`levelIdentity` 变化（切世界、重连）时整体清空并递增 `epoch`。
+- 注册表按 section key 存，`levelIdentity` 按世界对象身份比较；切世界、重连或退出到菜单时，
+  `observeLevel` 清空注册表、RT 几何池与材质间接表并递增 `epoch`。上传传递世界对象，不使用 identity hash。
+  客户端 tick 与上传入口共用该函数；注册表更新、版本计算和池发布串行，避免两个上传覆盖同一段的层集合。
 - meshlet 切分时机由 `[mesh] terrain` 决定：
   - 打开时 `shadowLimit = Int.MAX_VALUE`，**每次上传都切**（派发需要全量段表）。
   - 关闭时只切前 64 次（`MESHLET_SHADOW_UPLOADS = 64`），仅用于「shadow」统计，默认路径零成本。
 - 切分过程整段 `catch` 掉（`catch (ignored: Throwable)`）：meshlet 是旁路数据，
   任何异常都**不允许**影响原版的上传主流程。
-- 每段还带 **`geometryVersion`**（逐 section，不是全局）：层集合或任一层的 `indexCount` /
-  `vertexBytes` / `indexBytes` 变化时 +1，同数据重传不动它。它俩的用途不同 —— `generation` 回答
-  "这帧看到的是不是同一份"，`geometryVersion` 回答"这份几何有没有变过"，后者才是 BLAS 重建 /
-  体素砖更新的判据（[§2.1](#21-数据从哪来段上传时采集)）。
+- 每次提交的非空层取得新的 **`geometryVersion`**，版本来自递增的 `generation`，不能只比较字节数或索引数。
+  同大小的顶点、UV、颜色与索引内容变化也使旧 BLAS 失效。上传重试在 mesh 对象暂存层去重，
+  已发布网格在整段提交前保持可见。RT 池逐顶点比较前 24 B（position、颜色、UV）与索引，
+  内容相同时复用原记录及版本；只变化的原版 lightmap（末 4 B）不触发 RT 重建。
+  整段替换只删除缺失层，仍存在的层先做内容比较；RT 内容版本无需等于注册表上传版本。
 - **契约自检**：`captureUpload` 只查"不依赖导出面就能判"的三条 —— 顶点字节数必须是 28 的整数倍、
   走共享顺序 quad 缓冲的层索引数必须是 6 的整数倍、自带索引切片时 `indexBytes` 要能被 `indexCount`
   整除且元素大小只能是 2/4。命中就 `violations +1` 并记下第一条的文字（日志里 `first=`），
@@ -397,8 +400,11 @@ stage1 处理上一步结果与着色率图。枚举值：`PASSTHROUGH = 0`、`M
 
 ## 4. 渲染比例
 
-渲染比例是**视频设置里的滑条**（不再读模组的 toml），持久化在 `options.txt` 的两个键：
+光栅渲染比例是**视频设置里的滑条**，持久化在 `options.txt` 的两个键：
 `dxrMcRenderScale`、DLSS 模式专用的 `dxrMcRenderScaleDlss`。
+它只在光追关闭时缩放附件。光追开启时，主目标与世界层附件保持窗口尺寸，
+由 `[raytracing] renderScale` 单独决定 RT 输入分辨率，见 [光追倍率](../rt/README.md#26-渲染倍率与上采样s4-4-e)。
+普通比例与 SR 质量档的保存值继续保留，关闭光追后重新生效。
 
 | 模式 | 最小 | 最大 | 步进 | 默认 | 档数 |
 | --- | --- | --- | --- | --- | --- |
@@ -413,6 +419,8 @@ stage1 处理上一步结果与着色率图。枚举值：`PASSTHROUGH = 0`、`M
   后处理内部目标）必须按 `appliedPercent` 而不是滑条值分配，否则帧中间会出现
   「主目标 640×360、世界层 290×163」这种不一致，OIT 的深度范围 pass 会直接抛
   `Depth texture: size does not match expected attachment size`。
+- `reconcileRayTracing()`：检测光追开关变化并安排帧边界重建，光追开启时附件使用 100%。
+  在重建完成前，世界层继续使用旧 `appliedPercent`，不能根据实时开关提前改变尺寸。
 - 重建主目标**只能**用 `Minecraft.schedule`，不能用 `execute`：后者在渲染线程内联执行，
   会把本帧仍在使用的深度纹理关掉（`IllegalStateException: Depth texture is closed`）。
   重建就是拿窗口尺寸再调一次 `gameRenderer.resize`（它会无条件 destroy + create 附件）。

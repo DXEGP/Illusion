@@ -15,6 +15,13 @@ plugins {
     id("net.neoforged.moddev") version "2.0.148"
     id("idea")
     id("org.jetbrains.kotlin.jvm") version "2.5.0-Beta2"
+    id("dev.detekt") version "2.0.0-alpha.6"
+}
+
+detekt {
+    buildUponDefaultConfig = true
+    config.setFrom("config/detekt/detekt.yml")
+    ignoreFailures = true
 }
 
 // 为 Gradle 10 做的修改
@@ -423,7 +430,7 @@ sourceSets.named("main") {
 // 分别在 `Illusion-shaders-extension\shaders\include\`（采样契约）与
 // `Illusion-HPT-Shaders\WorkGraph-Advanced\shaders\include\`（颜色/数学）。这里把每个包摊平拷到
 // `build/generated/shaders/assets/dxr_mc/shaders/<包名>/shaders/` 并挂成资源 srcDir，宿主按
-// `<包名>/shaders/mega_trace.hlsl` 从 classpath 读，包清单写进同级的 `packs.txt`。
+// `<包名>/shaders/rt_dxr_lib.hlsl` 从 classpath 读，包清单写进同级的 `packs.txt`。
 //
 // 只有顶层带 `.hlsl` 的目录才算光影包：纯 include 目录（WorkGraph-Advanced）与 GLSL 参考包会跳过。
 // 和 copyNative 一样 NEVER fails：光影包是独立目录，缺它时构建要能过（运行时建不出光追管线，
@@ -488,8 +495,8 @@ val stageShaders = tasks.register("stageShaders") {
             if (packs.isEmpty()) {
                 logger.warn("[stageShaders] no shaderpack staged; the RT pipeline will report a missing shader source")
             }
-            // 清单：D3D12ShaderPacks 照它列 jar 内置的包；B-Mega 排在最前（默认包）。
-            val ordered = packs.sortedBy { if (it == "B-Mega") 0 else 1 }
+            // 清单：D3D12ShaderPacks 照它列 jar 内置的包；B-DXR 排在最前（默认包）。
+            val ordered = packs.sortedBy { if (it == "B-DXR") 0 else 1 }
             File(staged, "packs.txt").writeText(ordered.joinToString("\n", postfix = "\n"))
             logger.lifecycle("[stageShaders] packs: ${ordered.joinToString()}")
         } catch (t: Throwable) {
@@ -740,11 +747,12 @@ val copyVendorDlls = tasks.register("copyVendorDlls") {
     // Captured by value, same reason as copyNative (configuration cache).
     val dxrmcDir = layout.projectDirectory.dir("run/dxrmc").asFile
     val devLibs: List<VendorDevLib> = vendorDevLibs
-    outputs.dir(dxrmcDir)
     // Never up-to-date on the task level; the per-file size check below is what
-    // keeps a no-op second run cheap. A task-level "up to date" would also skip
-    // the (cheap) reporting, which is the point of running it.
-    outputs.upToDateWhen { false }
+    // keeps a no-op second run cheap. Declaring `run/dxrmc` as an output instead
+    // makes Gradle hash the whole folder, including the MCDR.dll / MCDR.pdb that
+    // `copyNative` writes there, and a concurrent run then fails with
+    // "Failed to create MD5 hash for file ... MCDR.pdb".
+    doNotTrackState("per-file size check is the only dedupe; run/dxrmc belongs to copyNative too")
 
     doLast {
         try {

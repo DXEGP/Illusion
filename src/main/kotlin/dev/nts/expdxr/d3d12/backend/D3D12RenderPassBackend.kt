@@ -18,6 +18,7 @@ import dev.nts.expdxr.d3d12.extern.MCDR_ABI
 import dev.nts.expdxr.d3d12.render.adapter.D3D12Device
 import dev.nts.expdxr.d3d12.render.advanced.mesh.D3D12MeshDrawCapture
 import dev.nts.expdxr.dxrmc.rt.D3D12RtGBuffer
+import dev.nts.expdxr.dxrmc.rt.RtVec3
 import dev.nts.expdxr.d3d12.render.advanced.taa.D3D12Temporal
 import dev.nts.expdxr.d3d12.render.core.D3D12AsyncContext
 import dev.nts.expdxr.d3d12.render.core.D3D12GpuBuffer
@@ -135,45 +136,54 @@ class D3D12RenderPassBackend(
      * 这里只往同一份命令列表追加 SetPipeline + DispatchMesh。全局常量必须重建 —— G-Buffer 的 MS 恒不带 AS，
      * 派发组数是原始 meshlet 数，且 VRS 档位要关掉（G-Buffer 是给光追读的，不能被粗档位抽稀）。
      */
-    fun replayGBuffer() {
+    fun replayGBuffer(cameraOffset: RtVec3, projection: FloatArray): Boolean {
         if (this.gbufferBatches.isEmpty()) {
-            return
+            return false
         }
+        require(projection.size == 16 && projection.all { it.isFinite() })
+        require(this.gbufferBatches.all { "Projection" in it.uniforms })
+        val projectionBytes = ByteBuffer.allocate(64).order(ByteOrder.LITTLE_ENDIAN)
+        projectionBytes.asFloatBuffer().put(projection)
+        val projectionSlice = this.transientMemory.uploadStaging(
+            projectionBytes, 256L, GpuBuffer.USAGE_UNIFORM)
         val savedPipeline = this.pipeline
         try {
             for (batch in this.gbufferBatches) {
                 val globalsBytes = ByteBuffer.allocate(256).order(ByteOrder.LITTLE_ENDIAN)
                 globalsBytes.putInt(batch.meshletCount)
                 globalsBytes.putInt(0)
-                globalsBytes.putFloat(0.0f)
-                globalsBytes.putFloat(0.0f)
-                globalsBytes.putFloat(0.0f)
-                globalsBytes.putFloat(0.0f)
+                globalsBytes.position(32)
+                globalsBytes.putFloat(cameraOffset.x)
+                globalsBytes.putFloat(cameraOffset.y)
+                globalsBytes.putFloat(cameraOffset.z)
+                globalsBytes.putFloat(0f)
                 globalsBytes.flip()
                 val globalsSlice = this.transientMemory.uploadStaging(
                     mutableListOf(globalsBytes), 256L, GpuBuffer.USAGE_COPY_SRC)
                 val globalsHandle = (globalsSlice.buffer() as? D3D12GpuBuffer)?.handle()
                 if (globalsHandle == null) {
                     IllusionLogger.warnMessage("rt gbuffer: globals upload failed")
-                    continue
+                    return false
                 }
                 if (!MCDR_ABI.D3D12SetPipeline(this.ctx, batch.pso, true)) {
                     IllusionLogger.warnMessage("rt gbuffer: bind gbuffer PSO failed: " +
                         MCDR_ABI.D3D12LastError())
-                    continue
+                    return false
                 }
                 // 换 PSO 会清掉根描述符表：必须重新 push（与 tryMeshletDraw 同一套 bindings）。
                 this.pipeline = batch.pipeline
                 this.anyDescriptorDirty = true
-                this.pushDescriptors()
+                this.pushDescriptors(batch, projectionSlice)
                 if (!MCDR_ABI.D3D12MeshDrawMeshlets(this.ctx,
                         batch.vertexBuffer, batch.vertexOffset,
                         batch.sections, batch.sectionsOffset, batch.sectionsLength,
                         batch.meshlets, batch.meshletsOffset, batch.meshletsLength,
                         globalsHandle, globalsSlice.offset(), batch.meshletCount)) {
                     IllusionLogger.warnMessage("rt gbuffer: redispatch failed: ${MCDR_ABI.D3D12LastError()}")
+                    return false
                 }
             }
+            return true
         } finally {
             this.pipeline = savedPipeline
             this.anyDescriptorDirty = true
@@ -362,7 +372,7 @@ class D3D12RenderPassBackend(
     }
 
     /** 镜像官方 pushDescriptors：把当前 uniform/texture 写入原生瞬时描述符堆并绑定 root table。 */
-    private fun pushDescriptors() {
+    private fun pushDescriptors(batch: D3D12RtGBuffer.Batch? = null, projection: GpuBufferSlice? = null) {
         if (!this.anyDescriptorDirty) {
             return
         }
@@ -388,7 +398,8 @@ class D3D12RenderPassBackend(
             val entry = bindings[i]
             when (entry.type) {
                 D3D12BindGroupEntry.Type.UNIFORM_BUFFER -> {
-                    val value = requireUniform(entry.name)
+                    val bound = requireUniform(entry.name, batch)
+                    val value = if (entry.name == "Projection" && projection != null) projection else bound
                     val buffer = value.buffer()
                     types[i] = 0
                     buffers[i] = (buffer as D3D12GpuBuffer).handle()
@@ -396,16 +407,17 @@ class D3D12RenderPassBackend(
                     lengths[i] = value.length()
                 }
                 D3D12BindGroupEntry.Type.SAMPLED_IMAGE -> {
-                    val texture = this.textures[entry.name]
+                    val view = if (batch == null) this.textures[entry.name]?.view else batch.textureViews[entry.name]
+                    val textureView = view
                         ?: throw IllegalStateException("Texture '${entry.name}' was not bound before core")
-                    if (texture.view.isClosed) {
+                    if (textureView.isClosed) {
                         throw IllegalStateException("Texture '${entry.name}' is closed")
                     }
                     types[i] = 1
-                    views[i] = texture.view.handle()
+                    views[i] = textureView.handle()
                 }
                 D3D12BindGroupEntry.Type.TEXEL_BUFFER -> {
-                    val value = requireUniform(entry.name)
+                    val value = requireUniform(entry.name, batch)
                     val buffer = value.buffer()
                     types[i] = 2
                     buffers[i] = (buffer as D3D12GpuBuffer).handle()
@@ -416,7 +428,7 @@ class D3D12RenderPassBackend(
                 }
                 D3D12BindGroupEntry.Type.RAW_BUFFER -> {
                     // RAW SRV：HLSL 里是 ByteAddressBuffer，原生按 4 字节寻址建视图，不取 texel 格式。
-                    val value = requireUniform(entry.name)
+                    val value = requireUniform(entry.name, batch)
                     val buffer = value.buffer()
                     types[i] = 3
                     buffers[i] = (buffer as D3D12GpuBuffer).handle()
@@ -435,8 +447,9 @@ class D3D12RenderPassBackend(
         }
     }
 
-    private fun requireUniform(name: String): GpuBufferSlice {
-        val value = this.uniforms[name] ?: throw IllegalStateException("Uniform '${name}' was not set before core")
+    private fun requireUniform(name: String, batch: D3D12RtGBuffer.Batch? = null): GpuBufferSlice {
+        val value = (batch?.uniforms ?: this.uniforms)[name]
+            ?: throw IllegalStateException("Uniform '${name}' was not set before core")
         val buffer = value.buffer()
         if (buffer.isClosed) throw IllegalStateException("Uniform '${name}' buffer is closed")
         return value
@@ -767,6 +780,8 @@ class D3D12RenderPassBackend(
                 meshletsOffset = meshletsSlice.offset(),
                 meshletsLength = meshletsSlice.length(),
                 meshletCount = tables.meshletCount,
+                uniforms = this.uniforms.toMap(),
+                textureViews = this.textures.mapValues { it.value.view },
             ))
         }
         when (layer) {

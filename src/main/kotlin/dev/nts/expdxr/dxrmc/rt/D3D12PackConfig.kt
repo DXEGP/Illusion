@@ -221,7 +221,6 @@ internal object D3D12PackConfig {
                 "raytracing/historyFrames" -> IllusionConfig.RAYTRACING_HISTORY_FRAMES.get().toString()
                 "raytracing/voxelTrustRadius" -> IllusionConfig.RAYTRACING_VOXEL_TRUST_RADIUS.get().toString()
                 "raytracing/hzb" -> IllusionConfig.RAYTRACING_HZB.get().toString()
-            "raytracing/asTrace" -> IllusionConfig.RAYTRACING_AS_TRACE.get().toString()
                 "raytracing/invalidationLog" -> IllusionConfig.RAYTRACING_INVALIDATION_LOG.get().toString()
                 else -> null
             }
@@ -249,8 +248,6 @@ internal object D3D12PackConfig {
                 "raytracing/voxelTrustRadius" ->
                     text.toDoubleOrNull()?.let { IllusionConfig.RAYTRACING_VOXEL_TRUST_RADIUS.set(it) }
                 "raytracing/hzb" -> text.toBooleanStrictOrNull()?.let { IllusionConfig.RAYTRACING_HZB.set(it) }
-            "raytracing/asTrace" ->
-                text.toBooleanStrictOrNull()?.let { IllusionConfig.RAYTRACING_AS_TRACE.set(it) }
                 "raytracing/invalidationLog" ->
                     text.toBooleanStrictOrNull()?.let { IllusionConfig.RAYTRACING_INVALIDATION_LOG.set(it) }
                 else -> return@runCatching

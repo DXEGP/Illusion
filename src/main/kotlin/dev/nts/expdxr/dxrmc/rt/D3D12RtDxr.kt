@@ -12,32 +12,29 @@ import java.util.function.Supplier
 /**
  * B-DXR 正式档（S3 3-f）：状态对象 + SBT + `DispatchRays`。
  *
- * 着色器是光影包里的 `mega_dxr_lib.hlsl`（`lib_6_8`），命中解码与光照数学与 compute 版共用
- * `mega_shade.hlsli`。见 docs/rt/README.md §16。
+ * 着色器库为 `rt_dxr_lib.hlsl`（`lib_6_8`）。见 docs/rt/README.md §16。
  */
 internal object D3D12RtDxr {
 
     const val SRV_COUNT = 6
-    const val UAV_COUNT = 3
+    const val UAV_COUNT = 5
     const val MAX_RECURSION = 1
 
-    private const val RAYGEN_EXPORT = "MegaRayGen"
-    private const val MISS_EXPORT = "MegaMiss"
-    private const val HIT_EXPORT = "MegaClosestHit"
-    private const val LIBRARY_SOURCE = "mega_dxr_lib.hlsl"
+    private const val RAYGEN_EXPORT = "RtRayGen"
+    private const val MISS_EXPORT = "RtMiss"
+    private const val HIT_EXPORT = "RtClosestHit"
+    private const val INVALID_EXPORT = "RtInvalidHit"
+    private const val LIBRARY_SOURCE = "rt_dxr_lib.hlsl"
     private const val LIBRARY_PROFILE = "lib_6_8"
 
     /** SBT 记录步长：32 B 标识符 + 32 B 局部根参数，必须是 32 的倍数（原生侧会校验）。 */
     private const val RECORD_BYTES = 64
     private const val MISS_COUNT = 1
 
-    /**
-     * 命中组顺序固定：0 = 不透明、1 = 镂空。镜像几何目前没有 alpha，两个组暂时共用同一个
-     * closest-hit；实例记录的 `InstanceContributionToHitGroupIndex` 决定选哪个。
-     */
-    private const val HIT_COUNT = 2
+    private const val HIT_COUNT = 3
     private const val HIT_GROUP_OPAQUE = "HITOPAQUE"
     private const val HIT_GROUP_CUTOUT = "HITCUTOUT"
+    private const val HIT_GROUP_INVALID = "HITINVALID"
 
     private const val RAYGEN_OFFSET = 0L
     private const val MISS_OFFSET = RECORD_BYTES.toLong()
@@ -69,6 +66,7 @@ internal object D3D12RtDxr {
         val groups = listOf(
             MCDR_ABI.RtHitGroup(HIT_GROUP_OPAQUE, HIT_EXPORT, null, null),
             MCDR_ABI.RtHitGroup(HIT_GROUP_CUTOUT, HIT_EXPORT, null, null),
+            MCDR_ABI.RtHitGroup(HIT_GROUP_INVALID, INVALID_EXPORT, null, null),
         )
         val handle = MCDR_ABI.D3D12CreateRaytracingPipeline(
             dxil, RAYGEN_EXPORT, MISS_EXPORT, groups, SRV_COUNT, UAV_COUNT, MAX_RECURSION)
@@ -93,8 +91,8 @@ internal object D3D12RtDxr {
     }
 
     /**
-     * 光线派发。`srvs` 必须是五个几何缓冲 + TLAS 视图（与 compute 版的 t0..t5 同序），
-     * `uavs` 是三张辐亮度/辅助缓冲。
+     * 光线派发。`srvs` 必须是五个几何缓冲 + TLAS 视图（t0..t5），
+     * `uavs` 是 direct、indirect、aux、specular、specularGrazing 五张 raw 缓冲。
      */
     fun dispatch(
         device: D3D12Device,
@@ -134,7 +132,7 @@ internal object D3D12RtDxr {
         val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
         // 命中组记录取的是**命中组导出名**的标识符，不是 closest-hit 的名字：
         // GetShaderIdentifier 只认建状态对象时登记的导出名，写错拿到空标识符，派发时整个 SBT 失效。
-        val exports = listOf(RAYGEN_EXPORT, MISS_EXPORT, HIT_GROUP_OPAQUE, HIT_GROUP_CUTOUT)
+        val exports = listOf(RAYGEN_EXPORT, MISS_EXPORT, HIT_GROUP_OPAQUE, HIT_GROUP_CUTOUT, HIT_GROUP_INVALID)
         exports.forEachIndexed { index, export ->
             val identifier = MCDR_ABI.D3D12GetShaderIdentifier(state, export)
             if (identifier == null) {

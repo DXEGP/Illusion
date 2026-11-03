@@ -67,8 +67,8 @@ internal object D3D12RtNrdPack {
         )
         val packSrvs = longArrayOf(normalRoughnessSource.handle(), depth.handle())
         val packUavs = longArrayOf(packedTarget.handle(), depthTarget.handle())
-        // b1 只有 8 个 32 位槽：深度尺度按浮点位传，其余留空。
-        val constants = intArrayOf(D3D12RtGBuffer.DEPTH_SCALE.toRawBits())
+        val constants = intArrayOf(
+            D3D12RtGBuffer.DEPTH_SCALE.toRawBits(), D3D12RtNrdRadiance.DENOISING_RANGE.toRawBits())
         val ok = MCDR_ABI.D3D12DispatchComputeEx(
             encoder.nativeHandle(), pipeline, packSrvs, packUavs, constants, cbv, cbvOffset,
             (width + THREADS - 1) / THREADS, (height + THREADS - 1) / THREADS, 1,
@@ -93,6 +93,7 @@ internal object D3D12RtNrdPack {
             return first to second
         }
         var created: Pair<D3D12GpuTexture, D3D12GpuTexture>? = null
+        var allocated: D3D12GpuTexture? = null
         try {
             // 引擎的 GpuFormat 没有 10-10-10-2 打包格式（见 §21.3）：这里用 RGBA16F 存同样的归一化打包值，
             // NRD 按 float4 读，数值一模一样，代价只是每像素多 8 字节。
@@ -101,17 +102,21 @@ internal object D3D12RtNrdPack {
                 as? D3D12GpuTexture
                 ?: throw IllegalStateException(
                     "rt-nrd-normal-roughness allocate failed (${MCDR_ABI.D3D12LastError()})")
+            allocated = packed
             val depth = device.createTexture(
                 "rt-nrd-viewz", USAGE, GpuFormat.R32_FLOAT, width, height, 1, 1)
                 as? D3D12GpuTexture
                 ?: throw IllegalStateException("rt-nrd-viewz allocate failed (${MCDR_ABI.D3D12LastError()})")
             created = packed to depth
         } catch (t: Throwable) {
+            allocated?.close()
             fail("pack allocate failed: ${t.message}")
             return null
         }
         normalRoughness = created.first
         viewZ = created.second
+        first?.close()
+        second?.close()
         targetWidth = width
         targetHeight = height
         IllusionLogger.infoMessage("rt: nrd pack ${width}x$height")

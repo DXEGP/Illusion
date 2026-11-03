@@ -61,7 +61,7 @@ MCDR_MeshPipelineDesc.kt
 - **调用约定是 `__cdecl`**。`MCDR_CALL` 在 Windows 上展开成 `__cdecl`；`MCDR_API` 在 native 编译时是 `__declspec(dllexport)`，在消费方是 `dllimport`。x64 上只有一种调用约定，但这个宏让头文件在 32 位下也不会错。
 - **MSVC 的 `long` 是 32 位**。头文件为此专门写了一条注释：凡是写成 `int32_t` 的参数，Java 侧必须是 `JAVA_INT`；只有 `int64_t` / `size_t` / 指针才是 `JAVA_LONG` / `JAVA_ADDRESS`。这一条是 §5 里"类型不逐字匹配"坑的根源。
 
-版本号是双份的：宏 `MCDR_ABI_VERSION`（当前 `10u`），以及运行时函数 `mcdrABIVersion()`。两者相等才算握手成功，防止"Java 常量被编译器内联、DLL 却是旧的"。
+版本号是双份的：宏 `MCDR_ABI_VERSION`（当前 `23u`），以及运行时函数 `mcdrABIVersion()`。两者相等才算握手成功，防止"Java 常量被编译器内联、DLL 却是旧的"。
 
 ### 1.2 布局层：`MCDR_Layout.kt`
 
@@ -352,6 +352,35 @@ fun unavailableReason(): String? = LOAD_FAILURE?.toString()
 | confined arena | 绝不跨线程传递段 |
 
 upcall 这条要单独说：`onFenceComplete` 在 native 线程上执行，异常一旦逃出去会**直接终止 JVM**（不是抛到某处可以捕获）。所以它自己 `catch (Throwable)`，只打一条 WARN，不依赖任何 `catchException` 包装。
+
+### 3.5 NRD 显式偏移入口
+
+当前 ABI 版本为 23。`MCDR_ABI.D3D12NrdDenoiseTemporal` 绑定九个参数：
+encoder、七纹理句柄数组、纹理数、64-float 矩阵地址、四 float 偏移地址、帧号、reset、诊断地址与容量。
+FFM descriptor 依次为 `PTR/PTR/I32/PTR/PTR/I32/I32/PTR/I32`，返回 `I32`。
+偏移个数使用 `MCDRLayout.NRD_JITTER_FLOAT_COUNT`，矩阵段至少 256 B，偏移段至少 16 B。
+四个偏移的顺序、单位与数值范围见 [光追接口](../rt/README.md#234-引擎侧的接口s4-4-c)。
+参数段与纹理句柄数组必须在调用返回前有效；调用返回不表示 GPU 已完成，纹理仍受提交 fence 约束。
+实际 RT 帧使用 `D3D12NrdDenoiseTemporal`，偏移与光栅/PT 同源，NRD 取 `(-Jx,+Jy)`。
+RR/RT SR 的 104-float 相机载荷 68–71 为当前/上一帧屏幕内容偏移 xy，
+不再作为保留位。SDK 矩阵仍无 jitter；四分量须有限且位于 `[-0.5,0.5]`。
+
+### 3.6 RT 显式曝光入口
+
+`MCDR_ABI.D3D12DlssdEvalExposure` / `D3D12RtSrEvalExposure` 绑定同名 native 导出，
+参数依次为 encoder、纹理句柄数组、纹理数、输入宽/高、输出宽/高、帧号、reset、
+104-float 相机段、独立曝光段、诊断段与容量，共十三项。
+FFM descriptor 为 `PTR/PTR/I32/I32/I32/I32/I32/I32/I32/PTR/PTR/PTR/I32`，返回 `I32`。
+wrapper 检查相机段至少 416 B，曝光数组个数为 `MCDRLayout.RT_EXPOSURE_FLOAT_COUNT=2`，
+且所有分量有限；Arena 分配两 float 参数段及纹理指针数组，生命周期覆盖调用。
+曝光分量依次为 `preExposure / exposureScale`，native 另检查闭区间 `[2^-16,2^16]`。
+
+RR 允许八/九纹理、RT SR 允许四/五纹理；可选最后一张为 1×1 `R32_FLOAT` 最终曝光倍率。
+缺少资源时 SR 显式启用 `useAutoExposure`；RR 没有同名开关，缺资源的内部行为代码中未明确。
+资源模式切换会等待上次求值 fence、释放 feature 并请求 reset；同一未提交列表内切换返回 0。
+旧入口默认两个曝光分量为 1。玩家 RR/独立 DLSS-SR 使用显式入口，两个分量仍为 1，
+附带由引擎测光生成的同帧曝光纹理；手动/AUTO 均保留纹理，切换时不改变 SDK 资源模式。
+资源与 GPU 生命周期见 [native ABI](../../../MCDR/docs/abi/README.md#4-版本握手)。
 
 ## 4 失败处理
 

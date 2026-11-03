@@ -2,6 +2,7 @@ package dev.nts.expdxr.dxrmc.rt
 
 import org.joml.Matrix4f
 import org.joml.Vector3f
+import dev.nts.expdxr.d3d12.render.advanced.taa.D3D12TemporalSampling
 import java.nio.ByteBuffer
 import kotlin.math.atan
 
@@ -38,23 +39,18 @@ object D3D12RtFrameConstants {
         for (i in values.indices) target.putFloat(offset + i * 4, values[i])
     }
 
-    /** 行主序铺开一个 4×4：Streamline 的 `float4x4` 是 `row[4]`，与 HLSL 相反。 */
-    private fun putRowMajor(source: Matrix4f, target: FloatArray, at: Int) {
-        for (row in 0 until 4) {
-            for (column in 0 until 4) {
-                // JOML 的 get(column, row) 第 1 参是列、第 2 参是行，与这里的行列正好对调。
-                target[at + row * 4 + column] = source.get(column, row)
-            }
-        }
+    /** SL 使用行向量和行主序；JOML 列主序数组等于转置矩阵的行主序。 */
+    private fun putStreamlineMatrix(source: Matrix4f, target: FloatArray, at: Int) {
+        source.get(target, at)
     }
 
     /**
-     * `outSlConstants` 需要的浮点个数：四个行主序矩阵 + 近/远/竖直视场/宽高比。
+     * `outSlConstants` 需要的浮点个数：四个重投影矩阵、相机参数与视图正逆矩阵。
      *
      * 带类型标注是故意的——`_port/frame_constants_check.py` 只把 `const val NAME = 数字` 当作 cbuffer
      * 字段，这个常量不属于 `WgaFrame`，写成带类型的形式可避免被当成多出来的字段。
      */
-    const val SL_CONSTANTS_FLOATS: Int = 72
+    const val SL_CONSTANTS_FLOATS: Int = 104
 
     private fun ByteBuffer.putFloatsAt(offset: Int, a: Float, b: Float, c: Float, d: Float) {
         putFloat(offset, a)
@@ -76,7 +72,7 @@ object D3D12RtFrameConstants {
     /**
      * 写一帧常量 `WgaFrame`。
      *
-     * `debugMode` 进 `g_misc.y`（光影包把这一位定义成调试模式；B-Mega 里 0..4 是调试图通道，
+     * `debugMode` 进 `g_misc.y`（光影包把这一位定义成调试模式；B-DXR 里 0..4 是调试图通道，
      * 8 是自检探针），`radius`/`recordCount` 占 `g_misc.z`/`g_misc.w`（misc 的 z/w 本就是备用）。
      * [previousViewProjection] 由调用方保存（运动矢量与重投影靠它），为空时按零位移处理；
      * [outViewProjection] 顺手把这一帧的矩阵交回给调用方，下次当上一帧用。
@@ -103,31 +99,47 @@ object D3D12RtFrameConstants {
         outViewProjection: FloatArray? = null,
         outNrdMatrices: FloatArray? = null,
         outSlConstants: FloatArray? = null,
+        viewMatrix: FloatArray? = null,
+        projectionMatrix: FloatArray? = null,
+        farPlane: Float = 1024f,
+        jitterX: Float = 0f,
+        jitterY: Float = 0f,
+        previousJitterX: Float = 0f,
+        previousJitterY: Float = 0f,
     ) {
-        val view = Matrix4f().lookAt(
+        val view = viewMatrix?.let { Matrix4f().set(it) } ?: Matrix4f().lookAt(
             Vector3f(position.x, position.y, position.z),
             Vector3f(position.x + forward.x, position.y + forward.y, position.z + forward.z),
             Vector3f(up.x, up.y, up.z),
         )
         val fovY = (2f * atan(tanHalfFovY.toDouble())).toFloat()
-        val projection = Matrix4f().perspective(fovY, aspect, 0.05f, 1024f)
+        val projection = projectionMatrix?.let { Matrix4f().set(it) }
+            ?: Matrix4f().perspective(fovY, aspect, 0.05f, farPlane)
         val viewProjection = projection.mul(view, Matrix4f())
         val inverse = viewProjection.invert(Matrix4f())
+        val sampleProjection = Matrix4f().set(D3D12TemporalSampling.jitterProjection(
+            projection.get(FloatArray(16)), 2.0 * jitterX / width, 2.0 * jitterY / height,
+        ))
+        val sampleViewProjection = sampleProjection.mul(view, Matrix4f())
 
         // HLSL 的 cbuffer float4x4 默认列主序，JOML 的 get() 也按列铺开，直接对拷即可。
         val scratch = FloatArray(16)
-        viewProjection.get(scratch)
+        sampleViewProjection.get(scratch)
         putMatrix(target, VIEW_PROJ, scratch)
         // 上一帧的矩阵由调用方保存：运动矢量与重投影都要它，没给就退化成「零位移」。
-        putMatrix(target, PREV_VIEW_PROJ, previousViewProjection ?: scratch)
-        if (outViewProjection != null) {
-            scratch.copyInto(outViewProjection, 0, 0, 16)
-        }
-        // NRD 要四个矩阵：当前/上一帧的视投影，以及当前/上一帧的世界到视图。
+        putMatrix(target, PREV_VIEW_PROJ, previousViewProjection?.let {
+            D3D12TemporalSampling.jitterProjection(it,
+                2.0 * previousJitterX / width, 2.0 * previousJitterY / height)
+        } ?: scratch)
         if (outNrdMatrices != null && outNrdMatrices.size >= 64) {
-            viewProjection.get(outNrdMatrices, 0)
-            val previous = previousViewProjection ?: outNrdMatrices.copyOfRange(0, 16)
-            previous.copyInto(outNrdMatrices, 16)
+            projection.get(outNrdMatrices, 0)
+            if (previousViewProjection != null && previousViewMatrix != null) {
+                Matrix4f().set(previousViewProjection)
+                    .mul(Matrix4f().set(previousViewMatrix).invert())
+                    .get(outNrdMatrices, 16)
+            } else {
+                projection.get(outNrdMatrices, 16)
+            }
             view.get(outNrdMatrices, 32)
             if (previousViewMatrix != null) {
                 previousViewMatrix.copyInto(outNrdMatrices, 48)
@@ -135,28 +147,31 @@ object D3D12RtFrameConstants {
                 view.get(outNrdMatrices, 48)
             }
         }
-        inverse.get(scratch)
+        sampleViewProjection.invert(Matrix4f()).get(scratch)
         putMatrix(target, INV_VIEW_PROJ, scratch)
 
-        // Streamline 的 slSetConstants 要四个行主序矩阵，且明确禁止含抖动偏移
-        // （见 MCDR\external\streamline\include\sl_consts.h 的 float4x4）。我们这一帧没有抖动，
-        // 所以 jitterOffset 恒为 0；矩阵用「当前/上一帧」的视投影推出 clip 空间的两段变换。
         if (outSlConstants != null && outSlConstants.size >= SL_CONSTANTS_FLOATS) {
-            putRowMajor(projection, outSlConstants, 0)
-            putRowMajor(projection.invert(Matrix4f()), outSlConstants, 16)
+            putStreamlineMatrix(projection, outSlConstants, 0)
+            putStreamlineMatrix(projection.invert(Matrix4f()), outSlConstants, 16)
             if (previousViewProjection != null && previousViewProjection.size >= 16) {
                 val previous = Matrix4f().set(previousViewProjection)
                 val clipToPrev = previous.mul(inverse, Matrix4f())
-                putRowMajor(clipToPrev, outSlConstants, 32)
-                putRowMajor(clipToPrev.invert(Matrix4f()), outSlConstants, 48)
+                putStreamlineMatrix(clipToPrev, outSlConstants, 32)
+                putStreamlineMatrix(clipToPrev.invert(Matrix4f()), outSlConstants, 48)
             } else {
-                putRowMajor(Matrix4f(), outSlConstants, 32)
-                putRowMajor(Matrix4f(), outSlConstants, 48)
+                putStreamlineMatrix(Matrix4f(), outSlConstants, 32)
+                putStreamlineMatrix(Matrix4f(), outSlConstants, 48)
             }
             outSlConstants[64] = 0.05f
-            outSlConstants[65] = 1024f
+            outSlConstants[65] = farPlane
             outSlConstants[66] = fovY
             outSlConstants[67] = aspect
+            outSlConstants[68] = jitterX
+            outSlConstants[69] = -jitterY
+            outSlConstants[70] = if (previousViewProjection != null) previousJitterX else jitterX
+            outSlConstants[71] = if (previousViewProjection != null) -previousJitterY else -jitterY
+            putStreamlineMatrix(view, outSlConstants, 72)
+            putStreamlineMatrix(view.invert(Matrix4f()), outSlConstants, 88)
         }
 
         target.putFloatsAt(CAMERA_POS, position.x, position.y, position.z, frameIndex.toFloat())
@@ -173,5 +188,8 @@ object D3D12RtFrameConstants {
         target.putFloatsAt(VOLUME, 50f, 10f, 0.012f, 64f)
         target.putFloatsAt(FROXEL_PARAMS, 160f, 90f, 32f, 1f)
         target.putFloatsAt(MISC, 0.12f, debugMode.toFloat(), radius, recordCount.toFloat())
+        if (outViewProjection != null) {
+            viewProjection.get(outViewProjection)
+        }
     }
 }

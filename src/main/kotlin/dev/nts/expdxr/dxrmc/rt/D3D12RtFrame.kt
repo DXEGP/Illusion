@@ -11,26 +11,24 @@ import dev.nts.expdxr.d3d12.extern.MCDR_ABI
 import dev.nts.expdxr.d3d12.render.adapter.D3D12Device
 import dev.nts.expdxr.d3d12.render.core.D3D12GpuBuffer
 import dev.nts.expdxr.d3d12.render.core.D3D12GpuTexture
+import dev.nts.expdxr.d3d12.render.advanced.mesh.D3D12SectionGeometry
+import dev.nts.expdxr.d3d12.render.advanced.taa.D3D12Temporal
+import dev.nts.expdxr.d3d12.render.advanced.vrs.D3D12RenderScale
+import dev.nts.expdxr.dxrmc.framegen.FrameGeneration
 import dev.nts.expdxr.misc.IllusionLogger
 import dev.nts.expdxr.misc.settings.D3D12Settings
 import net.minecraft.client.Minecraft
-import net.minecraft.world.attribute.EnvironmentAttributes
-import org.joml.Quaternionfc
-import org.joml.Vector3f
+import org.joml.Matrix4f
 import java.lang.foreign.Arena
 import java.lang.foreign.ValueLayout
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.function.Supplier
-import kotlin.math.PI
 import kotlin.math.abs
-import kotlin.math.cos
-import kotlin.math.sin
-import kotlin.math.tan
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * 逐帧光追派发：把几何池与材质表上传成 GPU 缓冲，跑一次 B-Mega 遍历，再合光成一张 HDR 结果。
+ * 逐帧光追派发：把几何池与材质表上传成 GPU 缓冲，跑一次 B-DXR 遍历，再合光成一张 HDR 结果。
  * 池每写一段、材质表每重烘一次才会重传，其余帧只重传 112 B 的相机常量。
  * 见 docs/rt/README.md
  */
@@ -50,7 +48,7 @@ object D3D12RtFrame {
     /** 与两个着色器的 `[numthreads(8, 8, 1)]` 一致。 */
     private const val THREADS = 8
 
-    /** BLAS 线框档的线程组宽度与「每个实例 12 条棱」，必须与 mega_debug_blas.hlsl 一致。 */
+    /** BLAS 线框档的线程组宽度与「每个实例 12 条棱」，必须与 rt_debug_blas.hlsl 一致。 */
     private const val BLAS_THREADS = 64
     private const val BLAS_EDGES_PER_BOX = 12
 
@@ -66,9 +64,6 @@ object D3D12RtFrame {
     /** 镜像三块缓冲合计的字节上限。世界加载时每帧都有新段进来，不设上限就会每帧传几百 MB。 */
     private const val MIRROR_BYTES = 128L * 1024 * 1024
 
-    /** 最短重建间隔（帧）。段上传会让 revision 每帧都变，不节流等于每帧重建镜像。 */
-    private const val MIRROR_INTERVAL = 60
-
     /** 相机位移超过这么多方块就立刻重建，不等节流。 */
     private const val MIRROR_SLACK = 24f
 
@@ -76,11 +71,6 @@ object D3D12RtFrame {
     // RENDER_TARGET，只带 STORAGE 的资源切到这个状态是非法的（Close 直接 E_INVALIDARG）。
     private const val OUTPUT_USAGE = D3D12GpuTexture.USAGE_STORAGE or GpuTexture.USAGE_RENDER_ATTACHMENT
 
-    /**
-     * 光追派发的内部分辨率除数下限：B-Mega 是逐像素线性扫整池，全分辨率在真实世界里会把一帧跑到几十秒。
-     * 见 docs/rt/README.md
-     */
-    private const val TRACE_MIN_DIVISOR = 4
 
     /** 几何池段数低于它就认为「世界是在光追关闭时载入的」，触发一次原版重建。 */
     private const val GEOMETRY_MIN_RECORDS = 32
@@ -88,14 +78,13 @@ object D3D12RtFrame {
     /** tick 在客户端 tick 事件里跑（每秒 20 次）：60 次 = 3 秒还没有任何几何就报一次。 */
     private const val STARVED_TICKS = 60
 
-    /** S2 占位的太阳仰角（弧度）：固定 59°，只让东西方向跟原版太阳走。 */
-    private const val S2_SUN_ELEVATION = 59.0 * PI / 180.0
+    /** 派发心跳间隔（毫秒）：按时间而不是按帧，否则高帧率下每秒刷出好几行 INFO。 */
+    private const val HEARTBEAT_MILLIS = 5000L
 
-    /** 辐亮度的目标高度（像素）；除数按它反推，`TRACE_MIN_DIVISOR` 兜底。 */
-    private const val TRACE_TARGET_HEIGHT = 160
+    /** 加速结构与追踪两段的 CPU 编码时长超过这个值就打一行分解（微秒）。 */
+    private const val SLOW_FRAME_MICROS = 200_000L
 
     /** `renderScale` 缩到 25% 时目标高度只剩 40 像素，再低就没有降噪的余地了。 */
-    private const val TRACE_MIN_SCALED_HEIGHT = 40
 
     /**
      * 只扫相机这么远的段（方块单位）。0 表示不裁，自检场景用 0；真实世界必须裁，否则求交次数爆炸。
@@ -113,6 +102,11 @@ object D3D12RtFrame {
         val aspect: Float,
         val sunDir: RtVec3,
         val sunColor: RtVec3,
+        val transform: D3D12RtCamera.Transform,
+        val farPlane: Float,
+        val worldIdentity: Any,
+        val worldTime: Long,
+        val frameNanos: Long,
         )
 
     private class Radiance(
@@ -121,10 +115,12 @@ object D3D12RtFrame {
         val direct: D3D12GpuBuffer,
         val indirect: D3D12GpuBuffer,
         val aux: D3D12GpuBuffer,
+        val specular: D3D12GpuBuffer,
+        val specularGrazing: D3D12GpuBuffer,
         val bytes: Long,
     ) {
         fun close() {
-            for (buffer in arrayOf(direct, indirect, aux)) {
+            for (buffer in arrayOf(direct, indirect, aux, specular, specularGrazing)) {
                 try {
                     buffer.close()
                 } catch (_: Throwable) {
@@ -142,7 +138,13 @@ object D3D12RtFrame {
     }
 
     private class Mirrors(
-        val key: Long,
+        val identity: Long,
+        val geometrySnapshot: D3D12RtGeometryPool.MirrorSlice,
+        val worldIdentity: Any,
+        val geometryEpoch: Int,
+        var key: Long,
+        val geometryRevision: Long,
+        val materialRevision: Long,
         val recordCount: Int,
         val records: D3D12GpuBuffer,
         val recordBytes: ByteBuffer,
@@ -173,6 +175,11 @@ object D3D12RtFrame {
     private var mirrors: Mirrors? = null
 
     @Volatile
+    private var publishedMirrors: Mirrors? = null
+
+    private var nextMirrorIdentity = 0L
+
+    @Volatile
     private var compositePipeline = 0L
 
     /** 这一帧的辐亮度缓冲是否真的被派发写过；没写成的话合光会把过期内容铺满屏幕。 */
@@ -180,14 +187,13 @@ object D3D12RtFrame {
 
     /** 已经为补齐几何池触发过一次原版重建。 */
     private var geometryRetriggered = false
+    private var observedGeometryEpoch = Int.MIN_VALUE
     private var reconciled = false
 
-    /** 太阳方向只记一次日志，避免每帧刷屏。 */
-    private var sunLogged = false
+    private var capturedCamera: Camera? = null
+    private var capturedCameraStamp = Long.MIN_VALUE
 
-    /** 走加速结构这条路只记一次；退回暴力路径也只在第一次退回时提示。 */
     private var accelLogged = false
-    private var fallbackLogged = false
     private var wgWarned = false
     private var debugPipeline = 0L
     private var blasPipeline = 0L
@@ -206,6 +212,10 @@ object D3D12RtFrame {
     @Volatile
     private var dispatches = 0L
     private var frameCounter = 0L
+    /** 心跳节流：上次报时的时刻与当时的规模，规模变了要立刻报出来。 */
+    private var heartbeatNanos = 0L
+    private var heartbeatRecords = -1
+    private var heartbeatTier: String? = null
     /** 连续多少个 tick 几何池还是空的（见 [STARVED_TICKS]）。 */
     private var starvedTicks = 0
     private var starvedReported = false
@@ -218,13 +228,25 @@ object D3D12RtFrame {
     private val previousViewProjection = FloatArray(16)
     private val previousView = FloatArray(16)
     private val nrdMatrices = FloatArray(64)
+    private val previousJitter = FloatArray(2)
+    @Volatile
+    private var temporalResolveReady = false
     /** DLSS-D 的 `slSetConstants` 载荷：四个行主序矩阵 + 近/远/竖直视场/宽高比。 */
     private val slConstants = FloatArray(D3D12RtFrameConstants.SL_CONSTANTS_FLOATS)
-    /** 上一次降噪用的（轨道, 宽, 高）：变了就丢历史，避免把上一套分辨率的历史搬过来。 */
-    private var denoiseSignature = Long.MIN_VALUE
+    private val history = D3D12RtHistory()
+    private val rrHistory = D3D12RtHistory.Consumer()
+    private val nrdHistory = D3D12RtHistory.Consumer()
+    private val srHistory = D3D12RtHistory.Consumer()
+    private var historyInvalidation = D3D12RtHistory.Invalidation(0, 0, 0)
+    private var previousPlan: D3D12RtPipelinePlan.Plan? = null
+
+    /** 合光只报一次成功行（真值表之外的形状变化靠它确认）。 */
+    private val compositeRan = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** 本帧 NRD 写好的辐亮度；为 null 时合光直接读三块缓冲。 */
     private var denoisedRadiance: D3D12GpuTexture? = null
+    private var denoisedSpecular: D3D12GpuTexture? = null
+    private var denoisedIsReblur = false
 
     /** 第七槽的占位：1x1 的 RGBA16F，只在降噪没跑的帧上绑给 `gDenoised`。 */
     private var fallbackTexture: D3D12GpuTexture? = null
@@ -247,7 +269,6 @@ object D3D12RtFrame {
     /** 光追链异常计数：只报前四次（见 reportFailure）。 */
     private val throwables = AtomicLong()
     private const val MAX_THROWABLES = 4L
-    private var mirrorFrame = 0L
     private var mirrorX = 0f
     private var mirrorY = 0f
     private var mirrorZ = 0f
@@ -255,18 +276,27 @@ object D3D12RtFrame {
     @Volatile
     private var failures = 0
     private var revDropped = 0
-    private var mirrorInterval = MIRROR_INTERVAL
     private var scene: Scene? = null
     private var frameCbv = 0L
     private var frameCbvOffset = 0L
 
     fun isActive(): Boolean = D3D12Settings.rtEnabled
 
+    fun hasTemporalResolve(): Boolean {
+        if (!D3D12Settings.rtEnabled) return false
+        val window = Minecraft.getInstance().window
+        if (window.width <= 0 || window.height <= 0) return false
+        val plan = D3D12RtPipelinePlan.configured(window.width, window.height)
+        return plan.enabled && plan.denoise
+    }
+
     fun summary(): String = "rt frame: dispatches=${dispatches} records=${mirrors?.recordCount ?: 0} " +
         "size=${outputWidth}x${outputHeight}"
 
     /** 光追关掉后把 GPU 资源还回去；与材质表共用同一个 tick。 */
     fun tick() {
+        D3D12RenderScale.reconcileRayTracing()
+        observeWorld(Minecraft.getInstance().level)
         // 老配置里 mode 可能停在 OFF（只有 backend 被写过）：包是这两个键的来源，进入世界时对一次账。
         if (!reconciled) {
             reconciled = true
@@ -285,8 +315,8 @@ object D3D12RtFrame {
         }
         retriggerGeometry()
         // 光追开着却一段几何都没有：整条链没启动（最常见的是 G-Buffer 变体没建起来）。
-        // 这里只在长时间空转后报一次，免得把「刚进世界还在建段」当成故障。
-        if (D3D12RtGeometryPool.recordCount() > 0) {
+        // 只在已经进入世界、且空转够久时报一次——菜单里 tick 照跑，那时本来就没有几何。
+        if (D3D12RtGeometryPool.recordCount() > 0 || Minecraft.getInstance().level == null) {
             starvedTicks = 0
         } else if (!starvedReported && ++starvedTicks >= STARVED_TICKS) {
             starvedReported = true
@@ -316,26 +346,39 @@ object D3D12RtFrame {
     }
 
     fun release() = synchronized(frameLock) {
+        temporalResolveReady = false
         scene?.close()
         scene = null
         val currentRadiance = radiance
         val currentMirrors = mirrors
+        val currentPublishedMirrors = publishedMirrors
         val currentOutput = output
         radiance = null
         mirrors = null
+        publishedMirrors = null
         output = null
         frameValid = false
+        previousPlan = null
+        previousValid = false
+        capturedCamera = null
+        capturedCameraStamp = Long.MIN_VALUE
+        history.clear()
         outputWidth = 0
         outputHeight = 0
         // 加速结构引用镜像缓冲的 GPU 地址，必须在镜像被销毁之前释放。
         D3D12RtBlas.release()
         currentRadiance?.close()
         currentMirrors?.close()
+        if (currentPublishedMirrors != null && currentPublishedMirrors !== currentMirrors) {
+            currentPublishedMirrors.close()
+        }
         currentOutput?.close()
         // 占位纹理跟着设备走：设备换了它就没用了，必须一起释放。
         fallbackTexture?.close()
         fallbackTexture = null
         denoisedRadiance = null
+        denoisedSpecular = null
+        D3D12RtNrd.reset()
         D3D12RtDlssd.reset()
         // 三个都是 compute 管线（D3D12CreateComputePipeline*），原生侧是 Dx12Object*，不是 Dx12Pipeline*：
         // 用 D3D12DestroyPipeline 释放等于按错的类型 delete，析构里读到别的对象的字段 → 直接 AV 崩进程。
@@ -356,28 +399,58 @@ object D3D12RtFrame {
         D3D12RtTrace.releasePipeline()
         D3D12RtMotion.release()
         D3D12RtNrdPack.release()
+        D3D12RtNrdRadiance.release()
+        D3D12RtMaterialGuide.release()
+        D3D12RtSuperResolution.release()
+        D3D12RtExposure.release()
     }
 
     /** 一帧的相机；读不到（还没初始化）时返回 null，调用方跳过这次派发。 */
-    fun currentCamera(aspect: Float): Camera? {
-        val camera = Minecraft.getInstance().gameRenderer.mainCamera()
-        if (!camera.isInitialized() || aspect <= 0f) return null
-        val rotation = camera.rotation()
-        val position = camera.position()
-        return Camera(
-            position = RtVec3(position.x.toFloat(), position.y.toFloat(), position.z.toFloat()),
-            right = axis(rotation, 1f, 0f, 0f),
-            up = axis(rotation, 0f, 1f, 0f),
-            forward = axis(rotation, 0f, 0f, -1f),
-            tanHalfFovY = tan(camera.fov * PI / 360.0).toFloat(),
-            aspect = aspect,
-            sunDir = sunDirection(camera),
+    fun currentCamera(): Camera? =
+        capturedCamera.takeIf { capturedCameraStamp == D3D12Temporal.frameTimestampNanos }
+
+    fun invalidateOutput() = synchronized(frameLock) {
+        frameValid = false
+    }
+
+    fun captureProjection(data: ByteBuffer) {
+        invalidateOutput()
+        val client = Minecraft.getInstance()
+        capturedCamera = null
+        capturedCameraStamp = D3D12Temporal.frameTimestampNanos
+        if (data.remaining() != 64) return
+        val world = client.level ?: return
+        val level = client.gameRenderer.gameRenderState().levelRenderState
+        val state = level.cameraRenderState
+        if (!state.initialized) return
+        val projection = FloatArray(16)
+        data.duplicate().order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(projection)
+        if (projection.any { !it.isFinite() }) return
+        val transform = D3D12RtCamera.resolve(
+            RtVec3(state.pos.x.toFloat(), state.pos.y.toFloat(), state.pos.z.toFloat()),
+            state.viewRotationMatrix,
+            state.projectionMatrix,
+            Matrix4f().set(projection),
+        )
+        capturedCamera = Camera(
+            position = transform.position,
+            right = transform.right,
+            up = transform.up,
+            forward = transform.forward,
+            tanHalfFovY = 1f / state.projectionMatrix.m11(),
+            aspect = state.projectionMatrix.m11() / state.projectionMatrix.m00(),
+            sunDir = D3D12RtCamera.sunDirection(level.skyRenderState.sunAngle),
             sunColor = SUN_COLOR,
-            )
+            transform = transform,
+            farPlane = state.depthFar,
+            worldIdentity = world,
+            worldTime = world.defaultClockTime,
+            frameNanos = capturedCameraStamp,
+        )
     }
 
     /**
-     * 主光线 + 1 弹射，写进三张辐亮度缓冲。返回 false 表示这次没派发（调用方无需处理）。
+     * 主光线与 diffuse/specular 弹射，写进五张 raw 缓冲。返回 false 表示未派发。
      * 见 docs/rt/README.md
      */
     /** 我们持有的显存峰值（六类基线之一）：镜像、相机常量、辐亮度、G-Buffer、HDR 输出。 */
@@ -390,21 +463,41 @@ object D3D12RtFrame {
         radiance?.let { bytes += it.bytes }
         bytes += D3D12RtGBuffer.byteCount()
         output?.let { bytes += it.getWidth(0).toLong() * it.getHeight(0) * HDR_BYTES }
+        bytes += D3D12RtSuperResolution.byteCount()
+        if (D3D12RtExposure.texture() != null) bytes += Float.SIZE_BYTES
         return bytes
     }
 
+    private fun updatePlan(plan: D3D12RtPipelinePlan.Plan) {
+        if (previousPlan == plan) return
+        D3D12RtNrd.reset()
+        D3D12RtDlssd.reset()
+        D3D12RtSuperResolution.reset()
+        previousPlan = plan
+    }
+
     /** 光追派发：CPU 编码耗时与派发次数进基线统计，真正的实现在 [dispatchImpl]。 */
-    fun dispatch(
+    internal fun dispatch(
 
         device: D3D12Device?,
         encoder: D3D12CommandEncoderBackend?,
         camera: Camera?,
-        width: Int,
-        height: Int,
+        plan: D3D12RtPipelinePlan.Plan,
     ): Boolean {
         val started = System.nanoTime()
         try {
-            return synchronized(frameLock) { dispatchImpl(device, encoder, camera, width, height) }
+            return synchronized(frameLock) {
+                var dispatched = false
+                try {
+                    dispatchImpl(device, encoder, camera, plan).also { dispatched = it }
+                } finally {
+                    if (!dispatched) {
+                        frameValid = false
+                        temporalResolveReady = false
+                        history.invalidate(D3D12RtHistory.InvalidationReason.FRAME_GAP)
+                    }
+                }
+            }
         } finally {
             D3D12RtStats.onCpuEncode(System.nanoTime() - started)
             if (frameValid) {
@@ -418,140 +511,151 @@ object D3D12RtFrame {
         device: D3D12Device?,
         encoder: D3D12CommandEncoderBackend?,
         camera: Camera?,
-        width: Int,
-        height: Int,
+        plan: D3D12RtPipelinePlan.Plan,
     ): Boolean {
         frameValid = false
+        denoisedRadiance = null
+        val width = plan.displayWidth
+        val height = plan.displayHeight
         // 这几种提前返回以前是静默的：屏幕停在原版画面上、日志一个字都没有，
         // 和「光追根本没开」分不出来。每种原因各报一次。
         if (device == null) return dispatchSkip("no device")
         if (encoder == null) return dispatchSkip("no encoder")
         if (camera == null) return dispatchSkip("no camera")
         if (width <= 0 || height <= 0) return dispatchSkip("empty target ${width}x$height")
-        // 3-f：选 DXR 档时逐帧走状态对象 + SBT，选 MEGA 档仍走 compute（两条路的着色器共用同一份
-        // 命中与解调代码，所以换档不改变画面语义）。
-        val dxrTier = D3D12Settings.rtBackend == RtBackend.DXR.ordinal
-        // WG 后端还没实现，快照里它和 MEGA 走同一条路：不提示的话用户会以为 Work Graph 真的在跑。
         if (!wgWarned && D3D12Settings.rtBackend == RtBackend.WG.ordinal) {
             wgWarned = true
-            IllusionLogger.warnMessage(
-                "rt backend WG is not implemented, using the compute path like MEGA")
+            IllusionLogger.warnMessage("rt: WG unavailable, using DXR")
         }
-        // 加速结构有两种用法：DXR 档走状态对象 + DispatchRays，MEGA 档可选用它替掉段 AABB
-        // （同一条 compute kernel，只有可见性判断换了）。见 docs/rt/README.md 13.6。
-        val asTier = !dxrTier && D3D12Settings.rtAsTrace
-        val buildAccel = dxrTier || asTier
-        val brutePipeline = if (dxrTier) 0L else D3D12RtTrace.dispatchPipeline()
-        if (!dxrTier && brutePipeline == 0L) return false
-        val accelPipeline = if (asTier) D3D12RtTrace.dispatchPipeline(asPath = true) else 0L
+        if (D3D12RtDxr.pipeline(device) == 0L) return dispatchSkip("DXR unavailable")
         val mirror = mirrorsFor(device, camera) ?: return false
         val sceneTarget = sceneFor(device) ?: return false
-        val divisor = traceDivisor(height)
-        val traceWidth = (width / divisor).coerceAtLeast(1)
-        val traceHeight = (height / divisor).coerceAtLeast(1)
+        val traceWidth = plan.traceWidth
+        val traceHeight = plan.traceHeight
         val frame = radianceFor(device, traceWidth, traceHeight) ?: return false
         encoder.ensureListOpen()
-        if (!writeScene(sceneTarget, camera, traceWidth, traceHeight, mirror.recordCount)) return false
-        // 降噪的纹理池按屏幕尺寸开，尺寸一变就得整体重建（见 docs/rt/README.md §22）。
-        D3D12RtNrd.ensure(device, width, height)
-        // 运动矢量必须在这一帧的常量写完之后算：它要靠 g_viewProj / g_prevViewProj 的重投影差。
-        D3D12RtMotion.render(
-            encoder, D3D12RtGBuffer.texture(D3D12RtGBuffer.LINEAR_DEPTH), frameCbv, frameCbvOffset)
-        // NRD 要的两种编码必须在派发之后重排一遍（见 docs/rt/README.md §21）。
-        D3D12RtNrdPack.render(
-            encoder,
-            D3D12RtGBuffer.texture(D3D12RtGBuffer.NORMAL_ROUGHNESS),
-            D3D12RtGBuffer.texture(D3D12RtGBuffer.LINEAR_DEPTH),
-            frameCbv, frameCbvOffset)
-        // 五个槽位都准备好之后打一行（一次进程），降噪与超分接线时要靠它。
-        D3D12RtGuide.noteOnce()
-        // 每个进程一次：默认档不建加速结构，这条检查得自己跑（见 docs/rt/README.md 16.6）。
+        updatePlan(plan)
+        val frameGeneration = FrameGeneration.activeBackend().toLong() shl 32 or
+            (FrameGeneration.mode().toLong() shl 16) or FrameGeneration.frames().toLong()
+        val jitter = D3D12Temporal.frameJitter(camera.frameNanos)
         D3D12RtBlas.checkContractOnce(
             mirror.recordBytes, mirror.recordCount, mirror.vertexBytes, mirror.indexBytes)
-        if (buildAccel) {
-            D3D12RtBlas.prepare(
-                device, encoder.nativeHandle(), mirror.recordBytes, mirror.recordCount,
-                mirror.vertices.handle(), mirror.indices.handle(), mirror.vertexBytes, mirror.indexBytes,
-            )
-        }
-        val accelView = if (buildAccel) D3D12RtBlas.view() else 0L
-        val accel = accelView != 0L
-        val useAccelPipeline = asTier && accel && accelPipeline != 0L
-        val pipeline = if (useAccelPipeline) accelPipeline else brutePipeline
-        // 绑几个 SRV 由**管线**决定，不是由「AS 建没建出来」决定：MEGA + asTrace 时若加速结构管线没建起来，
-        // 实际派发的是 5 个槽的暴力管线，多绑一个 t5 会被原生按数量校验拒掉（每帧静默失败、画面等于没开光追）。
-        val asSrvs = dxrTier || useAccelPipeline
-        val traceSrvs = if (asSrvs) longArrayOf(
-            mirror.records.handle(), mirror.vertices.handle(), mirror.indices.handle(),
-            mirror.materials.handle(), mirror.quads.handle(), accelView,
-        ) else longArrayOf(
-            mirror.records.handle(), mirror.vertices.handle(), mirror.indices.handle(),
-            mirror.materials.handle(), mirror.quads.handle(),
+        val accelStart = System.nanoTime()
+        D3D12RtBlas.advanceFrame()
+        D3D12RtBlas.prepare(
+            device, encoder.nativeHandle(), mirror.recordBytes, mirror.recordCount,
+            mirror.vertices.handle(), mirror.indices.handle(), mirror.vertexBytes, mirror.indexBytes,
+            mirror.geometryEpoch, mirror.geometryRevision, mirror.identity,
         )
-        val traceUavs = longArrayOf(frame.direct.handle(), frame.indirect.handle(), frame.aux.handle())
-        if (accel) {
-            if (!accelLogged) {
-                accelLogged = true
-                IllusionLogger.infoMessage(
-                    "rt trace: ${if (dxrTier) "dxr" else "as"} tier on, tlas slot=$accelView " +
-                        "inst=${D3D12RtBlas.instances()}",
-                )
+        val activeMirror = when {
+            D3D12RtBlas.activeMirrorId() == mirror.identity -> {
+                val old = publishedMirrors
+                publishedMirrors = mirror
+                if (old != null && old !== mirror) old.close()
+                mirror
             }
-        } else if (dxrTier && !fallbackLogged) {
-            fallbackLogged = true
-            IllusionLogger.warnMessage("rt trace: dxr tier needs the accel structure")
+            canUsePublishedMirror(mirror, device, encoder.nativeHandle()) -> publishedMirrors
+            else -> null
+        } ?: return dispatchSkip("acceleration structure pending")
+        val accelMicros = (System.nanoTime() - accelStart) / 1000L
+        val accelView = D3D12RtBlas.view()
+        if (accelView == 0L) return dispatchSkip("acceleration structure unavailable")
+        historyInvalidation = history.begin(D3D12RtHistory.Snapshot(
+            plan, camera.worldIdentity, device, D3D12RtGBuffer.texture(D3D12RtGBuffer.ALBEDO),
+            activeMirror.geometryEpoch, D3D12RtBlas.sceneRevision(), activeMirror.materialRevision,
+            RtBackend.DXR.ordinal,
+            frameGeneration, camera.worldTime, camera.frameNanos, camera.position, camera.forward, camera.up,
+            camera.transform.projection,
+            jitter.enabled,
+        ))
+        if (historyInvalidation.reasons != 0) previousValid = false
+        if (!writeScene(sceneTarget, camera, traceWidth, traceHeight, activeMirror.recordCount)) return false
+        val traceSrvs = longArrayOf(
+            activeMirror.records.handle(), activeMirror.vertices.handle(), activeMirror.indices.handle(),
+            activeMirror.materials.handle(), activeMirror.quads.handle(), accelView,
+        )
+        val traceUavs = longArrayOf(frame.direct.handle(), frame.indirect.handle(), frame.aux.handle(),
+            frame.specular.handle(), frame.specularGrazing.handle())
+        if (!accelLogged) {
+            accelLogged = true
+            IllusionLogger.infoMessage("rt: DXR active (${D3D12RtBlas.instances()} instances)")
         }
-        val constants = intArrayOf(0)
         if (frameCbv == 0L) {
             // 常量缓冲没绑上时着色器拿到的全是 0：宁可不派发（画面留在原版），也不要写一屏黑。
             fail("frame constants are not bound")
             return false
         }
-        val ok = if (dxrTier) {
-            if (!accel) {
-                fail("dxr tier needs the acceleration structure")
-                return false
-            }
-            D3D12RtDxr.dispatch(
-                device, encoder.nativeHandle(), traceSrvs, traceUavs, frameCbv, frameCbvOffset,
-                traceWidth, traceHeight)
-        } else {
-            MCDR_ABI.D3D12DispatchComputeEx(
-                encoder.nativeHandle(), pipeline, traceSrvs, traceUavs, constants, frameCbv, frameCbvOffset,
-                (traceWidth + THREADS - 1) / THREADS, (traceHeight + THREADS - 1) / THREADS, 1,
+        val ok = D3D12RtDxr.dispatch(
+            device, encoder.nativeHandle(), traceSrvs, traceUavs, frameCbv, frameCbvOffset,
+            traceWidth, traceHeight)
+        val traceMicros = (System.nanoTime() - accelStart) / 1000L - accelMicros
+        // 这一帧慢到不像话时留一行分解：卡死前最后一条「慢帧」直接指出钱花在哪一段。
+        if (accelMicros + traceMicros > SLOW_FRAME_MICROS) {
+            IllusionLogger.infoMessage(
+                "rt frame: slow accel=${accelMicros / 1000}ms trace=${traceMicros / 1000}ms " +
+                    "records=${activeMirror.recordCount} inst=${D3D12RtBlas.instances()}"
             )
         }
         if (!ok) {
             fail("dispatch failed: ${MCDR_ABI.D3D12LastError()}")
             return false
         }
-        frameValid = true
-        val tier = when {
-            dxrTier -> "dxr"
-            useAccelPipeline -> "accel"
-            else -> "brute"
+        if (!D3D12RtMaterialGuide.render(encoder, frame.aux, activeMirror.materials, frameCbv, frameCbvOffset)) {
+            return false
         }
+        val exposureAlbedo = D3D12RtGBuffer.texture(D3D12RtGBuffer.ALBEDO) ?: return false
+        val exposureEmissive = D3D12RtGBuffer.texture(D3D12RtGBuffer.EMISSIVE) ?: return false
+        val exposureSpecular = D3D12RtGBuffer.texture(D3D12RtGBuffer.SPECULAR) ?: return false
+        val exposureReset = historyInvalidation.reasons and
+            (D3D12RtHistory.InvalidationReason.GEOMETRY.mask or
+                D3D12RtHistory.InvalidationReason.MATERIAL.mask).inv() != 0
+        if (!D3D12RtExposure.render(encoder, frame.direct.handle(), frame.indirect.handle(),
+                frame.specular.handle(), frame.specularGrazing.handle(), exposureAlbedo.handle(),
+                exposureEmissive.handle(), exposureSpecular.handle(), frameCbv, frameCbvOffset,
+                camera.frameNanos, exposureReset)) return false
+        frameValid = true
+        val tier = "dxr"
         D3D12RtStats.setTier(tier)
-        D3D12RtStats.onTraceDispatched(traceWidth, traceHeight, mirror.recordCount)
+        D3D12RtStats.onTraceDispatched(traceWidth, traceHeight, activeMirror.recordCount)
+        D3D12RtStats.mark(encoder, D3D12RtStats.SLOT_TRACE)
+        if (plan.denoise) {
+            D3D12RtNrd.ensure(device, plan.renderWidth, plan.renderHeight)
+        }
         // 降噪轨：辐亮度先搬成 2D 纹理，再交给 NRD 逐帧派发（见 docs/rt/README.md §23.5）。
-        if (!denoiseFrame(encoder, frame, width, height, frameCbv, frameCbvOffset)) {
+        if (!denoiseFrame(encoder, frame, plan, frameCbv, frameCbvOffset)) {
             // 降噪没跑：这一段记 0，合光的耗时仍然从降噪那一点算起。
             D3D12RtStats.mark(encoder, D3D12RtStats.SLOT_DENOISE)
         }
-        D3D12RtStats.mark(encoder, D3D12RtStats.SLOT_TRACE)
+        val upscaleSucceeded = upscaleDenoisedFrame(encoder, plan, frameCbv, frameCbvOffset)
+        temporalResolveReady = upscaleSucceeded && denoisedRadiance != null && !denoisedIsReblur &&
+            traceWidth == plan.renderWidth && traceHeight == plan.renderHeight &&
+            (plan.track == RtDenoise.RR || plan.superResolution)
+        D3D12RtStats.mark(encoder, D3D12RtStats.SLOT_SR)
         val count = dispatches + 1
         dispatches = count
         // 真值表按显示分辨率算，表变了才打一行（见 docs/rt/README.md §18）。
-        D3D12RtPipelinePlan.note(D3D12RtPipelinePlan.configured(width, height))
+        D3D12RtPipelinePlan.note(plan)
         D3D12RtNrd.inspectOnce()
-        if (count == 1L) {
         lastTier = tier
-        lastDispatch = "tier=$tier accelView=$accelView records=${mirror.recordCount} " +
-            "trace=${traceWidth}x$traceHeight"
-        // 放在 lastDispatch 之后：这类报告的意义就是把「这一帧到底走了哪条路」带出去。
-        D3D12RtTrace.reportPending()
-        IllusionLogger.infoMessage("rt frame: dispatch ${traceWidth}x$traceHeight " +
-                "of ${width}x$height records=${mirror.recordCount} tier=$tier " +
+        lastDispatch = "tier=$tier records=${activeMirror.recordCount} " +
+            "inst=${D3D12RtBlas.instances()} trace=${traceWidth}x$traceHeight"
+        if (count == 1L) {
+            // 放在 lastDispatch 之后：这类报告的意义就是把「这一帧到底走了哪条路」带出去。
+            D3D12RtTrace.reportPending()
+        }
+        // 规模变了或间隔到了才报：高帧率下按帧报会把 INFO 刷成每帧一行。
+        // 设备移除时最后一条心跳就是卡住那一刻的规模（记录数、三角数、追踪尺寸）。
+        val now = System.nanoTime()
+        val scaleChanged = activeMirror.recordCount != heartbeatRecords || tier != heartbeatTier
+        val cooled = now - heartbeatNanos >= HEARTBEAT_MILLIS * 1_000_000L
+        if (count == 1L || cooled || (scaleChanged && now - heartbeatNanos >= 1_000_000_000L)) {
+            heartbeatNanos = now
+            heartbeatRecords = activeMirror.recordCount
+            heartbeatTier = tier
+            IllusionLogger.infoMessage("rt frame: dispatch ${traceWidth}x$traceHeight " +
+                "of ${width}x$height records=${activeMirror.recordCount} tier=$tier " +
+                "inst=${D3D12RtBlas.instances()} " +
+                "cam=${camera.position.x.toInt()},${camera.position.y.toInt()},${camera.position.z.toInt()} " +
                 "triangles=${D3D12RtGeometryPool.triangleCount()} radius=$TRACE_RADIUS")
         }
         return true
@@ -568,7 +672,6 @@ object D3D12RtFrame {
     /** 合光没跑成的原因各报一次：静默返回会让「光追看不见」没有任何线索。 */
     private val dispatchSkips = java.util.Collections.synchronizedSet(HashSet<String>())
 
-    /** 派发没跑起来时留一行（每种原因一次）：否则画面等于原版而日志无一字。 */
     /** 最近一次派发用的档位与实例数：自检报告里带出去，省得再跑一次看日志。 */
     private var lastDispatch = "none"
 
@@ -581,6 +684,8 @@ object D3D12RtFrame {
 
     private fun dispatchSkip(reason: String): Boolean {
         if (dispatchSkips.add(reason)) IllusionLogger.warnMessage("rt dispatch: skipped, $reason")
+        // 这一帧没有产出：合光必须停手，否则会把上一张旧图按 1:1 铺到主目标上。
+        frameValid = false
         return false
     }
 
@@ -593,22 +698,26 @@ object D3D12RtFrame {
         return null
     }
 
+    @JvmOverloads
     fun composite(
         encoder: D3D12CommandEncoderBackend?,
         albedo: D3D12GpuTexture?,
         emissive: D3D12GpuTexture?,
         source: D3D12GpuTexture?,
+        debugMode: Int = 0,
     ): D3D12GpuTexture? = synchronized(frameLock) {
         if (encoder == null) return compositeSkip("no encoder")
         if (albedo == null || emissive == null || source == null) return compositeSkip("missing inputs")
         val started = System.nanoTime()
         val device = encoder.device ?: return compositeSkip("no device")
         val frame = radiance ?: return compositeSkip("no radiance targets")
-        if (!frameValid) return compositeSkip("frame invalid")
-        // 输出与 G-Buffer 同尺寸：albedo/emissive 是逐像素读的，输出小了会把 albedo 抽稀。
-        val width = albedo.getWidth(0)
-        val height = albedo.getHeight(0)
-        if (width <= 0 || height <= 0) return compositeSkip("empty albedo")
+        // 这一帧没有派发产出就不能上屏：窗口改过尺寸时，旧图会被按 1:1 糊到左上角（象是裁剪+缩放）。
+        if (!frameValid) return compositeSkip("no dispatched frame")
+        // 输出域取**主目标尺寸**：主目标可能是窗口尺寸而 G-Buffer 是渲染尺寸，两者不同时
+        // 按 G-Buffer 出图再 1:1 blit 只会盖住左上角。取样比例由着色器按各自 GetDimensions 算。
+        val width = source.getWidth(0)
+        val height = source.getHeight(0)
+        if (width <= 0 || height <= 0) return compositeSkip("empty target")
         val pipeline = ensureCompositePipeline() ?: return compositeSkip("no pipeline")
         val target = ensureOutput(device, width, height) ?: return compositeSkip("no output target")
         encoder.ensureListOpen()
@@ -616,15 +725,27 @@ object D3D12RtFrame {
         val denoised = denoisedRadiance
         // 降噪没跑时第七槽留着不用（开关是 0），绑一张同尺寸的占位纹理免得堆里出现空描述符。
         val denoisedView = denoised ?: ensureFallback(device) ?: return compositeSkip("no denoised fallback")
+        val denoisedSpecularView = denoisedSpecular ?: denoisedView
+        val specularMaterial = D3D12RtGBuffer.texture(D3D12RtGBuffer.SPECULAR)
+            ?: return compositeSkip("no specular material")
+        val exposure = D3D12RtExposure.texture() ?: return compositeSkip("no exposure")
         val compositeSrvs = longArrayOf(
             albedo.handle(), frame.direct.handle(), emissive.handle(), frame.indirect.handle(),
             source.handle(), frame.aux.handle(),
             denoisedView.handle(),
+            frame.specular.handle(), frame.specularGrazing.handle(), specularMaterial.handle(),
+            denoisedSpecularView.handle(),
+            exposure.handle(),
         )
         val compositeUavs = longArrayOf(target.handle())
+        // 调试图档位读的是 **g_resolvePad.y**（合光里五个分支），塞进 .x 等于一档都不生效。
         val constants = intArrayOf(
-            if (denoised != null) 1 else 0,
-            D3D12RtNrdRadiance.DENOISING_RANGE.toRawBits(),
+            if (denoised == null) 0 else if (denoisedIsReblur) 2 else 1,
+            0,
+            0,
+            debugMode,
+            slConstants[68].toRawBits(),
+            slConstants[69].toRawBits(),
         )
         if (frameCbv == 0L) return compositeSkip("frame constants not bound")
         val ok = MCDR_ABI.D3D12DispatchComputeEx(
@@ -634,6 +755,11 @@ object D3D12RtFrame {
         if (!ok) {
             fail("composite failed: ${MCDR_ABI.D3D12LastError()}")
             return null
+        }
+        // 一次成功就能证明合光真的跑过：没有这行而画面仍是原版，问题就在上屏而不是合光。
+        if (compositeRan.compareAndSet(false, true)) {
+            val flag = if (denoised != null) 1 else 0
+            IllusionLogger.infoMessage("rt composite: ${width}x${height} mode=$debugMode denoise=$flag")
         }
         D3D12RtStats.mark(encoder, D3D12RtStats.SLOT_COMPOSITE)
         D3D12RtStats.onCpuEncode(System.nanoTime() - started)
@@ -650,13 +776,13 @@ object D3D12RtFrame {
         encoder: D3D12CommandEncoderBackend?,
         source: D3D12GpuTexture?,
         channel: Int,
+        width: Int,
+        height: Int,
     ): D3D12GpuTexture? = synchronized(frameLock) {
         // `channel` 0..3 = 取单个通道铺灰；4 = 法线档（0.5 + 0.5 * rgb），见 D3D12RtDebugShader。
         if (encoder == null || source == null || channel !in 0..4) return null
         val started = System.nanoTime()
         val device = encoder.device ?: return null
-        val width = source.getWidth(0)
-        val height = source.getHeight(0)
         if (width <= 0 || height <= 0) return null
         val pipeline = ensureDebugPipeline() ?: return null
         val target = ensureOutput(device, width, height) ?: return null
@@ -799,10 +925,7 @@ object D3D12RtFrame {
         output = created
         outputWidth = width
         outputHeight = height
-        // 分辨率一变，上一帧矩阵的宽高比就对不上了：旧矩阵当上一帧用会算出一帧乱飞的运动矢量。
-        previousValid = false
-        // DLSS-D 的选项按输出尺寸缓存，尺寸变了要允许它重新下发一次。
-        D3D12RtDlssd.reset()
+        current?.close()
         IllusionLogger.infoMessage("rt: hdr ${width}x$height")
         return created
     }
@@ -811,19 +934,26 @@ object D3D12RtFrame {
         val current = radiance
         if (current != null && current.width == width && current.height == height) return current
         val bytes = (width.toLong() * height * 16L).coerceAtLeast(MIN_BYTES)
+        val allocated = mutableListOf<D3D12GpuBuffer>()
+        fun allocate(name: String, planes: Long = 1L): D3D12GpuBuffer =
+            uav(device, name, bytes * planes).also { allocated += it }
         val created = try {
             Radiance(
                 width, height,
-                uav(device, "rt-direct", bytes),
-                uav(device, "rt-indirect", bytes),
-                uav(device, "rt-aux", bytes),
-                bytes * 3L,
+                allocate("rt-direct"),
+                allocate("rt-indirect"),
+                allocate("rt-aux", 5L),
+                allocate("rt-specular"),
+                allocate("rt-specular-grazing"),
+                bytes * 9L,
             )
         } catch (t: Throwable) {
+            allocated.forEach { it.close() }
             fail("radiance allocate failed: ${t.message}")
             return null
         }
         radiance = created
+        current?.close()
         return created
     }
 
@@ -833,32 +963,52 @@ object D3D12RtFrame {
 
     private fun mirrorsFor(device: D3D12Device, camera: Camera): Mirrors? {
         frameCounter++
-        val revisionKey = D3D12RtGeometryPool.revision() * 1_000_003L + D3D12RtMaterialTable.revision()
-        val current = mirrors
-        if (current != null && current.key == revisionKey) return current
+        val geometryEpoch = observeWorld(camera.worldIdentity)
+        val geometryRevision = D3D12RtGeometryPool.revision()
+        val materialRevision = D3D12RtMaterialTable.revision()
+        val revisionKey = geometryRevision * 1_000_003L + materialRevision
+        val current = mirrors?.takeIf {
+            it.worldIdentity === camera.worldIdentity && it.geometryEpoch == geometryEpoch
+        }
+        if (current == null && mirrors != null) {
+            discardMirrors()
+            geometryRetriggered = false
+        }
         val moved = abs(camera.position.x - mirrorX) + abs(camera.position.y - mirrorY) +
             abs(camera.position.z - mirrorZ) > MIRROR_SLACK
-        if (current != null && !moved && frameCounter - mirrorFrame < mirrorInterval) {
-            return current
-        }
-        mirrorFrame = frameCounter
+        if (current != null && current.key == revisionKey && !moved) return current
         // 只镜像相机附近的一小片：整池上传在世界加载时会每帧传几百 MB，直接把画面卡死。
         val slice = D3D12RtGeometryPool.mirrorNear(
             camera.position.x, camera.position.y, camera.position.z,
             TRACE_RADIUS + MIRROR_SLACK, MIRROR_RECORDS, MIRROR_BYTES,
-        ) ?: return current
+        ) ?: run {
+            discardMirrors()
+            return null
+        }
+        if (slice.geometryEpoch != geometryEpoch) return null
         mirrorX = camera.position.x
         mirrorY = camera.position.y
         mirrorZ = camera.position.z
+        if (current != null && current.geometrySnapshot === slice &&
+            current.materialRevision == materialRevision) {
+            current.key = revisionKey
+            return current
+        }
         val materials = D3D12RtMaterialTable.entryBytes()
-        if (materials.remaining() <= 0) return current
+        if (materials.remaining() <= 0) return null
         val key = revisionKey
         val startedAt = System.nanoTime()
         // 加速结构要用同一份记录的 CPU 字节，先留一份副本：upload() 会消费掉原缓冲的位置。
         val recordBytes = slice.records.duplicate().order(ByteOrder.LITTLE_ENDIAN)
         val created = try {
             Mirrors(
+                identity = ++nextMirrorIdentity,
+                geometrySnapshot = slice,
+                worldIdentity = camera.worldIdentity,
+                geometryEpoch = slice.geometryEpoch,
                 key = key,
+                geometryRevision = slice.geometryRevision,
+                materialRevision = materialRevision,
                 recordCount = slice.recordCount,
                 records = upload(device, "rt-records", slice.records),
                 recordBytes = recordBytes,
@@ -878,22 +1028,54 @@ object D3D12RtFrame {
         val elapsedNanos = System.nanoTime() - startedAt
         val previous = mirrors
         mirrors = created
-        previous?.close()
-        revDropped++
-        // 重建本身慢了就把间隔翻倍（世界加载时 CPU 已经很忙），快了再退回来，避免同一份开销每帧重演。
-        mirrorInterval = if (elapsedNanos > 8_000_000L) {
-            (mirrorInterval * 2).coerceAtMost(600)
-        } else if (elapsedNanos < 2_000_000L) {
-            (mirrorInterval / 2).coerceAtLeast(MIRROR_INTERVAL)
-        } else {
-            mirrorInterval
+        if (previous != null && previous !== publishedMirrors) {
+            previous.close()
         }
-        val line = "rt frame: mirror records=${slice.recordCount} triangles=${slice.triangles} " +
-            "v=${slice.vertices.remaining() shr 10}KB i=${slice.indices.remaining() shr 10}KB " +
-            "q=${slice.quads.remaining() shr 10}KB m=${materials.remaining()}B " +
-            "buildMs=${elapsedNanos / 1_000_000} interval=$mirrorInterval rebuilds=$revDropped"
+        revDropped++
+        val line = "RT mirror: ${slice.recordCount} records (${elapsedNanos / 1_000_000} ms)"
         if (revDropped == 1) IllusionLogger.infoMessage(line) else IllusionLogger.debugMessage(line)
         return created
+    }
+
+    private fun observeWorld(worldIdentity: Any?): Int = synchronized(frameLock) {
+        D3D12SectionGeometry.observeLevel(worldIdentity)
+        val epoch = D3D12SectionGeometry.epoch()
+        if (observedGeometryEpoch != epoch) {
+            observedGeometryEpoch = epoch
+            geometryRetriggered = false
+            starvedTicks = 0
+            starvedReported = false
+            frameValid = false
+            discardMirrors()
+            history.invalidate(D3D12RtHistory.InvalidationReason.WORLD)
+        }
+        epoch
+    }
+
+    private fun discardMirrors() {
+        temporalResolveReady = false
+        D3D12RtBlas.invalidateGeometry()
+        val current = mirrors
+        val published = publishedMirrors
+        mirrors = null
+        publishedMirrors = null
+        current?.close()
+        if (published != null && published !== current) {
+            published.close()
+        }
+        previousValid = false
+    }
+
+    private fun canUsePublishedMirror(current: Mirrors, device: D3D12Device, ctx: Long): Boolean {
+        val published = publishedMirrors ?: return false
+        if (published.worldIdentity !== current.worldIdentity ||
+            published.geometryEpoch != current.geometryEpoch ||
+            D3D12RtBlas.activeMirrorId() != published.identity
+        ) {
+            return false
+        }
+        val changed = D3D12RtGeometryPool.changedSections(published.recordBytes, current.recordBytes)
+        return D3D12RtBlas.filterPublished(device, ctx, published.recordBytes, published.recordCount, changed)
     }
 
     private fun upload(device: D3D12Device, label: String, data: ByteBuffer): D3D12GpuBuffer {
@@ -936,57 +1118,88 @@ object D3D12RtFrame {
     private fun denoiseFrame(
         encoder: D3D12CommandEncoderBackend,
         frame: Radiance,
-        width: Int,
-        height: Int,
+        plan: D3D12RtPipelinePlan.Plan,
         cbv: Long,
         cbvOffset: Long,
     ): Boolean {
         denoisedRadiance = null
-        if (D3D12Settings.rtDenoise == RtDenoise.OFF) {
+        denoisedSpecular = null
+        denoisedIsReblur = false
+        if (!plan.denoise) {
             return false
         }
-        val motion = D3D12RtMotion.texture()
-        val normalRoughness = D3D12RtNrdPack.normalRoughnessTexture()
-        val viewZ = D3D12RtNrdPack.viewZTexture()
-        if (motion == null || normalRoughness == null || viewZ == null) {
-            return false
+        val width = plan.renderWidth
+        val height = plan.renderHeight
+        val albedo = D3D12RtGBuffer.texture(D3D12RtGBuffer.ALBEDO) ?: return evaluationFailure()
+        val emissive = D3D12RtGBuffer.texture(D3D12RtGBuffer.EMISSIVE) ?: return evaluationFailure()
+        val specularMaterial = D3D12RtGBuffer.texture(D3D12RtGBuffer.SPECULAR) ?: return evaluationFailure()
+        val rawNormalRoughness = D3D12RtGBuffer.texture(D3D12RtGBuffer.NORMAL_ROUGHNESS) ?: return evaluationFailure()
+        val sourceDepth = D3D12RtGBuffer.texture(D3D12RtGBuffer.LINEAR_DEPTH) ?: return evaluationFailure()
+        val motion = D3D12RtMotion.render(
+            encoder, sourceDepth, cbv, cbvOffset,
+            slConstants[68] - slConstants[70], slConstants[69] - slConstants[71],
+        ) ?: run {
+            return evaluationFailure()
         }
+        if (!D3D12RtNrdPack.render(encoder, rawNormalRoughness, sourceDepth, cbv, cbvOffset)) {
+            return evaluationFailure()
+        }
+        val normalRoughness = D3D12RtNrdPack.normalRoughnessTexture() ?: return evaluationFailure()
+        val viewZ = D3D12RtNrdPack.viewZTexture() ?: return evaluationFailure()
+        D3D12RtGuide.noteOnce()
         if (!D3D12RtNrdRadiance.render(
                 encoder, frame.direct.handle(), frame.indirect.handle(), frame.aux.handle(),
+                frame.specular.handle(), frame.specularGrazing.handle(),
+                viewZ.handle(), albedo.handle(), emissive.handle(), specularMaterial.handle(), rawNormalRoughness.handle(),
+                plan.track != RtDenoise.RR,
                 width, height, cbv, cbvOffset)) {
-            return false
+            return evaluationFailure()
         }
-        val signature = D3D12Settings.rtDenoise.ordinal.toLong() * 1_000_000_000L +
-            width.toLong() * 10_000L + height
-        val resetHistory = signature != denoiseSignature || frameCounter < 3L
-        denoiseSignature = signature
-        val radianceIn = D3D12RtNrdRadiance.radianceTexture() ?: return false
-        val radianceOut = D3D12RtNrdRadiance.outputTexture() ?: return false
-        if (D3D12Settings.rtDenoise == RtDenoise.RR) {
-            val depth = D3D12RtGBuffer.depthTexture()
-            if (depth != null) {
+        val radianceIn = D3D12RtNrdRadiance.radianceTexture() ?: return evaluationFailure()
+        val radianceOut = D3D12RtNrdRadiance.outputTexture() ?: return evaluationFailure()
+        val specularIn = D3D12RtNrdRadiance.specularTexture() ?: return evaluationFailure()
+        val specularOut = D3D12RtNrdRadiance.specularOutputTexture() ?: return evaluationFailure()
+        if (plan.track == RtDenoise.RR) {
+            val normal = D3D12RtGBuffer.texture(D3D12RtGBuffer.NORMAL_ROUGHNESS)
+            val specular = D3D12RtGBuffer.texture(D3D12RtGBuffer.SPECULAR)
+            val specularHitDistance = D3D12RtNrdRadiance.specularHitDistanceTexture()
+            val rrOutput = encoder.device?.let {
+                D3D12RtNrdRadiance.rrOutputTexture(it, plan.displayWidth, plan.displayHeight)
+            }
+            if (normal != null && specular != null && specularHitDistance != null && rrOutput != null) {
                 val accepted = D3D12RtDlssd.evaluate(
                     encoder.nativeHandle(),
                     radianceIn.handle(),
-                    radianceOut.handle(),
-                    depth.handle(),
+                    rrOutput.handle(),
+                    viewZ.handle(),
                     motion.handle(),
-                    normalRoughness.handle(),
+                    normal.handle(),
+                    albedo.handle(),
+                    specular.handle(),
+                    specularHitDistance.handle(),
                     width,
                     height,
-                    width,
-                    height,
+                    plan.displayWidth,
+                    plan.displayHeight,
                     slConstants,
-                    resetHistory,
+                    rrHistory.requiresReset(historyInvalidation),
+                    D3D12RtExposure.texture()?.handle() ?: return evaluationFailure(),
                 )
                 if (accepted > 0) {
+                    rrHistory.accept(historyInvalidation)
                     D3D12RtStats.onDispatches(accepted)
                     D3D12RtStats.mark(encoder, D3D12RtStats.SLOT_DENOISE)
-                    denoisedRadiance = radianceOut
+                    denoisedRadiance = rrOutput
                     return true
                 }
             }
-            // RR 不可用时整链退回 NRD：宁可降噪档位不符，也不要画面突然回到未降噪。
+            if (!D3D12RtNrdRadiance.render(
+                    encoder, frame.direct.handle(), frame.indirect.handle(), frame.aux.handle(),
+                    frame.specular.handle(), frame.specularGrazing.handle(),
+                    viewZ.handle(), albedo.handle(), emissive.handle(), specularMaterial.handle(), rawNormalRoughness.handle(),
+                    true, width, height, cbv, cbvOffset)) {
+                return evaluationFailure()
+            }
         }
         val ok = Arena.ofConfined().use { arena ->
             val segment = arena.allocate(256L, 16L)
@@ -1000,18 +1213,63 @@ object D3D12RtFrame {
                 viewZ.handle(),
                 radianceIn.handle(),
                 radianceOut.handle(),
+                specularIn.handle(),
+                specularOut.handle(),
                 segment,
+                floatArrayOf(-slConstants[68], -slConstants[69], -slConstants[70], -slConstants[71]),
                 frameCounter.toInt(),
-                resetHistory,
+                nrdHistory.requiresReset(historyInvalidation),
             )
         }
         if (ok <= 0) {
-            return false
+            return evaluationFailure()
         }
+        nrdHistory.accept(historyInvalidation)
         D3D12RtStats.onDispatches(ok)
         D3D12RtStats.mark(encoder, D3D12RtStats.SLOT_DENOISE)
         denoisedRadiance = radianceOut
+        denoisedSpecular = specularOut
+        denoisedIsReblur = true
         return true
+    }
+
+    private fun evaluationFailure(): Boolean {
+        denoisedRadiance = null
+        denoisedSpecular = null
+        denoisedIsReblur = false
+        history.invalidate(D3D12RtHistory.InvalidationReason.EVALUATION_FAILURE)
+        return false
+    }
+
+    private fun upscaleDenoisedFrame(
+        encoder: D3D12CommandEncoderBackend,
+        plan: D3D12RtPipelinePlan.Plan,
+        cbv: Long,
+        cbvOffset: Long,
+    ): Boolean {
+        if (!plan.superResolution || !denoisedIsReblur) return true
+        val denoised = denoisedRadiance ?: return superResolutionFailure()
+        val specular = denoisedSpecular ?: return superResolutionFailure()
+        val albedo = D3D12RtGBuffer.texture(D3D12RtGBuffer.ALBEDO) ?: return superResolutionFailure()
+        val specularMaterial = D3D12RtGBuffer.texture(D3D12RtGBuffer.SPECULAR) ?: return superResolutionFailure()
+        val emissive = D3D12RtGBuffer.texture(D3D12RtGBuffer.EMISSIVE) ?: return superResolutionFailure()
+        val depth = D3D12RtNrdPack.viewZTexture() ?: return superResolutionFailure()
+        val motion = D3D12RtMotion.texture() ?: return superResolutionFailure()
+        val reconstructed = D3D12RtSuperResolution.reconstruct(
+            encoder, denoised, specular, albedo, specularMaterial, emissive, depth, motion, plan, slConstants, cbv, cbvOffset,
+            srHistory.requiresReset(historyInvalidation),
+            D3D12RtExposure.texture()?.handle() ?: return superResolutionFailure(),
+        ) ?: return superResolutionFailure()
+        srHistory.accept(historyInvalidation)
+        denoisedRadiance = reconstructed
+        denoisedSpecular = null
+        denoisedIsReblur = false
+        return true
+    }
+
+    private fun superResolutionFailure(): Boolean {
+        history.invalidate(D3D12RtHistory.InvalidationReason.EVALUATION_FAILURE)
+        return false
     }
 
     private fun writeScene(
@@ -1021,6 +1279,7 @@ object D3D12RtFrame {
         traceHeight: Int,
         recordCount: Int,
     ): Boolean {
+        val jitter = D3D12Temporal.frameJitter(camera.frameNanos)
         val index = (sceneIndex + 1) % SCENE_RING
         sceneIndex = index
         val offset = (index * FRAME_SLOT_BYTES).toLong()
@@ -1048,6 +1307,13 @@ object D3D12RtFrame {
                     outViewProjection = previousViewProjection,
                     outNrdMatrices = nrdMatrices,
                     outSlConstants = slConstants,
+                    viewMatrix = camera.transform.view,
+                    projectionMatrix = camera.transform.projection,
+                    farPlane = camera.farPlane,
+                    jitterX = jitter.x.toFloat(),
+                    jitterY = jitter.y.toFloat(),
+                    previousJitterX = if (previousValid) previousJitter[0] else jitter.x.toFloat(),
+                    previousJitterY = if (previousValid) previousJitter[1] else jitter.y.toFloat(),
                 )
                 true
             }
@@ -1058,6 +1324,8 @@ object D3D12RtFrame {
         if (!painted) return false
         // 下一帧的「上一帧视图矩阵」就是这一帧写的那个（nrdMatrices 的第三块）。
         nrdMatrices.copyInto(previousView, 0, 32, 48)
+        previousJitter[0] = jitter.x.toFloat()
+        previousJitter[1] = jitter.y.toFloat()
         previousValid = true
         // 同一帧的三次派发（追踪/合光/调试）共用这一份常量。
         frameCbv = target.buffer.handle()
@@ -1083,57 +1351,6 @@ object D3D12RtFrame {
         }
     }
 
-    /**
-     * 太阳方向取自原版的 `EnvironmentAttributes.SUN_ANGLE`，按原版 `SkyRenderer` 的 `rotate(YP,-90) → rotate(XP,angle)`。
-     * 见 docs/rt/README.md
-     */
-    private fun sunDirection(camera: net.minecraft.client.Camera): RtVec3 {
-        val degrees = try {
-            camera.attributeProbe().getValue(EnvironmentAttributes.SUN_ANGLE, 0f)
-        } catch (_: Throwable) {
-            return SUN_DIR
-        }
-        // S2 占位：仰角固定 59°（与原版亮度观感一致），只有东西方向跟原版太阳走 ——。
-        // 真按太阳仰角算直射的话，黄昏时整片光追区域会比原版暗一截，半径边缘出现一圈可见边界。
-        // 见 docs/rt/README.md
-        val angle = degrees * PI / 180.0
-        val east = -sin(angle) >= 0.0
-        val horizontal = cos(S2_SUN_ELEVATION).toFloat()
-        val vertical = sin(S2_SUN_ELEVATION).toFloat()
-        val direction = RtVec3(if (east) horizontal else -horizontal, vertical, 0f)
-        if (!sunLogged) {
-            sunLogged = true
-            IllusionLogger.infoMessage(
-                "rt sun: angle=" + degrees + " deg east=" + east + " dir=(" + direction.x + ", " + direction.y + ")"
-            )
-        }
-        return direction
-    }
-
-    /**
-     * 让辐亮度高度落在「目标高度」附近；窗口越大除数越大，单帧耗时基本恒定。
-     *
-     * 目标高度受 `[raytracing] renderScale` 缩放：100 就是 `TRACE_TARGET_HEIGHT`，25 时降到四分之一。
-     * 光追没开（`RtDenoise.OFF`）时忽略倍率，与 `D3D12RtPipelinePlan` 的真值表一致（§18）。
-     */
-    private fun traceDivisor(height: Int): Int {
-        val percent =
-            if (D3D12Settings.rtDenoise == RtDenoise.OFF) 100 else D3D12Settings.rtRenderScale
-        val target = (TRACE_TARGET_HEIGHT * percent.coerceIn(25, 100) / 100)
-            .coerceAtLeast(TRACE_MIN_SCALED_HEIGHT)
-        return ((height + target - 1) / target).coerceAtLeast(TRACE_MIN_DIVISOR)
-    }
-
-    private fun axis(rotation: Quaternionfc, x: Float, y: Float, z: Float): RtVec3 {
-        val vector = rotation.transform(Vector3f(x, y, z))
-        return RtVec3(vector.x, vector.y, vector.z)
-    }
-
-    /**
-     * 太阳方向 / 颜色是 S2 的占位常量：S5 的天空模型接上后再换成逐帧计算。
-     * 见 docs/rt/README.md
-     */
-    private val SUN_DIR = D3D12RtLightContract.normalize(RtVec3(0.35f, 0.86f, 0.37f))
     private val SUN_COLOR = RtVec3(1f, 0.96f, 0.9f)
 
     /** 太阳辐亮度强度（进 `g_sunRadiance.w`）：与天空走同一套 HDR 出口，1.0 时接近原版观感。 */

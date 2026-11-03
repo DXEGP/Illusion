@@ -1,10 +1,12 @@
 package dev.nts.expdxr.dxrmc.rt
 
 import dev.nts.expdxr.d3d12.extern.MCDR_ABI
+import dev.nts.expdxr.d3d12.extern.MCDRLayout
 import dev.nts.expdxr.d3d12.render.adapter.D3D12Device
 import dev.nts.expdxr.misc.IllusionLogger
 import java.lang.foreign.Arena
 import java.lang.foreign.MemorySegment
+import java.lang.foreign.ValueLayout
 
 /**
  * NRD 后端（S4 4-c）。第一步只读库自己算出来的实例清单：pipeline 数、常量缓冲上限、纹理池尺寸与
@@ -18,6 +20,7 @@ internal object D3D12RtNrd {
 
     /** 上一次建上下文的设备与尺寸；三者任一变化都要重建（纹理池按屏幕尺寸开）。 */
     private var reported = false
+    private var failed = false
 
     /** 上下文是否就绪：`ensure` 建成功后为 true，`shutdown` 清掉。 */
     private var ready = false
@@ -61,6 +64,7 @@ internal object D3D12RtNrd {
         }
         ready = result > 0
         reported = false
+        failed = false
         val lines = text.lines().filter { it.isNotBlank() }
         for (line in lines) {
             if (result > 0) IllusionLogger.infoMessage(line) else IllusionLogger.warnMessage(line)
@@ -74,14 +78,12 @@ internal object D3D12RtNrd {
         }
     }
 
-    /**
-     * 逐帧降噪派发（S4 4-c）。五张纹理按 `motion / normal-roughness / viewZ / radiance-in /
-     * radiance-out` 的顺序传，`matrices` 是四个列主序 4x4（当前视投影、上一帧视投影、
-     * 当前世界到视图、上一帧世界到视图），共 256 字节。
-     *
-     * 前置条件：五张纹理都带 `USAGE_STORAGE` 且与屏幕同尺寸；调用方已经写好 motion 与
-     * 两张 NRD 引导（`D3D12RtMotion` / `D3D12RtNrdPack`）。返回派发的 pass 数，0 = 没有上下文。
-     */
+    fun reset() {
+        if (ready) return
+        lastWidth = 0
+        lastHeight = 0
+    }
+
     fun denoise(
         encoder: Long,
         motion: Long,
@@ -89,25 +91,34 @@ internal object D3D12RtNrd {
         viewZ: Long,
         radianceIn: Long,
         radianceOut: Long,
+        specularIn: Long,
+        specularOut: Long,
         matrices: MemorySegment,
+        jitter: FloatArray,
         frameIndex: Int,
         resetHistory: Boolean,
     ): Int {
         if (!ready) {
             return 0
         }
-        val textures = longArrayOf(motion, normalRoughness, viewZ, radianceIn, radianceOut)
+        val textures = longArrayOf(motion, normalRoughness, viewZ, radianceIn, radianceOut, specularIn, specularOut)
         var result = 0
         var text = ""
         Arena.ofConfined().use { arena ->
             val buffer = arena.allocate(TEXT_CAPACITY.toLong())
+            val offsets = arena.allocate(MCDRLayout.NRD_JITTER_FLOAT_COUNT.toLong() * Float.SIZE_BYTES, 4L)
+            require(jitter.size == MCDRLayout.NRD_JITTER_FLOAT_COUNT)
+            for (index in jitter.indices) {
+                offsets.setAtIndex(ValueLayout.JAVA_FLOAT, index.toLong(), jitter[index])
+            }
             result =
-                MCDR_ABI.D3D12NrdDenoise(
+                MCDR_ABI.D3D12NrdDenoiseTemporal(
                     encoder,
                     textures,
                     matrices,
+                    offsets,
                     frameIndex,
-            resetHistory,
+                    resetHistory,
                     buffer,
                     TEXT_CAPACITY,
                 )
@@ -115,21 +126,32 @@ internal object D3D12RtNrd {
         }
         if (result <= 0) {
             failOnce(result, text)
-        } else if (!reported) {
+        } else if (!reported || failed) {
             reported = true
-            IllusionLogger.infoMessage(text.lines().first { it.isNotBlank() })
+            failed = false
+            // 成功也报一次：`nrd: dispatch passes=<n> missing=<m>` 是「降噪真的派发了」的唯一证据。
+            val lines = text.lines().filter { it.isNotBlank() }
+            IllusionLogger.infoMessage(lines.lastOrNull { it.startsWith("nrd: dispatch") } ?: "nrd: dispatch ok")
+            for (line in lines) {
+                if (line.startsWith("nrd: dispatch")) {
+                    continue
+                }
+                // 首帧的逐 pass 表只在会话开始时报一次：线程组尺寸与管线号是排查「派发后挂死」的唯一线索。
+                IllusionLogger.debugMessage(line)
+            }
         }
         return result
     }
 
     /** 失败只说一次：每帧刷屏没有意义，原因见 docs/rt/README.md §23.2。 */
     private fun failOnce(result: Int, text: String) {
-        if (reported) {
+        if (failed) {
             return
         }
         reported = true
-        val reason = text.lines().firstOrNull { it.isNotBlank() } ?: "no context"
-        IllusionLogger.warnMessage("nrd: denoise unavailable ($result), $reason")
+        failed = true
+        val reason = text.lines().firstOrNull { it.isNotBlank() } ?: "nrd: dispatch failed ($result)"
+        IllusionLogger.warnMessage(reason)
     }
 
     /** 设备销毁前调一次，避免 NRD 的实例和描述符堆跟着设备泄漏。 */
@@ -142,6 +164,7 @@ internal object D3D12RtNrd {
         lastHeight = 0
         ready = false
         reported = false
+        failed = false
         MCDR_ABI.D3D12NrdShutdown()
     }
 

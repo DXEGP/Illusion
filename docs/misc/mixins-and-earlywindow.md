@@ -19,6 +19,9 @@ mixin 处理的是接口拿到**之前**、以及接口给不了的东西：
 - 原版在调用接口前自己做的决定：渲染目标分配多大、这一帧的主目标是谁、某个 pass 排在哪两条语句之间。
 - 只存在于原版方法局部变量里的值（`GuiRenderer#draw` 开头取一次主目标就再没用过）。
 - 静态上下文里没人递给你的对象（`GameRenderer#preloadUiShader` 里的 `ResourceManager`）。
+- `ScreenshotMixin` 包装 `Screenshot.lambda$takeScreenshot$1` 的两处 `NativeImage.setPixelABGR`，
+  对 D3D12 纹理将写入行改成 `image.height - 1 - row`，取消原版固定的垂直翻转。
+  两处分别覆盖原尺寸与缩小截图，其他后端保持原行序；GPU 完成等待由编码器负责。
 - 私有类型（`ShaderManager$PendingResults` 是私有 record，写不进方法描述符，只能包它的构造）。
 
 体量：`Illusion\src\main\java\dev\nts\expdxr\mixin\` 下 **44 个文件、1947 行**。按注解行统计为
@@ -158,18 +161,21 @@ D3D12 时**保留**，因为游戏每个后端尝试都会建一次窗口，我�
 
 | Mixin | 目标（类#方法） | 注入点 | 目的 |
 | --- | --- | --- | --- |
-| `render\GameRendererSmaaWorldMixin` | `GameRenderer#render` | ① `@Inject` INVOKE `GuiRenderer#render()V` ② `@Inject` INVOKE `CommandEncoder#clearDepthTexture(GpuTexture,D)` shift=BEFORE | ① 世界画完、GUI 未画之间依次 `D3D12TAA` → `D3D12SMAAWorld` → `SuperResolution` → DLSS 提交记账 → `D3D12GUISplit.prepareForGui` ② 清深度前只做 DLSS 的每帧记账 |
+| `render\GameRendererSmaaWorldMixin` | `GameRenderer#render` | ① `@Inject` INVOKE `GuiRenderer#render()V` ② `@Inject` HEAD | ① 世界画完、GUI 未画之间依次 `D3D12TAA` → `D3D12SMAAWorld` → `SuperResolution` → DLSS 提交记账 → `D3D12GUISplit.prepareForGui` ② DLSS 后端的帧起点使旧深度快照失效，再协调抗锯齿状态 |
 | `render\LevelRendererMainPassDepthMixin` | `LevelRenderer#lambda$addMainPass$0` | `@Inject` RETURN, remap=false | 采时域数据、录速度 pass、深度快照、OIT 透射率（唯一无条件入帧图的 pass，且在任何清深度之前） |
 | `render\ChunkSectionsToRenderSamplerMixin` | `ChunkSectionsToRender#renderGroup` / `#renderOit` | `@ModifyVariable`（HEAD, argsOnly）×2 | 只给地形专用 sampler 加超分 mip bias，不污染共享 sampler 缓存 |
 | `render\GameRendererTransparencyMixin` | `GameRenderer#useImprovedTransparency` | `@Inject` HEAD, cancellable | mesh 地形强制返回 `true`：mesh 路径的线程组顺序不保证，只能走顺序无关的 Wavelet OIT |
-| `render\SectionUploadCaptureMixin` | `SectionRenderDispatcher$RenderSection#addSectionBuffersToUberBuffer` | `@Inject` HEAD | 记下每段每层的 indexCount 与缓冲尺寸，供 meshlet 几何构建 |
+| `render\SectionUploadCaptureMixin` | `RenderSection#addSectionBuffersToUberBuffer` / `#setSectionMesh` / `#releaseSectionMesh` / `#reset` | HEAD / RETURN / HEAD / HEAD | 暂存层字节；与原版网格一起提交完整层集合；清理取消上传、空段和卸载，供 meshlet 与 RT 使用 |
 | `render\DynamicGpuDataCaptureMixin` | `DynamicGpuData#writeChunkSectionCommands`（HEAD/RETURN）、`#writeChunkSectionsInstanced`（HEAD） | `@Inject` ×3 | 抓 `drawIndexedIndirect` 的参数缓冲，mesh 路径按同一份参数重放 |
 
 深度唯一有效的采集点是 `LevelRenderer#lambda$addMainPass$0` 的 RETURN：帧图 main pass 是唯一无条件进入帧图的 pass，
 深度在那一刻有效、且在全部 `clearDepthTexture` 之前。**不要改挂 `GameRenderer.render`**（那时深度已清过三次，采样全为
 `mean=0.0`），也不要挂 `always_on_top` pass（`hasAnyAlwaysOnTop()` 为假时根本不跑）。
+帧起点与深度采集分开：`pclFrameBegin()` 挂在 `GameRenderer.render` HEAD，必须早于 main pass RETURN 的快照捕获；后续清深度不得再次使本帧快照失效。
 `SectionUploadCaptureMixin` 必须挂 `addSectionBuffersToUberBuffer`，不要改挂 `SectionCompiler.compile`：后者能成功应用，
 但回调一次也不触发。
+上传 HEAD 仅复制 CPU 字节，发布在 `setSectionMesh` RETURN；仅监听非空层上传会漏掉整段清空与层消失。
+reset 在原版替换 section 坐标前移除旧记录；初建的 `UNCOMPILED` 哨兵不移除记录，避免误删坐标零处的其它段。
 
 ### 3.7 视频设置与选项（10）
 
@@ -241,17 +247,18 @@ javac 给枚举隐式加了 `name` / `ordinal`，少写就 `NoSuchMethodExceptio
 | --- | --- | --- | --- |
 | 1 | `Minecraft#renderFrame` HEAD | 开 `FRAME` 段、`frameStart`、强制开启改进透明 | `D3D12RenderProf` |
 | 2 | `GameRenderer#extract` | 开 `EXTRACT` 段 | 同上 |
-| 3 | `FrameGraphBuilder#execute` HEAD | `D3D12ShadingRateImage.prepareFrame()` + 开 `EXECUTE_FRAMEGRAPH` | VRS |
+| 3 | `GameRenderer#render` HEAD | DLSS 帧起点使旧快照失效，再协调抗锯齿状态 | DLSS / Reflex |
 | 4 | `LevelRenderer#render` | 辅助目标改用 `worldLayerSize`；三段计时 | 渲染比例 / 计时 |
-| 5 | `LevelRenderer#lambda$addMainPass$0` RETURN | TAA 时域数据、速度 pass、深度快照、OIT 透射率 | TAA / DLSS / 超分掩码 |
+| 5 | `FrameGraphBuilder#execute` HEAD | `D3D12ShadingRateImage.prepareFrame()` + 开 `EXECUTE_FRAMEGRAPH` | VRS |
 | 6 | `ChunkSectionsToRender#renderGroup` | 地形 sampler 加 mip bias、`RENDER_GROUP` 段 | 超分 / 计时 |
-| 7 | `GameRenderer#render` INVOKE `GuiRenderer#render` | TAA → SMAA → SR → DLSS 提交记账 → `prepareForGui` | 后处理链 / 帧生成 |
-| 8 | `GuiRenderer#draw` / `CubeMap#render` | 换到 GUI 目标 | GUI 拆分 |
-| 9 | `GameRenderer#processBlurEffect` | 背景模糊换到 GUI 目标 | GUI 拆分 |
-| 10 | `GuiRenderer#render` | 开 `GUI` 段 | 计时 |
-| 11 | `Minecraft#close` HEAD | 接管来的 SDL 窗口刷黑 | 退出闪屏 |
+| 7 | `LevelRenderer#lambda$addMainPass$0` RETURN | TAA 时域数据、速度 pass、深度快照、OIT 透射率 | TAA / DLSS / 超分掩码 |
+| 8 | `GameRenderer#render` INVOKE `GuiRenderer#render` | TAA → SMAA → SR → DLSS 提交记账 → `prepareForGui` | 后处理链 / 帧生成 |
+| 9 | `GuiRenderer#draw` / `CubeMap#render` | 换到 GUI 目标 | GUI 拆分 |
+| 10 | `GameRenderer#processBlurEffect` | 背景模糊换到 GUI 目标 | GUI 拆分 |
+| 11 | `GuiRenderer#render` | 开 `GUI` 段 | 计时 |
+| 12 | `Minecraft#close` HEAD | 接管来的 SDL 窗口刷黑 | 退出闪屏 |
 
-第 7 步的顺序是硬约束，为什么必须是这个顺序、以及 SMAA 与 DLSS 为什么各判各的开关，写在抗锯齿与超分两篇文档里；
+第 8 步的顺序是硬约束，为什么必须是这个顺序、以及 SMAA 与 DLSS 为什么各判各的开关，写在抗锯齿与超分两篇文档里；
 这里只记一个事实：**它是全帧唯一一个「世界已画完、GUI 还没画」的可注入时刻。**
 
 ## 5. 早期窗口（early window）

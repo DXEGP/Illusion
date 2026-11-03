@@ -6,6 +6,13 @@
 这份文档讲三个问题：这套抽象的结构、每帧的数据怎么流动、以及**改动时不能破坏的约束**。
 DLSS 的专项细节（NGX 初始化、preset、输出纹理契约）见 [`dlss.md`](dlss.md)。
 
+启用光追时，本目录的光栅 SR 求值与 DLSS guide 捕获提前返回。光追倍率由
+`[raytracing] renderScale` 控制；主目标与世界层附件保持窗口尺寸，视频界面保存的光栅比例或 SR 质量档不会再次缩小主目标。
+`NRD_SR` 在低于 100% 时使用所选 provider 重建窗口尺寸；DLSS 使用独立 Streamline viewport 2，
+XeSS/FSR 使用通用 SR 入口，RR 使用 viewport 1。质量档按实际输入/输出尺寸查询。
+输入颜色、设备深度与失败回退见 [光追的 NRD 后独立 SR](../rt/README.md#264-nrd-后独立-sr)。
+NRD 后独立 SR 在重调制前为两路光照重新加入当前子像素偏移，材质与设备深度保持当前 G-Buffer 采样位置。
+
 > 建议阅读顺序：第 1～2 节建立概念，第 3 节看一帧的时序，第 4～6 节按你关心的后端或掩码继续，
 > 第 7～8 节是动手前的交互关系与硬约束。
 
@@ -254,7 +261,7 @@ DLSS 的选择器只有前 4 档，DLAA 由抗锯齿选项驱动（见 4.6）。
 | `sharpness` | 滑条 0..100 ÷ 100 |
 | `reset` | `frameKey` 变化（后端/尺寸/比例）时置位 |
 | `hdrInput` | **固定 0**：本工程把超分输入一律当 SDR 处理，是否设置 FSR 的高动态范围标志由 native 决定 |
-| `flags` | 0 |
+| `flags` | 光栅为 0（MV 含 jitter）；RT XeSS/FSR 为 `MCDR_SR_FLAG_UNJITTERED_MV`（1），见 [RT 独立 SR](../rt/README.md#264-nrd-后独立-sr) |
 | `pColorInput` / `pDepth` / `pMotionVectors` | 主目标颜色、主目标深度、速度 pass 本帧的句柄 |
 | `pColorOutput` | 必须是带 `USAGE_STORAGE` 的纹理（见 5.3） |
 | `pReactiveMask` | `D3D12SrMask.produce(...)` 的返回值，0 表示「没有掩码」 |
