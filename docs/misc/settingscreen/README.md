@@ -58,7 +58,7 @@ options.txt + native（专用 ABI 函数）
 | `[renderer]` | `…renderer` | GL 上下文逃生口、异步录制、命令 bundle、HDR、交换链、锐化 | 混合：多数要重启 |
 | `[dlss]` | `…dlss` | DLSS 实现、输出交接、Reflex 限帧、帧生成 | 实现选择要重启 |
 | `[sr]` | `…sr` | 超分后端（NONE/DLSS/FSR/XeSS）、锐度、响应遮罩 | 下一帧 |
-| `[raytracing]` | `…raytracing` | 光追可见性分层 | 下一帧 |
+| `[rt]` | `…rt` | 光追可见性分层 | 下一帧 |
 | `[shaderpack]` | `…shaderpack` | 启用的光影包（空串＝无光影） | 下次打开光追 |
 | `[mesh]` | `…mesh` | mesh 地形与 amplification 剔除 | 代码中未明确 |
 | `[vrs]` | `…vrs` | 逐图元距离带、着色率图像参数 | 每个地形批次 |
@@ -242,7 +242,7 @@ glContext = config(false) { IllusionConfig.GL_CONTEXT.get() } ||
 | `[renderer] sharpenAmount`、`taaSharpenAmount` | 下一帧的后处理参数 |
 | `[dlss] frameGeneration`、`frameGenerationFrames`、`reflexFrameLimitUs` | 立即推给 native，下一帧 |
 | `[sr] backend`、`sharpness`、`mask` | 下一帧；切后端会等 GPU 一次 |
-| `[raytracing] mode` | 下一帧 |
+| `[rt] mode` | 下一帧 |
 | `[vrs] *` | 每个地形批次重读 |
 | `[debug] profiling`、`dumpHlsl`、`skipGlSwap`、`temporalChain`、`temporalJitter`、`noCrashPopup` | 下一个使用点 |
 | `[debug] pixTimingCapture`、`pixCaptureFrames` | 按下捕获热键那一刻 |
@@ -486,7 +486,7 @@ D3D12VideoSettingsPage(
 行为规则：
 
 - 「无光影」永远是第 0 行，其余是 `D3D12ShaderPacks.all()` 的顺序（内置在前、用户包在后）。
-- 选中只是改 `selection`；**应用**才写配置（`D3D12ShaderPacks.apply`），并把 `[raytracing] backend`
+- 选中只是改 `selection`；**应用**才写配置（`D3D12ShaderPacks.apply`），并把 `[rt] backend`
   一起改掉。「取消」把选择回退到已应用的那一行；「完成」先应用、成功才关界面（应用失败时留在
   这一屏并显示原因，否则玩家点完不知道到底改没改）。
 - 不可用的包（缺入口着色器）在说明面板里列出缺哪个文件，点「应用」只出一条提示、不写配置。
@@ -616,7 +616,7 @@ false 都会在下一帧被拉回），不是只在首帧设一次——只设�
 
 ## 9. 文件导航
 
-路径相对 `Illusion\src\main\kotlin\dev\nts\expdxr\`；最后一列标注不在该根下的真实位置。
+路径相对 `Illusion\src\main\kotlin\io\github\dxegp\`；最后一列标注不在该根下的真实位置。
 
 | 文件 | 一句话职责 |
 | --- | --- |
@@ -628,14 +628,14 @@ false 都会在下一帧被拉回），不是只在首帧设一次——只设�
 | `misc\gui\D3D12VideoSettingsScreen.kt` | 视频设置屏幕：布局、页签、滚动、绘制、输入、应用/撤销 |
 | `misc\gui\D3D12VideoSettingsContent.kt` | 四个页面的内容、条目类型、灰化联动与取值过滤 |
 | `misc\gui\D3D12ShaderPackScreen.kt` | 光影包子页面：包列表、说明面板、应用/取消/完成（见 §6.10） |
-| `dxrmc\rt\D3D12ShaderPacks.kt` | 光影包的发现、元数据与 `[shaderpack] active` 的读写入点 |
+| `dxrmc\raytracing\D3D12ShaderPacks.kt` | 光影包的发现、元数据与 `[shaderpack] active` 的读写入点 |
 | `misc\gui\D3D12ShaderPackConfigScreen.kt` | 光影包设置子页面：按包声明的 `attributes` 出控件（见 §6.11） |
-| `dxrmc\rt\D3D12PackConfig.kt` | 读包内 `shaders/configs.json`，读写包的 `settings.json` 与它绑的 TOML 键 |
+| `dxrmc\raytracing\D3D12PackConfig.kt` | 读包内 `shaders/configs.json`，读写包的 `settings.json` 与它绑的 TOML 键 |
 | `misc\gui\D3D12Widget.kt` | 控件基类、`WidgetRenderer`（提取器的 alpha/scissor 封装）、调色板 |
 | `misc\gui\D3D12Widgets.kt` | 标题/分组/说明/页签/二级页签/设置行/按钮/滚动条八种控件 |
 | `d3d12\render\advanced\vrs\D3D12RenderScale.kt` | 渲染缩放选项、25% 步进取值集合、DLAA 锁定 |
 | `d3d12\render\advanced\D3D12AntiAliasing.kt` | 抗锯齿选项（原版取值集合上的 `OptionInstance`） |
-| `dxrmc\nvidia\reflex\NvidiaReflex.kt` | Reflex 三档选项、`options.txt` 读写、与帧生成的互锁 |
+| `dxrmc\superresolution\dlss\NvidiaReflex.kt` | Reflex 三档选项、`options.txt` 读写、与帧生成的互锁 |
 | `…FrameGeneration`、`…SuperResolution` | 帧生成/超分的后端选择与状态行，向界面提供实时状态 |
 | `Illusion\src\main\java\…\mixin\options\OptionsScreenVideoMixin.java` | 把原版「视频设置…」按钮换成自绘界面 |
 | `…\mixin\options\OptionsRenderOptionsMixin.java` | 在 `Options.load`/`save` 上读写视频设置项的 `options.txt` 行，并补一票重启提示 |

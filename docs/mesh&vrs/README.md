@@ -18,7 +18,7 @@
 | 机制 | 需要什么 | 由谁判定 | 缺失时 |
 | --- | --- | --- | --- |
 | mesh 管线 | FL 12_2 + mesh shader tier ≥ 1 + DXC 可用 | `D3D12MeshShader.isSupported()` | 地形批整批不画，记 ERROR（**没有** IMR 回退） |
-| AS 剔除 | mesh 管线 + `[mesh] terrainCull` + VS 里能解析出相机 uniform + 没有 `dxrmc/meshlet_no_as` 标记文件 | `D3D12MeshletShader.resolveCullUniforms`、`tryMeshletDraw` | 回退到「不剔除」的 meshlet 版本 |
+| AS 剔除 | mesh 管线 + `[mesh] terrainCull` + VS 里能解析出相机 uniform | `D3D12MeshletShader.resolveCullUniforms`、`tryMeshletDraw` | 回退到「不剔除」的 meshlet 版本 |
 | 逐图元距离档位 | 视频设置 VRS = AUTO 且 native 预检通过 | `D3D12VariableShadingRate.push()` | 恒 1X1 |
 | 屏幕空间着色率图（Tier 2） | 设备支持 SRI + `[vrs] sri` + 主深度可读 | `D3D12ShadingRateImage.prepareFrame()` | 退回逐图元距离档位 |
 | 渲染比例 | D3D12 后端正在驱动渲染 | `D3D12RenderScale.isAvailable()` | 比例只记录不生效，warn 一次 |
@@ -36,9 +36,59 @@
 ### 2.1 数据从哪来：段上传时采集
 
 - `SectionUploadCaptureMixin` 在 `addSectionBuffersToUberBuffer` HEAD 按 mesh 对象暂存各层 CPU 字节，
-  同一层的上传重试复用暂存数据；在 `setSectionMesh` RETURN 与原版网格一起提交整段。
-  提交时替换完整层集合，删除缺失层；空网格与 reset 移除该段，`releaseSectionMesh` 丢弃取消任务的暂存数据。
+  同时生成该版本的 meshlet；同一层首次完整快照保持不变，不完整采集允许后续完整重试替换。
+  已安装 mesh 的 index-only 排序上传不再建立待提交几何。
+  `setSectionMesh` 包装器在安装前校验当前未取消任务、结果对象、world、epoch、sectionNode 和内容令牌；
+  安装后确认当前 mesh 仍是该对象，再从 `SectionMesh.getSectionDraw` 枚举完整非空层清单并原子提交。
+  不合格结果交还原版释放，不能返回仍在使用的当前 mesh；晚到提交不得切换几何注册表的 world/epoch。
+  层清单决定 `indexCount`、`hasCustomIndexBuffer` 和 `indexType().bytes`，不能从暂存 map 或缺失索引推断层已删除。
+  缺暂存、null/零字节顶点、复制失败、draw 数不匹配或缺自定义索引时，保留当前所需版本并撤销旧载荷；
+  后续完整采集才能恢复。错 section 的提交不消费源 section 的暂存，错 epoch 的数据不能复用。
+  只删除原版层清单中明确不存在的层；`CompiledSectionMesh.EMPTY`、没有 terrain draw 的已编译 mesh 与 reset 移除该段。
+  `UNCOMPILED` 不是空网格证明，提交时忽略它；释放/取消采集本身不改变已发布几何。
+  `releaseSectionMesh` 撤销未提交的 CPU 上传；meshlet 元数据按 mesh 对象身份使用弱键保存，
+  仍被提取流程持有的 mesh 可以继续查到自己的层记录。对象不可达后经引用队列清理，不按坐标替换或延迟固定帧数。
+  已提取的绘制快照强持不可变层记录，不受后续提交、reset、mesh 释放或 GC 影响；切世界清空查找表。
 - 采集内容按层：`indexCount`、`vertexBytes`、`indexBytes`，以及切好的 meshlet 列表。
+- 关闭 RT 时非空上传仍登记当前要求并撤销旧 RT 载荷；开启后由局部重捕获补齐，不作废全部已编译 mesh。
+  `SectionUploadCaptureMixin` 记录新建编译任务身份；`SectionCompileTaskMixin` 记录其实际结果，
+  `setSectionMesh` 的真实安装结束该任务的等待。CPU 完成、旧任务的晚到结果与共享空 mesh 身份均不能提前结束等待。
+  空结果调用点还须核对实际生产任务，避免取消或被替换任务借共享 EMPTY 身份覆盖当前 mesh。
+  reset 在原版回收前撤销安装资格与 RT 表示；chunk 仍登记该来源时转换为新的无界整段恢复要求，
+  保持原输入代次和最早缺口年龄。section 临界区不包住原版 reset/cancel 的 copyLock 路径。
+  重捕获在主线程准备 region，原版编译调度后只补充异步任务；world/epoch/section/mesh/任务或要求变化时丢弃准备项。
+  批次、在途、原版队列背压、退避与统计的具体约束见 [光追架构 §7](../rt/README.md#7-导出几何缓存s2)。
+- `RenderRegionCacheCaptureMixin` 在复制前取得 `CompileScope`，`RenderSectionRegionCaptureMixin` 将它随 region 交给任务。
+  令牌冻结输入段内容代次、当前模型资源代 `modelRevision` 及 block/fluid 模型集合对；安装同时核验。
+  编译调用处读取实际 `SectionCompiler` 的两个模型字段，记录后才可接受其结果；
+  该记录须发生在任务绑定之后、安装之前，不能在捕获结果后补授绑定资格。
+  未记录来源、集合不匹配或资源已经换代的非空/EMPTY 结果均拒绝，并按当前任务身份重排 dirty。
+  实际编译同时捕获已知模型全部候选的分层支持界与 renderer 真正使用的 float offset；
+  weighted 枚举全部分支，multipart 保守并集全部 selector 子模型，不按命名空间或一次采样结果认证。
+  不可变候选清单与原始 scope、实际层内容版本一起安装；未知子模型、fluid、additional renderer 保持未证明。
+  当前缺层仅在版本与候选清单匹配时取得有限 unknown 覆盖，dirty/装卸/资源发布随内容撤销它。
+  该清单不能签发已认证空/完整空间状态；类型、上限与消费规则见 [光追架构 §7](../rt/README.md#7-导出几何缓存s2)。
+  等待整段编译的来源另用 `SourceManifest`：在实际编译调用前由编译线程扫描原始中心 copy 的全部位置，
+  对无 offset、无 fluid、无附加回调的已知模型取全部候选并集；状态容器省略或任一未知输入均保持无界。
+  发布再次核验原始 region 身份、编译调用序号、scope、资源对与当前整段要求版本；
+  该有限界只限制 unknown 代理，不创建层内容或解除恢复要求。取消、编译异常和输入变化立即撤销它，
+  新所有者的界不受旧任务晚到取消影响。
+  cache 的 world 或内容 revision 改变时清除缓存的 `SectionCopy`；任务创建不能把旧 region 换成当前令牌。
+  `LevelExtractorGeometryStateMixin` 接收 `setSectionDirty(IIIZ)`，立即撤销受影响段的令牌和旧 RT 内容，
+  在新编译结果安装前保留 unknown 目标。之前安装的空 mesh 同样需要等待新结果；未编译不构成空空间证明。
+- `IllusionClient` 在 mod bus 注册 `ModelEvent.BakingCompleted`；新的 `BlockStateModelSet` 或 `FluidStateModelSet` 发布后，
+  `D3D12SectionGeometry.observeModelResources` 推进模型/内容代次，在注册表与 RT 池锁内撤销旧任务资格、
+  未提交采集、活动 RT 内容与 dormant 缓存，并清除材质表的查找快照和历史资格。
+  保留当前已加载 chunk 的全部来源段与额外已观测生产者的无界整段恢复要求，
+  包含尚未编译、先前为空或渲染表示已回收的来源；不复活已卸载段，不改变世界 epoch 或 chunk 对象身份。
+  资源代变化沿用每段既有缺层与整段要求中的最早缺口年龄，不清零恢复队列的等待时间。
+  同一模型集合对的重复通知不重复失效；原版仍持有 mesh 的层元数据与已有不可变导出保持可用。
+- `ClientLevelGeometryStateMixin` 按真实 chunk 身份与 level section 范围登记全部来源段；
+  首次编译前即发布无界整段 node 要求、输出支持清单与恢复任务，不按当前视锥或查询半径删去未知来源。
+  渲染表示回收不删除 loaded 来源，实际卸载才退休它；chunk 来源范围缩小时退休旧范围多出的段。
+  已加载而尚未创建编译 scope 的来源也参与邻段输入撤销。
+  初始 `UNCOMPILED` 可走同一异步恢复入口，仍受 region 批次、在途、原版编译队列与空闲 buffer 限制；
+  它本身不能代替当前编译结果解除要求。已加载来源登记不构成完整空间或空空间证明。
 - **不缓存 GPU 句柄**：Uber 缓冲会扩容和整理，句柄每批都要重新从派发路径拿。
 - 注册表按 section key 存，`levelIdentity` 按世界对象身份比较；切世界、重连或退出到菜单时，
   `observeLevel` 清空注册表、RT 几何池与材质间接表并递增 `epoch`。上传传递世界对象，不使用 identity hash。
@@ -69,8 +119,8 @@
   决定，`RenderSystem.java:445-475`）。只有 `SectionDraw.hasCustomIndexBuffer()` 的层才带自己的一片
   索引（排序后的半透明，`LevelRenderer.java:800-837`），那片索引的元素大小 = `IndexType.SHORT/INT`。
 - 因此契约里记 **`indexSource`**：`SEQUENTIAL_QUADS`（用原版共享缓冲）或 `CUSTOM_SLICE`（自带索引，
-  元素字节数记 `indexStrideBytes`，由 `indexBytes / indexCount` 反推）。`captureUpload` 收到
-  `indexBuffer == null` 就是前者。改源也算几何变化 —— `geometryVersion` 会 +1（索引语义可能变）。
+  元素字节数记 `indexStrideBytes`）。生产采集与提交均读取 `SectionDraw` 的来源和元素大小，
+  自定义索引缺字节时保持 unknown，不能生成共享索引冒充。改源也算几何变化 —— `geometryVersion` 会 +1（索引语义可能变）。
 - quad 的顶点/索引算术：quad `q` 占顶点 `4q..4q+3`；共享缓冲给的是 `(i, i+1, i+2, i+2, i+3, i)`，
   与 `[mesh] terrain` 的算术展开（§2.5）是同一组三角形（`(0,1,2)` + `(2,3,0)`，与 `(0,2,3)` 同绕序）。
   写进契约时以原版那条序列为准，不要自己排。
@@ -112,14 +162,20 @@
   20 B，对应 `D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED`。
 - 每个段附带 `ChunkSectionInfo(x, y, z, visibility)`，来自 slot 1 的 `CHUNK_DATA_INSTANCED`
   实例流（16 B / 段，`stepRate = 1`）。
-- 捕获结果按顶点切片偏移（`slice.offset`）索引；一批里存 `drawCount × 4` 个 int
+- 捕获结果按间接命令缓冲对象身份与切片偏移（`slice.buffer`、`slice.offset`）索引；
+  缓冲扩容后相同 offset 仍是不同批次，禁止互相覆盖。一批里存 `drawCount × 4` 个 int
   （indexCount / firstIndex / baseVertex / baseInstance）。
 - **每帧清空**，不要用「超过 64 条只留最新 offset」这类剪枝：它会连别的图层的批一起删掉，
   日志里就会出现 `no captured MDI list for offset 0/2920/4620`，地形整片不画。
-- 段的键用 `SectionPos.asLong(blockToSectionCoord(x/y/z))`，但写进段表的是**方块坐标**
-  （`chunkX/Y/Z` 直接参与距离计算）。用方块坐标当键会让几乎全部段查不到。
-- `buildTables()` 的契约：任一段缺 meshlet、或缺这一层，**整批返回 null**。
-  没有 IMR 回退，部分派发只会画出缺块的画面，不如整批跳过并留证据。
+- `LevelRendererMeshCaptureMixin` 在 `extractSectionDrawGroups` 中伴随原版
+  `getRenderSectionSlice(mesh, layer)` 捕获同一 mesh 的层记录和实际 GPU 顶点切片。
+  GPU buffer 按对象身份匹配，层名和绝对字节偏移共同定位记录；不同缓冲的相同偏移不能合并。
+- 提取结束时一并冻结 `ChunkSectionInfo`；每批命令保留所属快照。段表写入的是**方块坐标**，
+  `buildTables` 用绑定切片偏移加 `baseVertex × 28` 找回选中的 meshlet，不再查询可变 section 注册表。
+- `LayerUpload` 预打包不变的 32 B meshlet 描述符模板。构批时复制模板到独立批次缓冲，仅改每条 `+8` 的 sectionId；
+  baseVertex、meshletBase、位置与 visibility 仍从本帧快照生成，不跨帧复用最终段表。
+- `buildTables()` 检查 section 索引、顶点切片、层记录及索引数；无效输入整批拒绝并记录日志。
+  区块替换、卸载或空网格发布不能使已提取的有效批次缺失元数据；后续帧按原版新网格重新提取。
 
 ### 2.4 顶点解码代码生成（`D3D12MeshVertexDecode`）
 
@@ -264,7 +320,8 @@ MS 的顶点属性不是从 IA 阶段来的，得把 VS 输入自己填。VS 有
 - `tryMeshletDraw` 的前置条件（任一不满足就记一条去重的 INFO，然后返回 false）：
   mesh 派发开关、已绑定管线、存在 mesh 变体、能按参数偏移找到捕获的 MDI 批、
   `drawCount` 一致、层名可识别、slot 0 顶点缓冲存在、顶点切片偏移已知、段表 / meshlet 表完整。
-- 剔除开关：`cullOn = !Files.exists(<工作目录>/dxrmc/meshlet_no_as)`。
+- 剔除开关读取 `[mesh] terrainCull`；旧 `dxrmc/meshlet_no_as` 标记仅在首次使用时读取并报告弃用覆盖，禁止逐批查询文件系统。
+- 同一捕获批次按顶点缓冲对象身份、layer 和 slice offset 缓存 section/meshlet 表，多次重放复用；新帧批次拥有独立缓存。
   这是一个同会话 A/B 用的标记文件，只改 b8 里的常量，不换 PSO。
 - 上传：段表与 meshlet 表走 staging（256 B 对齐），globals 也是 256 B
   （`gMeshletCount`、`gCullEnabled`、`gVrsBand` 四个 float）。
@@ -403,7 +460,7 @@ stage1 处理上一步结果与着色率图。枚举值：`PASSTHROUGH = 0`、`M
 光栅渲染比例是**视频设置里的滑条**，持久化在 `options.txt` 的两个键：
 `dxrMcRenderScale`、DLSS 模式专用的 `dxrMcRenderScaleDlss`。
 它只在光追关闭时缩放附件。光追开启时，主目标与世界层附件保持窗口尺寸，
-由 `[raytracing] renderScale` 单独决定 RT 输入分辨率，见 [光追倍率](../rt/README.md#26-渲染倍率与上采样s4-4-e)。
+由 `[rt] renderScale` 单独决定 RT 输入分辨率，见 [光追倍率](../rt/README.md#26-渲染倍率与上采样s4-4-e)。
 普通比例与 SR 质量档的保存值继续保留，关闭光追后重新生效。
 
 | 模式 | 最小 | 最大 | 步进 | 默认 | 档数 |
@@ -531,7 +588,7 @@ mip 会选得偏高（更模糊）。
 
 ## 9. 文件导航
 
-路径相对于 `Illusion\src\main\kotlin\dev\nts\expdxr\`。
+路径相对于 `Illusion\src\main\kotlin\io\github\dxegp\`。
 
 | 文件 | 一句话职责 |
 | --- | --- |

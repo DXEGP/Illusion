@@ -452,7 +452,7 @@ val stageShaders = tasks.register("stageShaders") {
     outputs.upToDateWhen { false }
     doLast {
         try {
-            // 整个 outRoot 先清掉：上一轮的旧目录（例如以前的 rt/、已改名的包）不能留在 jar 里。
+            // 整个 outRoot 先清掉：上一轮的旧目录（例如以前的 raytracing/、已改名的包）不能留在 jar 里。
             outRoot.deleteRecursively()
             val staged = File(outRoot, "assets/dxr_mc/shaders")
             staged.mkdirs()
@@ -944,7 +944,7 @@ val earlyWindowJar = tasks.register<Jar>("earlyWindowJar") {
     archiveVersion.set("")
     destinationDirectory.set(layout.buildDirectory.dir("libs"))
     from(sourceSets.main.get().output) {
-        include("dev/nts/expdxr/earlywindow/**")
+        include("io/github/dxegp/earlywindow/**")
         include("META-INF/services/net.neoforged.neoforgespi.earlywindow.ImmediateWindowProvider")
     }
     // P271: artwork for the loading screen, decoded with AWT inside the provider.
@@ -961,7 +961,7 @@ val earlyWindowJar = tasks.register<Jar>("earlyWindowJar") {
 tasks.named<Jar>("jar") {
     // The early-window classes must exist exactly once, in the companion jar: a second copy on the
     // mod class path would give the bridge class two separate sets of static state.
-    exclude("dev/nts/expdxr/earlywindow/**")
+    exclude("io/github/dxegp/earlywindow/**")
     exclude("META-INF/services/net.neoforged.neoforgespi.earlywindow.ImmediateWindowProvider")
     // P270: ship the companion jar *inside* the mod jar so a release is a single download. FML only
     // recognises early services in top-level jars under mods/, so the mod extracts this resource into

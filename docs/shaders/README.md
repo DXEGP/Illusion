@@ -540,7 +540,7 @@ daemon 线程 `backend-stack-sampler`（`MAX_PRIORITY`）每 2 ms 取一次 `tar
 
 ## 17. 文件导航
 
-路径相对于 `Illusion\src\main\kotlin\dev\nts\expdxr\`：
+路径相对于 `Illusion\src\main\kotlin\io\github\dxegp\`：
 
 | 文件 | 职责 |
 | --- | --- |

@@ -3,7 +3,7 @@
 本文说明 Blaze3D 的 GPU 抽象（`GpuBackend` / `GpuDevice` / `CommandEncoder` / `RenderPass` / 资源四件套）
 在 D3D12 上是怎么落地的：对象由谁持有、在哪一刻释放、内存怎么分块复用、哪些数值一旦改动就会立刻出错。
 
-范围：`Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\` 下的 `backend\`、`render\adapter\`、`render\core\`
+范围：`Illusion\src\main\kotlin\io\github\dxegp\d3d12\` 下的 `backend\`、`render\adapter\`、`render\core\`
 三个包，以及它们调用的 C ABI（`MCDR.dll`）。**不展开**：GLSL→SPIR-V→HLSL→DXIL 的编译细节、
 呈现与后处理管线（SMAA/TAA/VRS/DLSS）、meshlet 几何构建算法、配置系统。
 
@@ -186,18 +186,18 @@ surface.present()         D3D12Temporal.onFramePresented() → blitSkipped 时�
 
 ### 3.3 一帧的两种提交模式
 
-同步模式（`asyncRenderThread` 关闭时，也是异步握手超时后的降级路径）：
+同步模式（`asyncRenderThread` 关闭、无 active surface 或一次性编码器）：
 
 ```
-submit() → settlePendingSubmit() → D3D12BeginCommandList（幂等）→ D3D12Submit
-        → transientMemory.rotate() → 执行本帧攒下的回调
+submit() → ensureListOpen() → D3D12Submit → 检查非零提交结果
+        → 确认本次录制的 RT history → transientMemory.rotate() → 执行回调
 ```
 
 异步渲染线程模式（`asyncRenderThread = true`）：
 
 ```
-主线程 submit()  → D3D12AsyncRenderBeginFrame → 等渲染线程就绪（阻塞，5s 超时）
-                → D3D12AsyncSendCommandsReady → pendingSubmit = true（不阻塞，下一帧再结算）
+主线程 submit()  → D3D12AsyncRenderBeginStatus → pendingSubmit = true
+                → 等渲染线程就绪（阻塞，5s 超时）→ D3D12AsyncSendCommandsReady
 渲染线程        → Close + ExecuteCommandLists + Present
 ```
 
@@ -208,8 +208,14 @@ submit() → settlePendingSubmit() → D3D12BeginCommandList（幂等）→ D3D1
   围栏 token。所以 `submit()` 的判定是 `device != null && D3D12AsyncRenderBeginFrame(ctx)`。
 - **allocator Reset 与 begin 只能由主线程在帧开始做**，渲染线程只允许 Close + Execute + Present。
   反过来的话主线程已录制的整帧命令会被丢弃，back buffer 永不写入 → 窗口狂闪。
-- 握手超时（5s）或 `D3D12AsyncRenderBeginFrame` 失败 → 降级同步路径，并 `D3D12ClearAsyncRenderCtx()`
-  清掉渲染线程上的上下文，避免下一帧错位。
+- `D3D12AsyncRenderBeginStatus` 返回 1 表示已取得异步所有权，0 表示未启用异步路径，-1 表示请求失败。
+  只有 0 可以走同步路径；-1 必须停止本次提交，禁止与仍活动的异步上下文竞争。
+- 就绪等待超时、命令交接失败或提交完成等待超时必须中断调用，并保留 `pendingSubmit`。
+  禁止同步重提、重新打开列表、清除活动上下文或销毁编码器；等待超时不证明工作已经停止。
+- `D3D12AsyncRenderWaitStatus` 返回 1 才确认本次录制的 history、view、projection 和 jitter；
+  0 表示仍未完成，-1 表示终态失败。终态失败取消对应 pending，下一次调用可重新录制。
+- 每次打开新的命令列表生成独立 `recordingIdentity`。RT pending 只接受相同录制身份的提交确认或取消，
+  一次性编码器与其他编码器不能确认或撤销帧历史；未提交列表被重录时取消旧 pending。
 - `ensureListOpen()` **先结算 `pendingSubmit` 再读 `listOpen`**。顺序颠倒会在多帧飞行时读到渲染线程
   尚未 Close 的中间态，主线程于是往一条正在被关闭的列表里写命令（数据竞争）。
 
@@ -557,7 +563,7 @@ copyBufferToTexture(...)   // 必须先 ensureListOpen()：分配 staging 不录
 
 ## 7. 文件导航
 
-路径相对 `Illusion\src\main\kotlin\dev\nts\expdxr\`。
+路径相对 `Illusion\src\main\kotlin\io\github\dxegp\`。
 
 | 文件 | 一句话职责 |
 | --- | --- |

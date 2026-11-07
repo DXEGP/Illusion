@@ -209,7 +209,7 @@ private fun hasJitterConsumer() = if (D3D12Settings.rtEnabled) {
 ```
 
 RT 捕获关卡投影原始字节并保持原版 UBO 不变；原版世界与失败直通画面使用稳定投影。
-`rtReplayProjection` 按当前 G-Buffer 尺寸生成采样矩阵，`replayGBuffer` 将它上传到 256 字节对齐的帧内切片，
+`rtReplayProjection` 按当前 G-Buffer 尺寸生成采样矩阵，`replayGBuffer` 将它提交给 native，后者上传到 256 字节对齐的帧内缓冲，
 只替换重放批次的 `Projection` 绑定。尺寸来自 `D3D12RtPipelinePlan.configured`。
 只有上一帧实际完成 RR 或 NRD 后独立 SR，且 trace/render 尺寸相同、当前 Plan 未变，才启用下一帧偏移。
 首帧、失败后、世界/配置/尺寸切换及没有独立 SR 的 `NRD_SR` 100% 路径使用零偏移。
@@ -568,7 +568,7 @@ TAA 的锐化不是单独一趟：`sharpenAmount` 作为参数进 native 的 res
 
 ## 9. 文件导航
 
-路径相对于 `Illusion\src\main\kotlin\dev\nts\expdxr\`。
+路径相对于 `Illusion\src\main\kotlin\io\github\dxegp\`。
 
 | 文件 | 职责 |
 | --- | --- |
@@ -583,7 +583,7 @@ TAA 的锐化不是单独一趟：`sharpenAmount` 作为参数进 native 的 res
 | `d3d12/render/advanced/smaa/D3D12GuiSplit.kt` | 窗口尺寸 GUI 目标、世界层搬运、hudless 武装与呈现源选择 |
 | `d3d12/backend/D3D12CommandEncoderBackend.kt` | 把四条 pass（velocity / SMAA / TAA / 锐化）追加进本帧命令列表 |
 | `d3d12/render/core/D3D12GpuSurface.kt` | 最终 blit 与 present：选呈现源、录兜底速度 pass、帧边界裁决 hudless |
-| `dxrmc/sr/dlss/DLSS.kt` | DLAA / DLSS 的升采样与锐化两趟、退出会话时的时间性复位 |
+| `dxrmc/superresolution/dlss/DLSS.kt` | DLAA / DLSS 的升采样与锐化两趟、退出会话时的时间性复位 |
 | `dxrmc/framegen/FrameGeneration.kt` | `hudlessWanted()`：帧生成后端与「有没有世界层」的判定 |
 | `misc/settings/D3D12Settings.kt` | 配置到运行期快照的解析（含已弃用的 `-D` 逃生口） |
 | `IllusionConfig.kt` | TOML 定义：`sharpenAmount`、`taaSharpenAmount`、`temporalChain`、`temporalJitter` |
@@ -592,8 +592,8 @@ Java 侧挂点（不在上面的相对路径下）：
 
 | 文件 | 职责 |
 | --- | --- |
-| `Illusion\src\main\java\dev\nts\expdxr\mixin\render\GameRendererSmaaWorldMixin.java` | 抗锯齿 / SR / GUI 拆分的唯一顺序挂点，以及每帧的 DLSS 记账 |
-| `Illusion\src\main\java\dev\nts\expdxr\mixin\render\LevelRendererMainPassDepthMixin.java` | 主 pass RETURN：采集时域数据并录速度 pass（深度被清之前） |
+| `Illusion\src\main\java\io\github\dxegp\mixin\render\GameRendererSmaaWorldMixin.java` | 抗锯齿 / SR / GUI 拆分的唯一顺序挂点，以及每帧的 DLSS 记账 |
+| `Illusion\src\main\java\io\github\dxegp\mixin\render\LevelRendererMainPassDepthMixin.java` | 主 pass RETURN：采集时域数据并录速度 pass（深度被清之前） |
 
 ## 10. 文档维护
 

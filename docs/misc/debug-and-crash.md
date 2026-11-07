@@ -5,7 +5,7 @@
 
 涉及两个语言侧：
 
-- JVM（Kotlin）侧：`Illusion\src\main\kotlin\dev\nts\expdxr\`，负责崩溃报告与弹窗。
+- JVM（Kotlin）侧：`Illusion\src\main\kotlin\io\github\dxegp\`，负责崩溃报告与弹窗。
 - native 侧：`MCDR\src\`，负责 SEH 级取证、原生日志行与设备状态查询。
 
 ## 1. 崩溃路径全景
@@ -223,9 +223,9 @@ JVM 侧只有这一个门面，所有地方都不得直接 `println` / `System.e
 | `applyOpt(level, nativeVerbose, shutdownTrace, nativeLogFile)` | 真正落地：改 log4j 级别 + 推给 native | — |
 | `applyFromConfig()` / `applyDefaults()` | 从 TOML / 内置默认值应用 | — |
 
-`OWN_LOGGERS = ["dev.nts.expdxr", "backend", "dxr_mc-temporal", "dxr_mc-velocity", "dxr_mc"]`：
+`OWN_LOGGERS = ["io.github.dxegp", "backend", "dxr_mc-temporal", "dxr_mc-velocity", "dxr_mc"]`：
 Minecraft 自带的 log4j2 配置里没有这些名字，不显式 `Configurator.setLevel` 的话它们会继承 root
-（INFO，开发环境下是 DEBUG），玩家配置的级别就形同虚设。`dev.nts.expdxr` 是包级 logger，
+（INFO，开发环境下是 DEBUG），玩家配置的级别就形同虚设。`io.github.dxegp` 是包级 logger，
 覆盖 `LogUtils.getLogger()` 派生的类名 logger，不必逐个枚举。
 
 启动时的级别来源优先级：`D3D12_LOG_VERBOSE=1`（开发逃生口，覆盖配置文件）> `[logging] logLevel` > 内置默认
@@ -385,7 +385,7 @@ int formatLogPrefix(char* out, size_t outSize, const char* level, const char* lo
 
 ## 6. 文件导航
 
-JVM 侧（相对 `Illusion\src\main\kotlin\dev\nts\expdxr\`）：
+JVM 侧（相对 `Illusion\src\main\kotlin\io\github\dxegp\`）：
 
 | 路径 | 一句话职责 |
 | --- | --- |
