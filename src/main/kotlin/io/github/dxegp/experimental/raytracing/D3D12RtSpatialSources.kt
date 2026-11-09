@@ -1,6 +1,7 @@
 package io.github.dxegp.experimental.raytracing
 
 import io.github.dxegp.d3d12.render.advanced.mesh.D3D12SectionGeometry
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet
 import net.minecraft.core.SectionPos
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -18,6 +19,10 @@ object D3D12RtSpatialSources {
         val layerSetKnown: Boolean,
     ) {
         val layers: List<Layer> = java.util.List.copyOf(layers)
+
+        internal fun sameProof(other: Source): Boolean = sectionNode == other.sectionNode && state == other.state &&
+            bounds == other.bounds && scope === other.scope && captureVersion == other.captureVersion &&
+            layers == other.layers && layerSetKnown == other.layerSetKnown
 
         internal fun influences(sectionNode: Long, fallback: D3D12RtGeometryPool.OutputBounds? = null): Boolean {
             val support = bounds ?: fallback ?: return true
@@ -72,7 +77,9 @@ object D3D12RtSpatialSources {
                                                       val universe: D3D12RtSourceUniverse.Snapshot =
                                                           D3D12RtSourceUniverse.unavailable) {
         val sources: List<Source> by lazy { java.util.List.copyOf(sourceFactory()) }
-        private val observed by lazy { sources.mapTo(hashSetOf()) { it.sectionNode } }
+        private val observed by lazy {
+            LongOpenHashSet(sources.size).apply { for (source in sources) add(source.sectionNode) }
+        }
         val unobservedMayInfluence: Boolean get() = true
         val spatialFlags: Int get() = if (universe.bounds == null) 2 else 0
 
@@ -97,7 +104,7 @@ object D3D12RtSpatialSources {
         fun requiredAt(sectionNode: Long): Requirements = Requirements(sectionNode,
             sources.filter { it.influences(sectionNode, universe.bounds) }, hasUnobservedAt(sectionNode), unobservedRangeAt(sectionNode))
 
-        private val certifiable by lazy {
+        internal val certifiable by lazy {
             val universeBounds = universe.bounds
             fun valid(bounds: D3D12RtGeometryPool.OutputBounds): Boolean =
                 bounds.minimumX.isFinite() && bounds.minimumY.isFinite() && bounds.minimumZ.isFinite() &&
@@ -113,12 +120,27 @@ object D3D12RtSpatialSources {
         }
 
         internal fun certifiedPages(pages: List<D3D12RtSpatialDirectory.Page>, targets: Set<Long>): List<IntArray> {
+            val candidates = pageSources(pages)
+            val side = D3D12RtSpatialDirectory.PAGE_SIDE
+            return pages.mapIndexed { index, page ->
+                certifiedStates(page.column * side, page.row * side, page.slice * side, side, targets, candidates[index])
+            }
+        }
+
+        internal fun pageSources(pages: List<D3D12RtSpatialDirectory.Page>): List<List<Source>> {
             require(pages.size <= D3D12RtSpatialDirectory.MAX_PAGES && pages.distinct().size == pages.size)
             val side = D3D12RtSpatialDirectory.PAGE_SIDE
             val universeBounds = universe.bounds
-            if (!certifiable || universeBounds == null) return pages.map { IntArray(side * side * side) }
             val indices = pages.withIndex().associate { [index, page] -> page to index }
             val candidates = List(pages.size) { mutableListOf<Source>() }
+            if (!certifiable || universeBounds == null) {
+                for (source in sources) {
+                    val page = D3D12RtSpatialDirectory.Page(SectionPos.x(source.sectionNode).floorDiv(side),
+                        SectionPos.y(source.sectionNode).floorDiv(side), SectionPos.z(source.sectionNode).floorDiv(side))
+                    indices[page]?.let { candidates[it] += source }
+                }
+                return candidates
+            }
             fun lower(origin: Int, minimum: Float): Int =
                 (origin.toLong() + ceil(minimum.toDouble() / 16.0).coerceIn(-8388608.0, 8388608.0).toLong() - 1L)
                     .coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong()).toInt().floorDiv(side)
@@ -147,9 +169,7 @@ object D3D12RtSpatialSources {
                     }
                 }
             }
-            return pages.mapIndexed { index, page ->
-                certifiedStates(page.column * side, page.row * side, page.slice * side, side, targets, candidates[index])
-            }
+            return candidates
         }
 
         internal fun certifiedStates(minimumX: Int, minimumY: Int, minimumZ: Int, side: Int,
@@ -208,7 +228,7 @@ object D3D12RtSpatialSources {
                 val index = (slice * padded + row) * padded + column
                 if (unavailable[index] != 0) continue
                 val node = SectionPos.asLong(minimumX + column, minimumY + row, minimumZ + slice)
-                val required = unobservedRangeAt(node)?.countAtMost(sources.size) ?: continue
+                val required = unobservedRangeAt(node)?.countAtMost(candidates.size) ?: continue
                 if (possible[index] == required) states[(slice * side + row) * side + column] =
                     if (nonempty[index] == 0) 1 else 2
             }

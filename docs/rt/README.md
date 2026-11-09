@@ -1,13 +1,13 @@
 # 光线追踪：配置、几何、硬件路径与降噪接口
 
-> **当前实现**：内置包为 B-DXR，生产追踪与场景自检均通过 BLAS/TLAS、状态对象、SBT 和 `DispatchRays` 执行；太阳遮挡使用独立 inline `RayQuery`。最低要求 DXR 1.1。`AUTO` 使用 DXR；WG 调度尚未实现，选择 WG 会报告回退 DXR。不支持 DXR 1.1 时关闭光追。
+> **当前实现**：内置包为 B-DXR，`AUTO` / `DXR` 使用状态对象、SBT 与 `DispatchRays`；显式 `WG` 使用实验性的 `RtWgPrimary → RtWgTrace → RtWgRecursive → RtWgResolve` 节点图。两者共享 BLAS/TLAS、硬件 inline `RayQuery`、积分器和 native 帧事务；场景自检仍使用 DXR。最低要求 DXR 1.1，WG 另需 Work Graphs Tier 1.0 和 `lib_6_9`。WG 创建失败时报告并使用实际 DXR；不支持 DXR 1.1 时关闭光追。
 >
 > **RAW 模式**：`[rt] denoise = "RAW"` 保留硬件追踪与合光，跳过降噪和时域重建。启动时自动迁移旧包名和旧后端、无降噪配置；迁移不提供软遍历兼容路径。
 >
 > **已知限制**：缺少对应材质的光源方块仍可能显示为白色，材质体素视差与 RR 阴影稳定性待独立目视验收。首次加速结构未就绪或没有有效快照时整帧直通原版；已有快照的变更按 section 体积屏蔽受影响光线。失效 section 包含相机时可能影响整个视野，失效边界仍需验证。统一 native 帧录制与提交确认边界已接入，完整空间/内容协议、世界内噪点与性能仍待验收。不同降噪器与 SR 方案分别验收，不设最终图像一致等级。
 
 下面按接口与资源列出配置、日志、查询、几何导出、G-Buffer、追踪、降噪和合光。
-DXR 的状态对象、SBT 与 `DispatchRays` 接线见 §16，NRD、RR 与 SR 适配见 §18 及后续章节；
+DXR 的状态对象、SBT 与 `DispatchRays` 接线见 §16，实验 WG 见 §16.11，NRD、RR 与 SR 适配见 §18 及后续章节；
 native 已拥有几何 GPU 快照、BLAS/TLAS、场景候选/发布/局部失效、G-Buffer 附件、批次快照与回放、生产追踪、
 raw/guide/信号资源、曝光、降噪、独立 SR 与合光资源、SDK 调度及历史；JVM 仍管理 CPU 几何池与范围选择、
 G-Buffer 着色器生成与捕获通知、调试绘制与上屏 blit。生产录制使用统一 native 帧事务，见 §16.10。
@@ -23,7 +23,7 @@ G-Buffer 着色器生成与捕获通知、调试绘制与上屏 blit。生产录
 
 | 键 | 默认 | 取值 | 作用 | B-DXR 生效 |
 | --- | --- | --- | --- | --- |
-| `backend` | `AUTO` | `AUTO` / `DXR` / `WG` | AUTO 使用 DXR；WG 当前回退 DXR；低于 DXR 1.1 时关闭光追 | 是 |
+| `backend` | `AUTO` | `AUTO` / `DXR` / `WG` | AUTO 使用 DXR；显式 WG 启用实验节点图，创建失败回退 DXR；低于 DXR 1.1 时关闭光追 | 是 |
 | `qualityProfile` | `BALANCED` | `VALIDATION` / `BALANCED` / `QUALITY` | 档位只调参数，不跳门 | 否 |
 | `spp` | `1` | 1–16 | 验证 profile 是 1 | 否 |
 | `maxBounces` | `2` | 1–8 | 路径最大弹射 | 否 |
@@ -33,7 +33,12 @@ G-Buffer 着色器生成与捕获通知、调试绘制与上屏 blit。生产录
 | `historyFrames` | `16` | 1–64 | 历史长度上限，降噪与缓存都夹到它 | 否 |
 | `debugView` | `NONE` | 见下 | 调试视图 | 是 |
 | `invalidationLog` | `false` | 布尔 | 历史复位时输出原因位和观察帧号，局部几何更新不输出复位日志 | 是 |
+| `managedMemoryMiB` | `2048` | 64–16384 | Native RT 受管分配共享上限，包含几何、AS 与显式登记的帧资源 | 是 |
 | `[shaderpack] active` | `B-DXR` | 包名；空串表示无光影 | 选择 HLSL 包并应用包声明的硬件后端 | 是 |
+
+`managedMemoryMiB` 是宿主资源预算，每次 `D3D12RtNativeFrame.prepare()` 在复用或创建上下文前提交。
+调低上限不强制释放资源；当前用量超限时仅拒绝新增分配，正常物理退休或调高上限后可重试。
+首次上下文因内存背压创建失败不会锁死后续初始化。其范围和统计见 §9.2。
 
 `debugView` 取值：`NONE` / `DEPTH` / `NORMAL` / `ALBEDO` / `ROUGHNESS` / `HIT_DISTANCE` / `SHADOW` / `COMPOSITE_MARK` /
 `DIRECT` / `INDIRECT` / `CACHE_CONFIDENCE` / `REACTIVE_MASK` / `MOTION_VECTORS` /
@@ -159,7 +164,7 @@ B-DXR 的硬件追踪着色器当 `ByteAddressBuffer` 读。仅在 `D3D12Setting
 
 容量与回收（三类 arena 各自封顶：顶点 768 MiB、索引 96 MiB、材质 96 MiB）：
 
-- **半透明层不收**（`hidden=` 计数）。当前三角形池不提供完整透明覆盖，不能将未收录的层当作已知空区域。
+- **半透明层占用同一预算**。TRANSLUCENT 与其它实际层共同发布；缺载荷时保留 missing，未实现的透明输运保持 unknown，见 §16.3。
 - **容量不足时撤销无法更新的旧内容**。分配先复用空闲区间，再按需淘汰 dormant；失败时报告
   `RT pool: storage budget exhausted`，不清空其它有效记录，也不保留已被编辑推翻的旧 live 几何。
 - **后续上传可重试**。同内容 dormant 重入不增加分配；其它完整上传在空间释放后重新申请。
@@ -193,16 +198,18 @@ CPU active/dormant 索引使用完整的 `(sectionNode, layer)` 键，禁止通�
   region 携带该令牌进入编译任务。
   cache 的 world 或 `contentRevision` 改变时，先清除缓存的 `SectionCopy`，再复制；已导出的 region 仍持有自身数据。
   创建任务时绑定 world identity、geometry epoch、sectionNode 与 region 的原始令牌，不在任务创建时刷新令牌。
-  安装时同时认证当前未取消任务、实际结果身份、绑定范围与当前内容令牌。
+  原版安装只校验当前未取消任务、实际结果身份和绑定 world/epoch/sectionNode；
+  RT 发布另行认证编译来源与当前内容令牌，不得用 RT 资格失败阻断原版网格安装及更新通知。
   `SectionCompileTaskMixin` 在五参数 `SectionCompiler.compile` 调用处记录实际接收者，
   由 `D3D12RtCompilerInputs` 读取其实际 `blockModelSet`、`fluidModelSet` 与 `blockColors`。
-  安装时编译器对象必须与原 scope 及当前未关闭 dispatcher 一致；相同模型集合不能替另一编译器补授资格。
+  RT 提交时编译器对象必须与原 scope 及当前未关闭 dispatcher 一致；相同模型集合不能替另一编译器补授资格。
   仅记录模型集合对的入口不取得活动编译器身份资格。
   编译来源只对已经绑定且尚未安装的任务记录有效；事后绑定 scope 不能为先前捕获的结果补授资格。
   编译开始先撤销该任务先前捕获的结果；实际集合对与 scope 不符、未记录编译来源或资源代已经失效时，
-  非空结果与共享 EMPTY 均不得安装。拒绝结果后按当前任务身份重排 dirty，不能让错误编译器的任务永久阻塞恢复。
+  非空结果与共享 EMPTY 均不得提交 RT，但当前任务的原版结果仍正常安装并结束待安装状态。
   EMPTY 的对象身份是共享的，必须在调用安装的任务处再次校验当前生产者；非空上传回调也只接受当前任务结果。
-  拒绝安装时将传入结果交还原版释放，不能返回当前仍在使用的旧 mesh。
+  任务归属校验拒绝安装时将传入结果交还原版释放，不能返回当前仍在使用的旧 mesh。
+  RT 校验失败只丢弃本次未提交字节，保留 unknown 与恢复要求，不复活旧 RT 载荷。
 - section reset 先撤销任务资格，再由原版回收绘制表示。真实 chunk 仍登记该段，且当前 `CompileScope`、
   完整安装层清单与全部当前载荷均有效时，`removeSection` 保留 RT 内容和原始依赖索引；EMPTY 也须有完整来源证明。
   保留集最多 1024 段、128 MiB，字节包含顶点、索引、逐 quad 材质与每条 64 B 记录，EMPTY 仍占一个段名额。
@@ -221,8 +228,8 @@ CPU active/dormant 索引使用完整的 `(sectionNode, layer)` 键，禁止通�
   派生中心段的失效不再充当新的内容源事件，也不扩散至其余邻段。与当前 world 不同的回调直接忽略。
   此规则在 RT 关闭时仍生效。旧 region 的 EMPTY 结果也不能解除目标；新内容完整安装后才由真实层清单替换等待状态。
   当前无 terrain draw 的已编译结果可解除该目标，但不能据此宣称整个体素空间都是空气。
-  当前任务因内容令牌过期被拒绝时，在主线程复核 world/epoch/node/任务身份后重新标 dirty；
-  已取消、已完成或被替换的任务不重排，避免丢失后续编译机会或干扰新任务。
+  实际网格安装结束当前任务等待，与 RT 提交成功分开；未恢复的 RT 内容继续由既有恢复队列调度。
+  RT 内容令牌过期不得额外发送世界 dirty，避免派生恢复推进输入代次、撤销邻接任务并扩大缺口。
 - 客户端在 mod bus 注册 `ModelEvent.BakingCompleted`；模型管理器发布新的 `BlockStateModelSet` 或
   `FluidStateModelSet` 后，`observeModelResources` 按两者的对象身份推进 `modelRevision` 与 `contentRevision`，不改变世界 epoch。
   在 section 注册表 → RT 池的锁顺序下撤销旧编译令牌、未提交采集、活动 RT 载荷与全部 dormant 内容，
@@ -292,7 +299,7 @@ CPU active/dormant 索引使用完整的 `(sectionNode, layer)` 键，禁止通�
   无 tint 读取和无关查询列保留资格；不等待后续 `onChunkLoaded` 或 block dirty。
   palette 解码与 tint source 计算均在注册表锁外执行。保护中首次登记对应列的编译读取立即撤销自身 scope，
   其返回值不能安装；原始替换正常返回才显式标记完整，结束时再次失效对应 cache，清掉过渡缓存后减少计数。
-  解码或结束时 cache 失效异常均保留该来源的 biome 失败状态，后续新 tint 采集继续拒绝安装，不能只撤销旧 capture。
+  解码或结束时 cache 失效异常均保留该来源的 biome 失败状态，后续新 tint 采集继续拒绝 RT 提交，不能只撤销旧 capture。
   cache/dirty/load 通知不提供完整恢复；后续完整成功的 biome 包或完整 chunk 包才可恢复该类输入。
   嵌套发布未全部结束前保持保护；世界 epoch 改变时清空计数，旧 token 的结束操作不影响新世界。
   此边界只覆盖 biome 包的实际替换；完整 chunk 包与混色选项另走各自发布入口。直接 palette 修改或 biome callback 的
@@ -312,7 +319,7 @@ CPU active/dormant 索引使用完整的 `(sectionNode, layer)` 键，禁止通�
   同步推进输入版本并保留整段恢复要求；不等待实际 block state 写入后的 load/dirty 通知。
   发布计数未清零时，读取该列的 3×3×3 region 不得建立有效 compile scope，旧 scope 与对应远处 tint 读取也不能安装。
   原方法正常返回后才标记完成；结束时再次撤销输入和过渡 tint，再解除本层保护。重复嵌套不能提前放行外层。
-  原方法异常退出时，该列保留 block-state 失败状态，保持内容未知，邻接 region 和对应 cache 查询继续拒绝安装。
+  原方法异常退出时，该列保留 block-state 失败状态，保持内容未知，邻接 region 和对应 cache 查询继续拒绝 RT 提交。
   block dirty、load 或 biome-only 更新不能清除 block-state 失败；同一列后续完整 chunk 包才可恢复该类输入。
   block-state 与 biome 输入分别记录来源列的在途计数、失败代次与失败状态，token 冻结开始时的失败代次。
   正常完成且期间未出现新的同类失败才清除该类失败；更早开始的外层正常返回不能覆盖内层后发生的失败。
@@ -342,7 +349,7 @@ CPU active/dormant 索引使用完整的 `(sectionNode, layer)` 键，禁止通�
   `BlockSectionPublicationMixin` 包装五参数 `setBlockState`、`read` 与 `recalcBlockCounts`。
   开始、正常完成标记与结束均取得注册表 class monitor；实际 palette 锁、原始写入和 section 计数更新在锁外执行。
   开始写入前先保护来源段，撤销该段及读取它的 27 段 region scope、未提交采集、活动与 dormant RT 内容，
-  并失效对应 canonical tint cache 查询列。过渡中的 region/tint 读取不得安装；结束时再清过渡内容后解除本层保护。
+  并失效对应 canonical tint cache 查询列。过渡中的 region/tint 读取不得提交 RT；结束时再清过渡内容后解除本层保护。
   保留无关列和垂直方向不依赖该来源的段，不能把单段写入扩大成整列几何失效。
   嵌套 palette/section 及完整 chunk 发布仍维护各自计数和失败代次，已被外层保护的段共用该失效边界，
   不为每次内层 read/resize 重复撤销。外层结束前不能提前建立有效 scope。
@@ -358,7 +365,7 @@ CPU active/dormant 索引使用完整的 `(sectionNode, layer)` 键，禁止通�
   `BiomePalettePublicationMixin` 包装 public `getAndSet`、`getAndSetUnchecked`、public `set`、`onResize` 和 `read`；
   `BiomeSectionPublicationMixin` 包装 `read`、`readBiomes` 与 `fillBiomesFromNoise`，覆盖临时 palette 构建到实际字段发布的全过程。
   开始、完成标记、结束使用注册表 class monitor；原始 palette 锁、解码与全部 biome resolver 调用在锁外执行。
-  首次写入前失效对应 canonical tint cache，撤销其实际编译读取者、采集及 RT 内容；过渡 tint 不得安装，
+  首次写入前失效对应 canonical tint cache，撤销其实际编译读取者、采集及 RT 内容；过渡 tint 不得提交 RT，
   结束再次清缓存后释放本层保护。无 tint 的独立 block 几何和无关查询列保持资格。
   三个 section 方法的实际 `biomes` 字段写点另调用 `publishBiomePalette`，在同一 class monitor 内写字段并刷新身份索引。
   新 palette 发布后立即具备当前来源身份，旧 palette 立即退出索引；不能等外层 section 方法返回才登记。
@@ -612,6 +619,11 @@ CPU active/dormant 索引使用完整的 `(sectionNode, layer)` 键，禁止通�
   仍缺载荷的层沿用原有最早缺口年龄。实际卸载与世界切换退休来源要求；loaded section reset 替换恢复版本。
 - 临时忙碌退让 100 ms；一次失败等待 50 ms，连续失败倍增至 2 s。每段/层独立退避，重试状态最多 64 项；
   当前版本替换、恢复、明确删除与切世界都重新验证资格。缺口年龄从首次缺失持续累计，重试不重新计龄。
+- 有限 unknown 来源的 GPU 需求经 `D3D12GetRtSceneCaptureDemands` 每次最多导出 64 项；
+  渲染帧在准备当前 scene 的版本/目标后交给池，worldEpoch/liveRevision 完全匹配才为实际缺层或整段要求登记优先提示。
+  提示最多 256 个 CaptureTarget、保留 250 ms，版本、首次缺口身份或 epoch 变化撤销。
+  捕获从普通轮转开始，在普通与需求之间交替；取出即消费提示，不绕过退避、在途限制和准备时间片。
+  已有载荷的驻留预算遗漏不重复编译，改由 §9.2 的驻留需求恢复；无界来源与空间目录缺页继续普通轮转。
 - `rt_stats.json` 的 `capture_recovery` 提供当前 `missing_layers`、`oldest_age_ms`、`prepared_regions`、
   `in_flight`、`retry_entries`，以及候选/提交/延后/丢弃/复制累计次数、`copy_ms_total`、`copy_ms_max`
   和 `over_slice_copies_total`。`missing_layers` 沿用字段名，计入缺层与等待当前编译的整段要求。
@@ -645,11 +657,53 @@ CPU active/dormant 索引使用完整的 `(sectionNode, layer)` 键，禁止通�
 声明域不受 39³ 限制，X/Z 最多 4194304 section、Y 最多 1048576 section，且 min + size 不越过 SectionPos 边界。
 页预算最多 512 页，载荷最多 1056832 B；从中心页按距离和稳定坐标顺序选择，未入选页不能当成空气。
 来源先按认证全集的潜在影响范围分发至已选页，再以三维差分认证相关页，避免每页重新扫描全部来源。
-空间状态变化推进池 revision，来源、声明域、中心页与 targets 不变时复用只读目录；
+空间状态变化推进池 revision；同一来源快照、声明域、中心页与 targets 复用只读目录。
+变化快照按页比较来源 node/state、支持界、原 scope 身份、捕获版本、完整层清单与相关 target 资格，
+只重新认证并编码依赖变化的完整页。新来源、删除、dirty、卸载、缺层及 targets 变化撤销相应页；
+world/epoch、认证全集身份或全局认证资格变化清空页缓存；资源重载独立清空，即使前后均为 unavailable。
+远处无关变化不重算未受影响页。
+构建前先保留已选页在本轮开始时的缓存项，再逐页核对和回填有界缓存；
+新页触发逐出时，不能丢掉本轮尚未核对的旧页，否则工作集超过依赖上限便会反复整轮重算。
+缓存最多 512 页状态 / 1048576 B 与 32768 个来源依赖引用，按最近使用逐出；世界清空同时释放缓存引用。
+缓存页保留完整 8³ 状态，声明域边缘在独立副本上裁剪，不能污染其它声明域或已冻结的帧。
+最终连续载荷仍整体组装并交给 native 校验，页编码复用不代表零上传或 native 增量更新。
 同锁冻结 live versions、targets 与来源事实，记录或字节预算省略的内容仍不能获得查询完整资格。
+冻结的 section 键表与来源去重使用 primitive long 集合，来源与 targets 仅在序列化前各排序一次，
+保留有符号 node 顺序；排序方式不能改变版本、支持界、缺层或未知来源的资格。
 native 保留 schema 1 密集载荷支持；两种布局分别校验，FFM setter 与统一帧事务的函数签名不变。
-当前目录仍由近域调用方请求，384 records、96 方块追踪半径与原查询预算没有随目录扩展自动放宽；
-512 页选择、认证、打包及 native 校验的实际游戏帧成本和完整分页调度尚待验证。
+
+`D3D12RtFullDomainProfile` 在投影捕获时冻结 world/dimension、配置视距、实际客户端视距与完整垂直 section 范围，
+随同相机进入帧准备；目录水平范围使用 `Options.effectiveRenderDistance`，垂直范围使用
+`ClientLevel.minSectionY` / `sectionsCount`，并包含认证全集支持界的闭边界影响格。
+相机位于世界高度外时，将页选择焦点夹到生产域，仍保留实际高度范围；世界高度不提供物理空域证明。
+生产帧经 `coverageFor` 请求这个目录，近域入口保留给已有调用与工具；两者共用池的类监视器。
+生产几何经 `mirrorFor` 选择实际请求域，按输出支持界与生产域的闭边界相交选取完整 section/layer 组，
+包括屏外来源、跨段输出和完整世界高度。支持界保守包含来源段本身，相邻接触边界也可能入选。
+选择按距当前相机的输出界距离排序；超预算的整组保留缺口，继续检查后续可容纳组，不拆层、不逐帧轮换超额组。
+`coverageFor` 的 targets 独立保留全部相交当前组与既有缺失要求，不能改成已选载荷的子集。
+native 对未上传、待建或失效组继续发布 unknown；页状态不替代实际 AS/内容资格。
+`coverageNear` / `mirrorNear` 保留给显式近域调用与工具，其近域限制不再决定正常世界的几何选择。
+
+`[rt] geometryPayloadMiB` 热配置默认 128，范围 1–512；计入逐内容四字节对齐的 vertex/index/quad 字节与
+64 B/record 表。选择同时受 native 的 65535 records 与 256/64/8 MiB arena 容量限制，配置上限不保证全部能驻留。
+这是所选逻辑载荷的保守核算，材料表、实际 committed arena、AS、UPLOAD 和在途旧代分别使用既有资源账本，
+不能把所选字节当成整个设备的显存用量。目标数量仍受 native 65535 个条目的技术上限约束。
+镜像复用同时比较世界、内容/材料版本、实际域和预算；视距、世界高度与预算变化不必等待相机移动才重新选择。
+同内容保持不可变内容身份与增量上传，原子组发布及 fence 退休继续由 native scene 管理。
+正常世界 profile 的合光半径常量为 0，关闭固定近域淡出；没有匹配世界 profile 的显式近域工具入口保留 96 方块淡出。
+原射线使用 TMax=1e9，没有 96 方块球半径裁剪；查询工作预算保持，远域几何入选仍须通过空间与信号资格验证。
+缺页、目标缺失、未观测区间与未接入类别继续 unknown。
+统计 JSON 的 `full_domain` 记录版本 3 profile、实际帧/镜像身份、请求/选择/发布页数、重算/复用页数、
+编码与最终载荷字节、目录构建时间、实际分辨率、几何限制及缺口原因；记录的是最近一次目录构建成本。
+`geometry_selection` 分别记录请求/选中组、记录和对齐字节、遗漏组及 record/payload/各 arena 超额原因，
+多项原因可以同时计入同一个遗漏组。`geometry_publication` 使用实际 native scene 统计记录已录制/待建/
+缺失/过时记录、proxy 数与最老请求帧龄；候选选择与实际发布镜像分开，预算省略或旧候选不表示发布完整。
+采用 profile 选择时 `geometry_radius` 为 null，`geometry_domain` 记录实际镜像对应的域，
+`trace_radius` 为 null，表示没有球半径裁剪；`primary_t_max` 与 `secondary_t_max` 均为 1e9。
+正常世界的 `composite_radius` 为 null，表示关闭距离淡出；帧常量用 0 表达相同行为。
+与当前请求不同的旧域不能冒充当前请求已满足。
+失败帧和世界更换清空该 profile，不沿用上次成功帧冒充当前输入。
+完整 profile 的逐类查询/生产者证明、生产帧时间预算、目录请求年龄、公平更新、全场景总账与 MG 继续接入。
 
 **编译候选支持清单**：`D3D12RtModelSupport` 在实际编译调用内按资源集合缓存不可变的候选界，
 由 `SectionCompilerSupportMixin` 接收真正传给 `ModelBlockRenderer` 的模型、段内位置与强制不透明设置。
@@ -680,7 +734,7 @@ native 保留 schema 1 密集载荷支持；两种布局分别校验，FFM sette
 两者都无可信有限界时仍导出 flags=0。有限后备只限定 unknown 代理，不提供内容、层版本或空空间证明，实际要求和 targets 继续保留。
 监听器、注册表、活动编译器或资源变化撤销全集时，新 revision 重新导出无界要求；已冻结的旧输出字节保持不变。
 输入 dirty、装卸、section reset、模型资源发布和世界切换撤销相关清单。
-旧的只读输出快照不随这些事件改变。GPU 几何记录仍为 64 B，输出支持记录仍为 48 B，当前契约为 ABI 45。
+旧的只读输出快照不随这些事件改变。GPU 几何记录仍为 64 B，输出支持记录仍为 48 B，当前契约为 ABI 46。
 
 等待整段编译时使用独立的 `SourceManifest`，不把编译前的候选界当作实际编译结果或层内容版本。
 任务创建时保存原始 `RenderSectionRegion` 身份；实际五参数编译调用在冻结 additional renderer 列表、
@@ -722,7 +776,8 @@ native 保留 schema 1 密集载荷支持；两种布局分别校验，FFM sette
   旧会话只撤销其持有的清单对象，不能撤销新任务或新编译调用的证明。
 
 上述证明只约束普通 fluid 的几何输出范围与层，不包含 tint/光照回调的完整内容依赖，也不提供透明输运或介质支持。
-当前 RT 池仍不接收 `TRANSLUCENT` 载荷；透明层范围可被记录，不代表该层已成为可追踪的实际内容。
+生产 RT 池接收 `SOLID`、`CUTOUT` 与 `TRANSLUCENT` 的实际顶点、索引和逐 quad 材质载荷。
+透明层使用相同的版本、缺层恢复、存储准入和撤销流程；取得三角形不等于已实现透明输运或介质支持。
 
 生产网格以 0=未观测、3=卸载、4=dirty、5=已加载但查询空间未认证作为未证明状态。
 只有受认证的有限来源全集覆盖全部潜在来源、相关来源均已完成当前编译安装，而且实际非空层全部有当前载荷时，
@@ -754,6 +809,8 @@ native 保留 schema 1 密集载荷支持；两种布局分别校验，FFM sette
 通过实际 `EventBus` / `ListenerList` 读取，不调用监听器、不以某个位置的空 renderer 列表代替全局判断。
 未知事件总线或反射失败保持无界。全局状态 ID 表须继承原始 `IdMapper` 的枚举和计数实现，允许 NeoForge 的可清空实现，
 不执行自定义枚举。每次冻结池版本前复核注册表的冻结状态、数量、全局状态 ID 和逐对象身份及实际监听器；
+身份检查按索引读取 canonical `byId` / `idToT`，跳过空槽并核对 holder 的当前值，避免构造筛选迭代器。
+同数量替换、末尾变化与 holder 值变化仍撤销证明，不按帧号缓存注册表资格。
 变化推进池 revision，旧快照保留原证明，新快照立即撤销不再成立的范围。
 同时从当前 `Minecraft.levelRenderer` 读取活动 dispatcher：`LevelRenderer`、`SectionRenderDispatcher`、
 `SectionCompiler` 均须为原始精确类型，dispatcher 须未关闭，编译器实际 block/fluid 资源须与证明对象相同。
@@ -772,7 +829,8 @@ native 保留 schema 1 密集载荷支持；两种布局分别校验，FFM sette
 完整实际层清单只从本次安装 mesh 的 draw 取得，并与该次 `replaceSection` 发布作用域、世界 epoch 绑定；
 候选模型有 quad 而实际剔除结果为空时不虚构非空层；实际非空 draw 缺对应候选界时拒绝整份清单。
 实际存在的 TRANSLUCENT draw 没有 RT 载荷时，
-保留 version=null、captured=false 的层要求，不虚构内容版本。发布失败或世界切换撤销该作用域。
+保留本次安装的 missing version、captured=false 与实际层要求；该版本标识待捕获内容，不提供可消费几何。
+完整载荷恢复后才将其标为 captured；发布失败或世界切换撤销该作用域。
 完整空编译仍保留来源段盒，只有全部潜在来源的当前内容闭合后才能签发空格。
 卸载撤销自身有限界与内容，在来源快照中保留由全集保守限定或无界的义务，
 既不重新加入恢复队列，也不向实际层版本表写入占位记录。dirty、资源发布和世界切换与现有输入协议一起撤销资格。
@@ -837,6 +895,68 @@ HLSL 侧就是 `ByteAddressBuffer` / `RWByteAddressBuffer`：
   不要用 512 —— 那是 `GpuBuffer.USAGE_INDIRECT_PARAMETERS`，撞位会让 UPLOAD 堆资源带上
   `ALLOW_UNORDERED_ACCESS` 而非法）；
 - 绑定顺序就是表里出现的顺序：SRV 从 `t0` 起、UAV 从 `u0` 起，`b0` 是 0~8 个 int32 常量。
+
+### 7.3 内容变更事件
+
+`D3D12RtGeometryPool.Versions` 同锁冻结 `lightingRevision`、world epoch 与几何 revision。
+以该 token 调用 `lightingChangesSince(versions, afterRevision)`；过期 token 返回 `null`，需重取整个场景快照。
+读取不消费事件，发布失败或录制重试不能提前推进消费者游标。
+
+`D3D12RtLightingChanges.Reason` 区分 `INPUT`、`SOURCE`、`RESOURCES`、`COMPILE_NOTIFICATION`、
+`CAPTURE_CHANGED`、`WORLD` 与 `OVERFLOW`。输入和来源在可变状态发布前记录，资源变化记录全域理由；
+纯表示释放/驻留选择、字节相同的 active/dormant 重捕获不推进内容游标。
+日志最多保存 256 项原始事件，批次按读取游标之后的 node 合并且不可修改；落后游标遇到逐出或单批过大
+返回显式 `OVERFLOW`，禁止静默丢事件。已接受旧事件不扩大后续批次。
+
+有限 bounds 使用已认证未来来源全集，并入旧实际输出与新候选 overhang，坐标相对来源 section；
+未认证或非法界保持无界。它表达内容支持，不是照明影响范围，不能直接转成当前屏幕矩形。
+生产统一事务将批次编码为 little-endian 字节，64 B 头部与每来源 64 B，最多 16448 B。
+`D3D12RtNativeFrame` 校验 epoch 与 `lightingRevision` 和当前 coverage token 一致，
+经 FFM Arena 复制后调用 `mcdr_dx12RtFrameTransactionLighting`；输入缓冲 position/limit 保持。
+新导出缺失时明确拒绝，不能改走不携带事件的旧入口。
+
+`lightingCursor` 只在同一录制的最终合光成功且提交确认后推进；失败、取消、外来录制与缺少合光均不确认。
+native 将事件与当前几何记录、schema 1/2 空间目录拼入同一份受管不可变追踪表，按实际列表槽与 fence 保活。
+本协议不新增 SDK reset，NRD 生产仍使用八纹理。
+
+B-DXR 按实际查询射线段与内容支持界相交，在 `indirect.w` 的位表示中写入
+`PRIMARY_CHANGED`（bit 8）、`DIRECT_CHANGED`（bit 9）、`DIFFUSE_CHANGED`（bit 10）与
+`SPECULAR_CHANGED`（bit 11）。无界来源与全域理由保守标记实际发出的查询；确定零贡献而未发出的查询不制造依赖。
+最近表面查询截到当前最近交点或原 TMax；阴影查询使用整个原 TMax，可能保守包含确定遮挡后的来源。
+这些位与当前 unknown 资格分开，不清除当前辐射、主命中或材质，不直接改变 SDK 输入资格。
+
+当前查询标记本身不包含旧路径；最后已提交 raw 帧的支持记录见 §7.4。
+当前 NRD 已另外接入逐 pass 的累积内容依赖，见 §7.5；RR/独立 SR 的内部历史分别接入。
+
+### 7.4 已提交 raw 帧的逐信号支持
+
+生产内容事务在实际发出查询时，分别记录 primary/direct/diffuse/specular 射线段的保守 world-space AABB。
+每个 64×64 图像 tile 按四类合并，未实际查询的信号保持空支持；最近查询止于当前最近交点或原 TMax，
+阴影覆盖原 TMax。长阴影和间接 miss 的 AABB 可能保守覆盖很大范围，不等于精确照明影响域。
+
+native 在 `aux` 五平面之后追加 current、previous 与影响值，每块为 64 B 头部加每 tile 128 B，
+每 tile 另有一个 u32 影响值，尾部合计 `128 + tileCount × 260` B。尺寸、world、frameId 和内容 revision 随块保存。
+每帧 current 复制到独立 GPU 快照，仅在最终合光成功且实际提交确认后发布；取消或失败保留上次确认数据。
+复制来源、seed 和快照沿实际列表槽/fence 保活并计入受管内存；预算拒绝不发布半帧。
+
+新内容事件检查可消费的 previous 支持，影响值低四位分别表示四类相交，previous 缺失为 `0x80000000`。
+该值属于 **previous 帧图像 tile 坐标**，不能按同坐标隐式套到当前像素，尚未进入 SDK confidence。
+旧统一入口不分配该尾部，入口切换、尺寸或 world 改变不会冒用旧支持。
+
+这份独立 raw 快照只持有最后一个已提交帧；NRD 的累积依赖由 §7.5 的另一组资源维护。
+路径记录本身不改变当前辐射或 unknown 资格，也不触发全屏 reset。
+
+### 7.5 NRD 累积内容依赖
+
+携带内容批次的统一事务，将当前路径支持和同份事件表交给内部 NRD，公开接口仍使用八纹理。
+diffuse 合并 primary/direct/diffuse 支持，specular 合并 primary/specular；guide 传递 primary 支持。
+跟踪 shader 在真实 SDK 纹理读写位置传播依赖，覆盖空间滤波及 surface/virtual 重投影，
+旧路径在停止采样后仍随保留的积累继续存在。每帧内容事件查询永久池依赖，生成分 lobe 的 previous-texel mask。
+
+内部依赖 buffer、整数 mask 与常量环使用共享内存准入；未提交、取消、执行后失败和 shutdown 沿真实 fence 保活。
+局部事件不自动全屏 reset；首次切换跟踪或 world epoch 改变须重新开始没有配套依赖的历史。
+保守 tile/AABB 合并会扩大撤销范围，额外派发的世界性能与画质待验；RR 和独立 SR 内部历史尚未接入。
+构建、格式、故障和独立检查入口见 [native NRD 累积内容依赖](../../../MCDR/docs/advanced/nrd.md#累积内容依赖)。
 
 ## 8. G-Buffer pass（S2 2-c）
 
@@ -966,42 +1086,71 @@ G-Buffer 的 MS 在 `vs_main` 后用原始顶点 `Color` 覆盖输出的颜色 v
   这个枚举，`GEOMETRY` 只是给 S3 的几何调试留的名字。
 - `DEPTH` 视图铺的是 `g_DepthLinear` 的线性距离（已开平方），不是深度附件的 reverse-Z 原值：
   深度附件当 SRV 读回来全是 0，读不到。
-- 追踪半径（`TRACE_RADIUS = 96`）之外的地面拿不到主光线命中，合光直接放过原版像素——远处没有
-  光追阴影，与近处之间能看到一条亮度/色调分界，这是镜像范围的边界，不是几何错误。
+- 正常世界的几何选择使用实际 profile；远表面通过空间与信号资格后参与合光，不按固定 96 方块淡出。
+  缺页、缺内容和不能证明的区间仍为 unknown，不能从几何入选推导出远域光照完整。
 
 ## 9. 逐帧派发与合光（S2 2-d / 2-e）
 
 ### 9.1 一帧的顺序
 
-主 pass 结束 → G-Buffer pass（§8）→ 光追派发 → 合光 → 上屏 blit。四段都在同一条 DIRECT 命令列表里，
-只有 G-Buffer 与合光之间的两段需要 `inRenderPass == 0`。
+不透明 pass 结束 → G-Buffer pass（§8）→ 光追输入准备 → RT 合光与 blit → 原版 OIT → outline 等后续层。
+这些步骤使用同一条 DIRECT 命令列表；RT 派发、SDK 与合光必须在原版 render pass 关闭后录制。
 
 - **光追派发生在 `D3D12CommandEncoderBackend.recordGBufferPass` 的末尾**（`D3D12EndRenderPass` 之后），
   因为 native `beginRenderPass` 只认「当前没有打开的 pass」，而 `dispatchComputeEx` 又不检查
   `inRenderPass`——在 pass 里派发不会被 native 拦住，只会被 D3D12 调试层报错。
-- **合光与上屏在 `LevelRendererRtDebugViewMixin` 的 main pass 体 RETURN**：那时 OIT、outline 已合成，
-  深度还在，GUI 未画；`debugView = NONE` 走「合光 → blit」，其余视图走「G-Buffer 单图 → blit」。
+- **正常合光与上屏在 `LevelRendererRtDebugViewMixin` 的 `executeOit` 调用之前**：
+  `debugView = NONE` 先合成 RT 不透明背景，随后由原版 OIT 叠加普通 alpha 层，不能在 OIT 后覆盖这些结果。
+- **诊断视图保留在 main pass 体 RETURN**，覆盖显示相应附件；两处入口按 `debugView` 互斥，
+  共同检查 `rt.enabled`，异常交给 `D3D12RtFrame.reportFailure`。深度/透射率捕获仍在 OIT 后的 RETURN。
+
+正常 RT 当前要求 OIT。已有 `[mesh] terrain=true` 路径通过 `GameRendererTransparencyMixin` 强制 OIT；
+经典透明在同一个不透明 render pass 内绘制，正常视图回退光栅，不能使用 OIT 后覆盖作为替代。
+这只定义当前合成所有权，不表示真实流体/介质输运已经接入。
 
 ### 9.2 上传镜像
 
 几何池与材质表各带一个 `revision()` 计数器（`D3D12RtGeometryPool` / `D3D12RtMaterialTable`），
-`D3D12RtFrame.mirrorsFor` 把它俩和相机位移一起当键：池写进新段、材质表重烘、或相机移动超过
-`MIRROR_SLACK = 24` 方块时才重传。
+`D3D12RtFrame.mirrorsFor` 同时比较内容/材质版本、世界、实际请求域、载荷预算、相机位移与独立驻留需求。
+池更新、视距/高度范围/预算变更或相机移动超过 `MIRROR_SLACK = 24` 方块时重新选择；
+实际层组与内容不变时复用镜像，不重传顶点。
 
 **镜像不是整池。** `D3D12RtGeometryPool` 为实际保留的不可变顶点计算 `OutputBounds`，
 扫描完整 28 B 步长载荷，支持非零 buffer position；范围是全部顶点与来源 16×16×16 段盒的保守并集。
-`coverageNear` 与 `mirrorNear` 都以该输出界判断半径 `TRACE_RADIUS + MIRROR_SLACK` 的闭球相交，
-面、边、角接触也计入范围；来源段在半径外但输出伸入范围的几何仍进入目标和候选。
+正常世界的 `coverageFor` 与 `mirrorFor` 以该输出界判断实际视距/完整世界高度域的闭边界相交，
+面、边、角接触也计入范围；来源段在域外但输出伸入范围的几何仍进入目标和候选。
 任一 layer 相交时，以同一 `sectionNode` 的全部已发布 layer 为完整选择单位，
-仍按段中心距离、再按有符号 `sectionNode` 排序。
-整组超过 `MIRROR_RECORDS = 384` 条 layer 记录，
-或顶点 + 索引 + 材质 payload 合计超过 `MIRROR_BYTES = 128 MiB` 时停止，不能拆组或用更远区段填洞。
-索引计入每条记录的 4 B padding；两个预算不含记录表和 quad 缓冲容量的末尾对齐字节。
-最近一组本身超过预算时返回空镜像，不复用旧的大镜像。
+先按有效驻留需求的 FIFO 顺序；纯需求重选随后优先保留当前组，其余按实际输出界距离、再按有符号 `sectionNode` 排序。
+预算由热配置 `geometryPayloadMiB`（默认 128 MiB）、native 65535 records 与 256/64/8 MiB arena 共同决定。
+逐内容四字节对齐后加 64 B/record，超额整组记录原因并继续检查后续可容纳组；不能拆层。
+全部所需 targets 独立保留，不得按所选载荷裁掉缺口。
+
+`TRANSLUCENT` 参与同一完整层组，记录层号为 2、层标志为 4，打包标志为 `0x400`。
+只消费与本次实际 draw 的 index count、index source 和 stride 匹配的暂存载荷；
+缺少自定义索引时保留 missing，不能用顺序索引代替。原版流体经 `DefaultVertexFormat.BLOCK` 输出后使用同一发布流程，
+缺层时先撤销旧内容，完整重捕获后恢复；实际网格删除、dirty、资源发布与换世界按相同身份约束撤销。
+透明层与其它已发布层共同占用既有几何和完整组预算，不单独豁免或拆分。
+
+有限 unknown 来源的同批 GPU 反馈同时进入捕获与驻留入口；只为全部当前层载荷已存在、没有整段/层缺口、
+且未进入当前镜像的来源登记驻留提示。`requestResidency` 要求 worldEpoch/liveRevision 与当前池完全匹配，
+每批最多 64 个来源，队列最多 256 组，提示保留 250 ms。每组冻结全部实际 `Record` 身份与独立调度 identity；
+重复反馈更新期限但不移到队尾，调度不推进几何 revision。缺层、编辑替换、卸载、域撤销及换世界撤销旧提示。
+按完整组执行全部五类载荷/arena/记录限制，超额组不能拆分或阻塞后续可容纳组。
+
+纯需求重选仅在当前镜像已提交并成为活动 AS、且该镜像不在 pending 时进行，尝试间隔至少 100 ms。
+新镜像未提交或仍在构建时继续保留，避免连续反馈不断替换候选。选择、打包和上传失败不消费提示；
+只有实际几何提交后，才按同一调度 identity 和仍当前的完整组确认已准入提示，不消费并发到达的新提示。
+同一切片已提交时允许直接确认，不重复上传。后续没有新需求时保留当前选择，不自动退回距离顺序。
+`full_domain.geometry_selection` 的 `demanded_groups` / `admitted_demands` 记录本次候选中的需求组与准入数。
+这些提示只影响当前数据的可获得性；不授予可靠 miss、合法辐亮度或 SDK 缺样本语义。
+尚未覆盖无界来源、目录页调度或所有普通预算遗漏的公平性；持续超预算的活跃工作集仍可能换入换出。
+
+显式近域工具入口 `coverageNear` / `mirrorNear` 仍使用 `NEAR_RADIUS + MIRROR_SLACK` 闭球，
+镜像采用 384 records / 128 MiB 的前缀选择；该兼容入口的 payload 不含记录表和 quad 末尾对齐。
 范围判定以 Double 计算相机与段原点的差值，再计算到局部输出界的最短距离平方；
 中心与半径必须有限，半径不得为负。没有有限输出界的现存 record 不以来源段盒排除。
 输出界随当前不可变 record 更新、删除和 dormant 重入；offset 复用不继承上一内容的界，旧导出不变。
-GPU record 仍为 64 B；输出界使用独立 48 B `mcdr_rt_output_support`，当前契约为 ABI 45。
+GPU record 仍为 64 B；输出界使用独立 48 B `mcdr_rt_output_support`，当前契约为 ABI 46。
 `versions()` 在同一池锁内冻结当前 layer/version、缺失层与整段 dirty 要求的输出支持清单。
 flags=1 表示包含来源段盒的有限支持界；flags=0 表示没有可信有限界且坐标全零，layer=-1 表示等待整段当前编译。
 普通层的界来自当前输出或与当前缺层版本匹配的已完成编译候选；layer=-1 的有限界来自当前来源扫描。
@@ -1016,7 +1165,7 @@ flags=1 表示包含来源段盒的有限支持界；flags=0 表示没有可信�
 释放、逻辑 offset 复用或换世界不能修改旧导出；dormant 重入和材质回填采用 quad 内容写时复制。
 映射未变化时保留 quad identity 和 revision，材质映射变化不改变顶点/索引或兼容 BLAS 的内容版本。
 
-选择变化立即生成新的镜像，不再按固定帧数延后。近场记录及其版本未变时复用同一个 `MirrorSlice`，
+内容/域/预算变化立即生成新的镜像，纯需求重选执行上述准入间隔。近场记录及其版本未变时复用同一个 `MirrorSlice`，
 远处区块上传不重建近场数据。完整 CPU 快照与材质均未变时复用 native 令牌；
 选择变化时上传完整小表，但未变内容只提交 identity 与长度，不再紧排、经 FFM 复制或重传。
 只在成功复用选中切片或成功创建 native 快照后更新镜像中心；上传失败必须保留原中心，
@@ -1073,15 +1222,33 @@ arena、DEFAULT 或 UPLOAD 背压时先清热缓存，保留仍有效的当前�
 `StorageStats.retainedContentBytes` 统计尚未被回收的 backing 内容，包含旧导出，弱引用清理后才扣除；
 它不包含对象开销、record table 或诊断生成的紧排副本，不能直接当 JVM 总内存预算。
 `RT upload: payload=… staged=…` 分别报告实际上传有效字节和 FFM 对 heap 内容的暂存字节。
-`D3D12GetRtGeometryMemory` 分别返回在用 DEFAULT/UPLOAD 的 committed 容量，去重共享 arena，并计入旧快照与在途多代。
-Snapshot 与 delta 入口共享两类在用内存各 512 MiB 的上限，换世界或 encoder 不重置账本。
+`D3D12GetRtGeometryMemory` 分别返回实际 DEFAULT/UPLOAD 的 committed 容量，去重共享 arena，并计入旧快照、在途多代与延迟删除资源。
+几何、AS 与显式登记的帧资源共用物理寿命租约总账，除各自域上限外还受 `[rt] managedMemoryMiB` 约束；资源真正释放后才退账，取消或撤销令牌不能提前退还分配。
+Snapshot 与 delta 入口共享两类物理内存各 512 MiB 的上限，换世界或 encoder 不重置账本。
 Snapshot 分配前检查新增 DEFAULT/UPLOAD 容量；纯引用复用不重复计费，背压清零输出且不提交或等待 GPU。
-RT 私有 buffer 仅复用相同物理容量的池内资源，容量按请求的 256 B 对齐值确定，不能以小请求借入大资源突破估算。
-通用 buffer pool、AS、SDK 历史和完整 CPU 导出预算仍需分别核算。
+几何 buffer 使用独立精确容量分配，不借用或进入通用池；驱动失败只退还未物化的预留，已创建的失败前缀继续计费至物理删除。
+`D3D12SetRtManagedMemoryBudget` / `D3D12GetRtManagedMemoryBudget` 是可选 FFM 入口，
+setter 使用字节单位，getter 返回六个 `RtMemoryAccount`：total、geometryGpu、geometryUpload、
+acceleration、frameGpu、frameHost；每项依次为当前字节、上限字节、拒绝次数和峰值字节。
+几何 DEFAULT、UPLOAD 与 AS 各限 512 MiB，帧域上限 0 表示只受共享上限约束。
+成功录制的生产帧保存账本快照，profile 版本 3 的 `native_managed_memory` 输出六个账户，
+各有 `bytes` / `limit_bytes` / `rejections` / `peak_bytes`；入口缺失或查询失败时省略该对象。
+查询不触发回收，物理退休不重置峰值或拒绝计数。
+帧域包含曝光、G-Buffer、raw/guide/信号、常量/记录表上传、SBT、捕获快照、SDK 的外部输入输出、
+独立 SR/合光目标和需求反馈资源；受管 buffer 不进入通用池。
+NRD 的永久/瞬态池纹理与常量 UPLOAD 环同样计入 frame GPU/host；在途退休池继续占用额度，
+生产帧创建或 G-Buffer 开始前仅回收已安全完成的旧池，不通过查询或等待 GPU 回收。
+NRD 初始化因预算拒绝时不发布输出，也不永久禁用相同尺寸和 plan 的下一帧。
+通用渲染资源、NRD CPU 对象、其它 SDK 内部分配/历史、CPU 导出/复制、描述符、PSO/状态对象、query pool 与驱动私有开销尚未计入，
+该账本不是整个 scene、JVM 或设备的总用量。
+24 值 ABI 布局与失败规则见 [native 受管分配总账](../../../MCDR/docs/advanced/rt-frame.md#17-native-rt-受管分配总账)。
 接口与取消/退休约束见 [native 几何快照](../../../MCDR/docs/advanced/rt-frame.md#11-不可变几何快照)。
 `_port/rt_world_geometry_check.py --recording-recovery-only` 检查产品镜像的提交归属、热返回、
 共享 arena 内容并集、编辑/删除、唯一内容/材质预算、背压重试及释放；
 `_port/rt_geometry_snapshot_check.py --delta-only` 通过实际 GPU 表与范围读回检查增量复用和在途退休。
+`_port/rt_geometry_snapshot_check.py --physical-memory-only` 检查真实分配失败、延迟删除背压和物理回收后恢复准入。
+`_port/rt_native_frame_check.py --managed-memory-only` 检查共享上限对几何、AS 与帧资源的实际背压；
+`_port/rt_managed_memory_check.py` 检查真实配置/FFM 与诊断输出，`prepare()` 复用上下文由 fixture 提供。
 这些检查不替代世界内噪点、卡顿与流送稳定性的目视和性能验收。
 
 记录里的 `materialOffset` 存的是 **quad 序号**，不是字节偏移：shader 侧 `RtQuadMaterial` 自己乘 2 取 u16。
@@ -1089,9 +1256,17 @@ RT 私有 buffer 仅复用相同物理容量的池内资源，容量按请求的
 ### 9.3 追踪尺寸与几何预算
 
 `D3D12RtPipelinePlan` 统一决定 trace 与 G-Buffer 的 render 尺寸，追踪不再有独立低分辨率上限。
-`TRACE_RADIUS = 96.0f`、`MIRROR_RECORDS = 384`、`MIRROR_BYTES = 128 MB` 限制近场镜像。
-硬件 BLAS/TLAS 处理求交，镜像按段 AABB 与选择球是否相交裁剪，段中心距离只决定选择优先级。几何或材质改变立即刷新所选镜像；
-只有当前镜像的加速结构全部就绪才派发。远处上传未改变近场集合时复用镜像与历史。
+正常世界的几何选择使用实际生产域，载荷预算见 §9.2；原射线区间为 TMax=1e9。
+`D3D12RtFullDomainProfile.compositeRadius` 对同一世界的有效请求返回 0，关闭距离淡出；
+无匹配请求时返回 `LEGACY_RADIUS=96.0f`，保留显式近域工具的合光行为。
+硬件 BLAS/TLAS 处理求交；几何、材质、生产域或载荷预算改变时重新评估镜像，不变内容继续复用。
+已发布的配对镜像/AS 可包含仍待建的完整组代理；缺失区间保持 unknown，不能等待整域全部构建才保留未变区域。
+
+从工作区根运行 `python _port/rt_shadow_query_check.py --far-scene`，核查跨页原查询、
+unknown 位于命中前后、有限端点及独立 TraceRay 结果。
+`python _port/rt_pending_frame_check.py --partitioned-section --far-primary 264` 核查远表面的
+实际追踪、材质 guides、曝光、SDK 输入与最终合光；追加 `--unproven-space` 核查空间证明缺失，
+追加 `--legacy-fade` 核查显式近域淡出。探针执行真实 NRD，RR 只核查准备输入，不执行 RR 求值。
 
 ### 9.4 解调纪律
 
@@ -1109,12 +1284,12 @@ RT 私有 buffer 仅复用相同物理容量的池内资源，容量按请求的
 `debug mode 9` 使用固定环境常量，供 `D3D12RtLightContract` 的 CPU 参考对拍。
 
 ```
-if (direct.w == 0) out = 原版像素          // 没有光追数据：天空、实体、追踪半径外
+if (direct.w == 0) out = 原版像素
 else {
     linear = albedo * (direct + indirect) + specular * f0 + specularGrazing + emissive
     color = WgaLinearToSrgb(WgaTonemapAces(linear * exposureTexture[0,0]))
-    fade  = saturate((radius - hitDistance) / (0.35 * radius))  // gAux.x = 命中距离
-    out   = lerp(原版像素, color, fade)                        // 半径边缘淡出，避免一圈接缝
+    fade  = radius > 0 ? saturate((radius - hitDistance) / max(0.35 * radius, 1)) : 1
+    out   = lerp(原版像素, color, fade)
 }
 ```
 
@@ -1122,10 +1297,10 @@ else {
 原版其余绘制都在 gamma 空间写，线性辐亮度直接写进去会整幅发暗。G-Buffer 里的 albedo 保持线性，不做任何编码。
 
 合光的第 5 个 SRV 是主目标颜色本身、第 6 个是 `gAux`（只用到 `x` = 主光线命中距离）：
-命中距离接近 `TRACE_RADIUS` 时淡回原版像素，否则半径处会有一条「RT 地面 / 原版地面」的硬边。`gDirect.w` 为 0（主光线在镜像范围内没打到三角形）或
-albedo 的 `a` 为 0（G-Buffer 没写过这个像素）时**原样放过主 pass 的像素**：这样天空还是原版的天空、
-实体与粒子还由原版画、`TRACE_RADIUS` 外的远景也保持原版外观。用辐亮度硬填这些像素的后果是
-「天空变成常量色、远处出现一条偏蓝地带」。
+正常世界 profile 使用 `radius=0`，有效远表面的 `fade=1`；只有显式近域工具在正半径边缘淡回原版。
+这个常量控制合光，不裁剪原查询的 TMax。
+`gDirect.w` 为 0（没有可消费的主表面信号）或 albedo 的 `a` 为 0（G-Buffer 未写过该像素）时，
+**原样放过主 pass 的像素**。天空、未接入对象和未知区间不由无效辐亮度覆盖；取消距离淡出不改变这些资格检查。
 
 合光读 G-Buffer 的 albedo（`RGBA8_UNORM`，已是线性空间）与 emissive，按 `gRadianceW/H`
 把输出像素映射到降采样的辐亮度像素再取 16 B 三元组——**不能拿输出像素直接索引辐亮度缓冲**，
@@ -1136,7 +1311,15 @@ albedo 的 `a` 为 0（G-Buffer 没写过这个像素）时**原样放过主 pas
 
 ### 9.5 调试视图怎么出图
 
-`[rt] debugView` 不为 `NONE` 时不再合光，而是把一张图铺到主目标上：
+`LevelRendererRtDebugViewMixin` 负责选择注入时机并把 `LevelTargetBundle` 传给
+`D3D12RtPresentation.blit()`。`NONE` 在 `executeOit` 前合光，诊断视图在主 pass 返回时上屏；
+关闭 RT 时两处都跳过。上屏逻辑与失败计数保存在普通 Kotlin 对象 `D3D12RtPresentation`，
+不从其它类引用 Mixin 实现类。
+
+`[rt] debugView` 决定主目标上的输出。`DIRECT` / `HIT_DISTANCE` / `COVERAGE` / `INDIRECT` /
+`SHADOW` / `COMPOSITE_MARK` 分别选择合光模式 1–6，四个 `*_VALIDITY` 视图选择 7–10；
+`NONE` 使用默认合光模式 0。合光输出及法线/粗糙度中间纹理必须与目标同尺寸，尺寸不一致时跳过该帧。
+其它视图按下表选择图像：
 
 | `debugView` | 源 | 通道 |
 | --- | --- | --- |
@@ -1229,7 +1412,8 @@ CPU 参考独立计算命中、材质和辐亮度；受控场景的离散量和�
   阴影方向与长度随世界实际太阳位置变化；太阳辐亮度仍为 `SUN_COLOR × SUN_STRENGTH` 常量。
 - 辐亮度缓冲按窗口高度自适应派发（854×480 下 1/4、2560×1334 下约 1/9），边缘有块状放大；阴影越远越糊，
   这是 S2 的临时规模，S8 换自适应采样。
-- 只扫相机 96 方块内的段：更远的地形既不投影也不遮挡，`TRACE_RADIUS` 之外淡回原版像素。
+- 正常世界按实际生产域与载荷预算选择几何；未驻留、未认证和未接入类别仍可能形成 unknown，
+  有效远表面不再受固定近域合光淡出限制。
 - 光追链上的任何异常都不许冒泡到帧图：`D3D12RtFrame.reportFailure` 只记前四次日志，`recordGBufferPass`、调试视图 mixin、池的 `publish` 都包了 try/catch——出图是开发档功能，崩掉整帧比丢掉一张图糟得多
 
 
@@ -1251,7 +1435,7 @@ CPU 参考独立计算命中、材质和辐亮度；受控场景的离散量和�
 | --- | --- | --- |
 | `rt_dxr_lib.hlsl` | `RtRayGen` | 主光线、漫反射与 GGX 镜面弹射，共五张 raw 缓冲（SRV t0..t5 / UAV u0..u4） |
 | `rt_integrate.hlsli` | `RtIntegrate` | DXR 主光线、直接光与一次间接弹射的积分实现 |
-| `rt_resolve.hlsl` | `RtResolve` | diffuse/specular 重调制、自发光、曝光、显示变换与半径淡出（SRV t0..t11 / UAV u0） |
+| `rt_resolve.hlsl` | `RtResolve` | 当前资格、diffuse/specular 重调制、自发光、曝光、显示变换与半径淡出（SRV t0..t13 / UAV u0） |
 | `rt_exposure.hlsl` | `RtExposure` | 线性 HDR 表面测光与 1×1 曝光倍率更新（SRV t0..t6 / UAV u0） |
 | `rt_debug.hlsl` | `RtDebug` | 单通道调试图：0..3 = x/y/z/w，4 = 法线档 |
 | `rt_motion.hlsl` | `RtMotion` | 运动矢量：线性深度重建世界点后按上一帧矩阵重投影（SRV t0 / UAV u0，见 §19） |
@@ -1417,7 +1601,8 @@ compute 根签名固定四个参数：`[0]` SRV 表（`t0..`）、`[1]` UAV 表�
 
 - 界面：标题、显示包名的副标题、按 `group` 分段的行、底部「完成」；布尔点击切换、枚举点击循环、
   区间项在行内轨道上点或拖取值。逐行规则见 `docs/misc/settingscreen/README.md` §6.11。
-- B-DXR 包后端固定 DXR。其余选项按 §1 标明是否生效；没有加速结构开关。
+- B-DXR 的后端枚举使用 `enum:DXR-WG`，界面在 DXR 与实验 WG 之间循环；默认 DXR。
+  其余选项按 §1 标明是否生效；没有加速结构开关。
 
 ## 12. 加速结构原语（S3 3-a）
 
@@ -1538,7 +1723,8 @@ S3 的 `D3D12RtBlas` 是**一 (段, 层) 一条 BLAS、每条只放一条几何*
 - BLAS 按段常驻，所以要回收：每项记最后一次出现的帧号，`EVICT_FRAMES = 180` 帧没再出现就销毁
   （每 60 帧扫一次）。不回收的话走动起来条目只增不减，显存跟着世界大小涨。
 
-几何经过 `setSectionMesh` 安装前的生产者/内容令牌校验，并在原版确实安装后按整段发布。
+`setSectionMesh` 安装前校验当前任务及网格身份；原版确实安装后，RT 几何另经生产者/内容令牌校验按整段发布。
+RT 资格失败不阻断原版安装或保持任务永久待安装，未恢复内容由有预算的恢复队列处理。
 上传 HEAD 只暂存 CPU 字节，同一 mesh/layer 的重试不重复收集；整段替换同时删除不再存在的层。
 当前空网格解除等待目标，reset 移除该段的注册与资格，取消任务释放暂存数据。
 每次提交的非空层取得新的原版上传版本；RT 池按 §9.2 比较内容，分别保留或更新几何与着色身份。
@@ -1757,10 +1943,10 @@ payload 的字段大小与原生那个数字对拍，改着色器的人不必记
 | `HITCUTOUT` | `RtClosestHit` | 无 | 镂空（叶子等） |
 | `HITINVALID` | `RtInvalidHit` | `RtInvalidIntersection` | 待重建 section 的程序化失效体积 |
 
-两个组暂时共用同一个 closest-hit：镜像几何没有 alpha，镂空判据要等材质表带上 alpha 才有意义。
+两个组共用同一个 closest-hit，生产 alpha 判定由 inline query 执行，见 §17.3。
 实例表里 `InstanceContributionToHitGroupIndex` 按层写：镂空 / 半透明层写 1（`HITCUTOUT`），
-其余写 0（`HITOPAQUE`）。两个组暂时共用同一个 closest-hit，所以这条现在只影响走哪条 SBT 记录；
-等材质表带上 alpha，`HITCUTOUT` 才会真的做出镂空。
+其余写 0（`HITOPAQUE`）。SBT 的传统 `TraceRay` closest-hit 不执行覆盖测试，
+不能用其原始交点代替生产主光线、次级光线和阴影的 alpha 查询结果。
 
 失效代理的贡献下标为 2，使用共享的程序化 AABB BLAS，局部边界为 `[0,16]³`。
 生产实例按当前冻结的有限输出界平移、缩放，保守舍入并校验包含性；不能可靠表示变换时显式保留无界 unknown。
@@ -1775,7 +1961,9 @@ inline 查询读取 `CANDIDATE_PROCEDURAL_PRIMITIVE`；`TraceRay` 路径由 `RtI
 最近表面查询遇到位于已知表面之前的代理，返回 unknown，不能越过代理选择更远的表面。
 
 生产 scene 对全部层与 live 版本匹配、仅 AS 未建好的 section 认证原查询补齐资格。
-快照最多 384 条 record；先认证全部当前层，再把首个到最后一个待建 record 作为补查范围。
+快照总量遵守几何协议的 65535 条 record 上限，补查资格逐 section 认证。
+整场景记录数超过 384 不影响当前完整内容的认证，也不增加每条原查询的工作额度。
+先认证全部当前层，再把首个到最后一个待建 record 作为补查范围。
 该范围必须连续、只含同一 section、数量为 1–127，且各 record 与当前 live 版本匹配；内容认证与查询预算分开。
 范围外已有当前可消费 BLAS 的层保持普通实例可见，其三角形不占补查额度；范围内已建记录仍补查并计费。
 完整 section 的 records 可以不连续；两个待建 record 之间夹有其他 section 时保留 unknown。
@@ -1783,6 +1971,12 @@ inline 查询读取 `CANDIDATE_PROCEDURAL_PRIMITIVE`；`TraceRay` 路径由 `RtI
 bit 23 是认证标志，bits 16–22 是连续 record 数，bits 0–15 是首 record 索引。
 `rt_pending_query.hlsli` 只在认证标志存在时解码补查范围，直接读取同一快照的当前记录并校验 sectionNode，
 沿原 origin/direction/TMin/TMax 求实际三角形交点，每条原查询最多 256 个三角形、8 个 section。
+软件补查在硬件候选遍历完成后进行，局部八项队列按入口距离保留最近的不同组；
+同组重复候选合并最早入口，相同距离按 identity 排序。队列满时近组替换远组，
+被丢弃的最早入口继续作为 unknown；它在最终可靠命中之后才不影响该最近表面。
+从近到远补查，并以已有实际最近交点收紧内部上界，后方组不再消耗三角形余额；
+原采样方向、PDF 与 TMax 保持。阴影先使用硬件遮挡证明，无证明时再消费同一有界队列。
+溢出至多提示最早丢弃组；丢弃的组后来重新入队时仍可保守保留原 unknown。
 最近表面必须能在剩余额度内完整测试认证范围，超额仍为 unknown，不能用局部命中推导最近表面。
 阴影在范围超额时可只测试不透明类别 `(flags & 0xFF00) == 0x100`，按实际测试逐三角形扣除共享余额。
 找到原区间内的真实遮挡即可证明阴影；没有找到、额度用尽或内容不合法时仍 unknown，不能证明无遮挡。
@@ -1793,15 +1987,24 @@ bit 23 是认证标志，bits 16–22 是连续 record 数，bits 0–15 是首 
 
 警告：补查数量上限不等于 GPU 时间预算。当前生产射线的 `TMax=1e9`；
 有限区间体积判定不扩充目标清单以外的空间覆盖，也不解决一般缺样本恢复。
-几何认证不签发空间状态 1、2。当前生产 JVM 仅发布 0、3、4、5；几何补查与完整 BLAS 都不能越过空间 unknown。
+几何认证不签发空间状态 1、2；JVM 必须另行完成来源、内容与 targets 认证。
+几何补查与完整 BLAS 都不能越过空间 unknown。
 
 太阳遮挡只需证明射线区间内存在可靠遮挡物。`RtTraceShadow` 使用
 `FORCE_NON_OPAQUE` 与 `ACCEPT_FIRST_HIT_AND_END_SEARCH`：
 代理只记录 unknown 并继续遍历，真实三角形 commit 后即可证明遮挡，即使代理在其前方。
 没有可靠遮挡物但遇到代理时保持 unknown；两者都没有才是可靠无遮挡。
 `CANDIDATE_NON_OPAQUE_TRIANGLE` 且 `CandidateInstanceID() < RtRecordCount()` 表示真实三角形，程序化候选表示代理；native 常量必须使用该快照完整记录数，
-不能替换成 active instance 数。当前不透明与 cutout 都按已提交三角形遮挡，不提供 alpha any-hit。
+不能替换成 active instance 数。不透明层直接接受；CUTOUT 候选通过 §17.3 的实际 alpha 覆盖测试才提交。
+透明孔洞继续遍历，覆盖数据不可用时保留 unknown；原区间内其它可靠三角形仍能证明阴影被遮挡。
 可补齐的代理先进行上述实际求交；已知遮挡证明优先于其他未解决缺口。
+
+`RtTrace` 的 `opaqueBackground=true` 重载只供产品主查询取得 OIT 后方的不透明背景，
+跳过真实 records 中 `(flags & 0xFF00) == 0x400` 的 TRANSLUCENT 候选。
+同模式的认证待建补查不计入这些透明记录的三角形额度。普通/次级与阴影查询遇到透明交点保留 unknown，
+不能把未实现的折射、吸收或介质边界当作不透明面或可靠透明 miss。
+生产 RT 池提供实际 TRANSLUCENT 载荷；缺层、真实未知代理和空间 unknown 不因背景模式消失。
+主查询可以穿过当前已捕获的透明层取得背景；透明层缺载荷时必须继续拒绝未证明的背景。
 
 未取得完整当前内容与补查认证的 section 中，已有可消费 BLAS、node/layer/version 与当前 live 表匹配，且 `(flags & 0xFF00) == 0x100` 的不透明层，
 保留为 mask=`0x80` 的阴影专用实例。`RtTraceShadow` 可以使用它证明遮挡，`RtTrace` 不可使用它提供主表面或 bounce 命中。
@@ -1816,8 +2019,8 @@ cutout、translucent、过期、缺席、未建或不可消费的层不授予该
 自发光、环境项与其它 lobe 继续求值。判断不设能量 epsilon，任一通道有非零贡献仍查询。
 未查询时 aux 的可见性使用局部视差可见性；`SHADOW` 图中的该值不能作为外部遮挡物存在或不存在的证明。
 
-主光线、diffuse/specular 最近表面或上述阴影查询仍为 unknown 时，当前积分仍会清除整个样本的
-radiance、aux 和有效标记，合光按 `direct.w=0` 直通原版；逐信号恢复尚未实现。
+主查询 unknown 清除主表面输出并使用当前光栅降级。次级 unknown 只撤销对应 direct、diffuse 或 specular，
+保留可靠主命中、材质及其它当前信号；完整逐 lobe 缺样本估计仍待接入。
 正常三角形命中必须显式初始化 `RtHit.invalid=false`，不能把减少阴影假 unknown 当作完整缺样本修复。
 
 ### 16.4 SBT 排版（native 生产与 JVM 自检）
@@ -1854,7 +2057,8 @@ GPU 探针直接通过 MCDR ABI 建 BLAS/TLAS，再用包内 DXR 库追踪受控
 `--two-layers` 验证当前全部层认证后的硬件/补查分工，以及编辑、缺层后退回独立阴影证明。
 `--noncontiguous-layers` 验证已建层不连续时仍能补查唯一待建层；`--resident-quads 129` 验证 258 个已建三角形不占软件补查额度。
 `_port/rt_pending_frame_check.py --partitioned-section` 沿未修改的生产 shader 执行待建/完成与两条输入编码的四个完整帧，
-核对当前 primary、材质 guides、SDK 输入、曝光与合光；NRD 实际执行 31 passes，RR 仅检查准备输入。
+核对当前 primary、材质 guides、SDK 输入、曝光与合光；NRD 实际执行，RR 仅检查准备输入。
+添加 `--scene-records 400` 可检查大场景的实际补查及同一完整消费链。
 加 `--unproven-space` 时改用状态 5，要求四帧均保留 primary unknown 与源画面所有权，不能由几何认证推导空间完整。
 `_port/rt_pending_frame_check.py --shadow-proofs` 经真实 native 帧验证五类查询、三个阶段与两条 SDK 输入编码的 30 个用例，
 检查可靠遮挡、primary unknown、PBR guides、SDK 输入、曝光和合光；NRD 实际执行，RR 仅检查准备输入。
@@ -1876,11 +2080,11 @@ GPU 探针直接通过 MCDR ABI 建 BLAS/TLAS，再用包内 DXR 库追踪受控
 | 配置 | 实际执行 | 不可用时 |
 | --- | --- | --- |
 | AUTO / DXR | DXR 状态对象 + SBT + DispatchRays | 关闭光追或跳过未就绪帧 |
-| WG | 当前回退 DXR，日志报告 WG 尚不可用 | DXR 不可用时关闭光追 |
+| WG | 实验 WG 状态对象 + SetProgram + DispatchGraph，无 SBT | 创建不可用时报告并回退 DXR；DXR 不可用时关闭光追 |
 | mode=OFF 或未选包 | 原版渲染 | 不分配 RT 帧资源 |
 
 `RAW`、RR、NRD_SR 是独立的降噪轨道，不改变上述追踪路由。
-实际成功派发的统计为 `tier=dxr`；WG 回退不得报告为 WG。
+实际成功派发的统计为 `tier=dxr` 或 `tier=wg`；WG 回退报告实际 DXR。
 
 ### 16.8 实机验收清单
 
@@ -1946,11 +2150,12 @@ native 复制数据并在当前主列表上传，分别共享不变的几何组�
 该表包含可用记录与仍需补齐的非空层。CPU 导出容量不足、复制异常或非空上传缺少 CPU 字节时，
 保留当前所需版本并撤销该层的旧载荷；条目存在不表示几何已经上传或可供追踪。
 当前完整上传成功后用实际几何身份替换待补齐要求；只有明确移除该层或退出世界才删除要求。
-`coverageNear` 在同一池锁内捕获版本表和独立 section node 清单，后者按 node 去重、排序并缓存为只读 8 B 数组。
+`coverageFor` / `coverageNear` 在同一池锁内捕获版本表和独立 section node 清单，后者按 node 去重、排序并缓存为只读 8 B 数组。
 目标包括范围内仍需非空层的段，以及已收到 dirty、等待当前编译结果的段；后者可以没有任何当前层要求。
-生产范围沿用镜像选择锚点和 120 m 选择球，即 `TRACE_RADIUS=96` 加 `MIRROR_SLACK=24`，
-按段 AABB 与闭球是否相交取得目标；没有增加追踪半径或记录/字节预算。
-目标不受 384 条记录/128 MiB 的载荷选择上限裁剪；整段载荷缺失或被预算整组省略时仍是所需目标。
+生产范围使用冻结的实际视距和完整世界高度，按当前输出支持界与该域的闭边界相交取得目标。
+显式近域工具入口仍使用 120 方块选择球；正常世界不受该球裁剪。
+目标不受所选 records/字节上限裁剪；整段载荷缺失或被预算整组省略时仍是所需目标。
+native targets 最多 65535 条，超过该技术上限的 profile 尚未支持；不得截断后声明覆盖完整。
 `D3D12PrepareRtSceneTargets` 同时提交两份清单，续建候选、推导局部失效并发布配对镜像/AS；native 拥有 BLAS/TLAS、scratch、TLAS view 与不可变实例表。
 无当前层清单的目标保留无界 unknown，不能复用旧几何提供最近表面、待建补查或阴影证明。
 已观测 dirty 目标不构成完整空间清单；未观测、卸载、范围外和无限太阳查询的支持域仍未认证。
@@ -1959,6 +2164,36 @@ trace 传 accelerationId，native 核对它与 snapshotId 配对、构建完整�
 构建、过滤与追踪的具体资源保留至实际列表槽完成，取消候选或替换已发布场景只撤销令牌。
 JVM 仍负责着色器生成、捕获通知、CPU 几何池/范围选择与镜像令牌缓存、普通调试纹理及上屏 blit。
 统一帧录制已有离线 FFM 与真实 GPU/SDK 检查；完整空间/内容协议、逐信号恢复、预算和世界内切换验收仍未完成。
+
+### 16.11 实验 Work Graph 帧
+
+在 B-DXR 光影包设置中选择 `backend=WG`。默认仍为 DXR，`AUTO` 不自动升级 WG。
+`D3D12RtNativeFrame` 编译 `rt_wg_lib.hlsl` 为 `lib_6_9`，经 ABI 46 的
+`mcdr_dx12CreateRtWorkGraphFrame` 创建上下文；其它七个 compute 程序和 128 B 创建描述保持相同。
+切换后端时释放旧帧上下文、重建 G-Buffer 与历史；历史身份和 `tier` 使用实际后端。
+
+图包含四个真实节点：
+
+| 节点 | launch / 记录 | 当前职责 |
+| --- | --- | --- |
+| `RtWgPrimary` | broadcasting，8×8；12 B CPU 入口记录 | 按实际追踪尺寸生成像素任务，网格上限 2048×2048×1 |
+| `RtWgTrace` | thread；8 B 像素输入 | 准备主表面、直射与次级任务，写初始 raw、材质 guide 和主表面/直射路径支持 |
+| `RtWgRecursive` | thread；76 B 任务；最大递归深度 3 | 每次执行 diffuse 或 specular 次级查询，自递归处理剩余任务，写对应 raw 与路径支持，累计有效性 |
+| `RtWgResolve` | coalescing，64 线程；12 B 像素/有效性输入 | 写最终逐信号 mask，供原有曝光、NRD/RR、SR 与合光消费 |
+
+共享积分器拆为主表面准备和独立次级查询；DXR 顺序执行同一任务，WG 通过记录延续。
+diffuse 与 specular 是同一主表面的独立 lobe，按序处理不增加物理弹跳深度。
+零 diffuse、拒绝的 specular 和 primary unknown 直接跳过相应任务；未完成任务保持对应 unknown。
+两个 thread 输出声明合计 88 B，符合 128 B 上限；device-scope UAV barrier 保障节点间访问可见性。
+
+native 验证非空图、唯一入口 `RtWgPrimary`、12 B 入口大小与非零 program identifier；
+backing 按驱动返回的最大字节数及 granularity 分配，纳入 RT 受管内存和实际 fence 退休。
+首次录制带 `INITIALIZE`；初始化录制取消或不可消费时重新初始化。后续使用共享帧提交与取消协议。
+
+当前为工程接入：事务、NRD/XeSS 消费、取消恢复、预算/退休及路径支持已有真实 native 检查。
+已有 diffuse/specular 查询的生产递归任务已接入；SDK query/training 图记录、更深输运和材质分流仍待接入，
+辐射缓存为 `none`。实际递归、逐信号汇总和 raw 消费已有定向 GPU 检查；
+WG 世界画面、持续运行与性能均待验，不登记为稳定支持。
 
 ## 17. labPBR 材质图接入
 
@@ -2031,6 +2266,20 @@ diffuse/specular 的采样 seed 使用实际帧号 `RtFrameIndex()`，sampleInde
 `RtSampleSurface` 使用 DXR 返回的三角形重心坐标插值顶点 UV，将 atlas UV 转为精灵局部坐标，
 以最近邻采样 `_s` / `_n`。主命中与二次命中调用同一函数，不把整张材质图平均成一个数。
 
+基础图 RGBA 在材质烘焙时独立捕获，不依赖 PBR 开关或 `_s` / `_n` 是否存在。
+40 B 材质记录的 +36 指向既有 64 B 贴图头；头内 +40/+44/+48 为基础图的相对字节偏移、宽和高，
+像素保留 ARGB。基础色按重心 UV 逐命中读取，再乘顶点 RGB；缺少精灵时继续使用常量材质退化。
+
+地形 CUTOUT 的覆盖测试由 `RtAlphaCoverage` 在接受交点前执行，硬件 inline query 与完整有界补查共用。
+按三角形重心插值原始 atlas UV 和顶点 alpha，最近邻读取基础图 alpha；
+两者乘积 ≥0.5 才接受，低于阈值则继续查询后方。阈值对应原版 `RenderPipelines.CUTOUT_TERRAIN`，
+SOLID 层保持不透明，`_n.A` 高度和 `_s.A` 自发光不能代替覆盖 alpha。
+TRANSLUCENT 的普通覆盖谓词返回 unknown；只有主查询显式取得 OIT 不透明背景时跳过真实透明记录，见 §16.3。
+材质头、像素范围、尺寸或 UV 无效时返回 unknown，不能当作空气或整面遮挡。
+最近表面遇到更近的未知 alpha 时拒绝提供确定命中；未知位于可靠最近命中之后则不否决该命中。
+阴影只需原区间内存在一个可靠遮挡证明，其它未知 alpha 不否决该证明。
+补查仍共享 256 个三角形和八个 section 的上限；超额阴影仅扫描不透明层，不为 cutout 签发证明。
+
 `_n.A` 为高度，255 表示原表面，较小值向内凹。每个高度像素表示等高柱体，保留水平顶面与垂直侧壁，
 禁止在相邻高度之间插值。沿入射方向按像素边界做 DDA，在每格内解析求顶面或入格侧壁交点；
 遍历上限为高度图宽加高再加 1，不以固定层数跳过单像素窄脊。太阳自遮挡使用同一柱体与格边界。
@@ -2053,14 +2302,18 @@ diffuse/specular 的采样 seed 使用实际帧号 `RtFrameIndex()`，sampleInde
   射线起点偏移仍沿几何法线，映射法线背向观察方向时回退几何法线。
 
 当前限制：贴图动画取首帧；`_n.B` 的 AO 和 `_s.B` 的孔隙/SSS 尚未接入。
-有材质图的二次命中同样采样基础色，缺图材质继续使用精灵均值。
+二次命中同样采样基础色；没有可用基础图的材质使用精灵均值，CUTOUT 覆盖仍显式 unknown。
+当前 cutout 支持静态首帧地形贴图，动画帧同步和透明介质输运尚未接入。
 
 ### 17.4 验收
 
-- 不配 `packPath`、不启用材质包：日志那行是 `from resources` 且 `spec=0`，画面与接入前一致；
+- 不配 `packPath`、不启用材质包：日志为 `from resources` 且 `spec=0`，基础图纹理和 CUTOUT 覆盖仍参与 RT；
 - 配 `packPath = Illusion-HPT-Shaders/SPBR-22_6`：`spec` 应是几千（该包 10 659 张图里 3 757 张 `_s`），
   石头/木头/金属的粗糙度与金属度各不相同；
 - `rt_pbr_loader_check.py` 调用产品 PNG 读取与打包，验证 ARGB、alpha=0、首帧裁切、偏移与不可变快照。
+- `rt_alpha_coverage_check.py` 消费产品捕获的基础 RGBA，实际执行 inline 最近表面/阴影及有界补查，
+  检查透明孔洞、0.5 阈值、顶点 alpha、atlas 边缘、u16/u32 索引、缺失/非法数据和真实待建代理转已建实例。
+  该检查不比较不同降噪器画面，静态世界内的叶片轮廓和阴影观感由用户确认。
 - `rt_parallax_probe.py` 由 GPU 信号探针调用，用独立射线/柱体包围盒交点验证离散台阶、四向侧壁法线、
   正负方向和格边界、单像素窄脊与太阳自遮挡，并检查基础色/粗糙度/自发光共享 UV、顶点染色和深度。
   guide 探针检查虚拟深度、基础色与金属重调制；这些数值检查不替代世界内的材质观感验收。
@@ -2076,7 +2329,7 @@ G-Buffer 重放、viewport、trace、motion、NRD pack 与 radiance 使用同一
 | --- | --- | --- | --- | --- |
 | `OFF` | 按 100% | 显示尺寸 / 不派发降噪 | 无 | 原始 trace 合光插值 |
 | `RR` | `renderScale` | render 尺寸 | 尝试 DLSS-D，不可用则 NRD | RR 输出显示尺寸；NRD 回退按所选 SR 后端重建或合光插值 |
-| `NRD_SR` | `renderScale` | render 尺寸 | REBLUR_DIFFUSE_SPECULAR | 低于 100% 时按所选 SR 后端重建；NONE 或不可用时合光插值 |
+| `NRD_SR` | `renderScale` | render 尺寸 | REBLUR_DIFFUSE / REBLUR_SPECULAR | 低于 100% 时按所选 SR 后端重建；NONE 或不可用时合光插值 |
 | `RAW` | `renderScale` | render 尺寸 / 不派发降噪 | 无 | 原始 trace 合光插值 |
 
 硬件追踪与 G-Buffer 使用同一 render 尺寸，见 §26.1。
@@ -2245,7 +2498,8 @@ guide 从这些平面消费追踪时采样的属性，避免降噪使用与着�
 主命中按 trace 尺寸映射，深度检查防止把相邻表面的材质写到当前像素。
 材质补写必须在 NRD pack 之前执行，使 NRD 与 RR 读取同一帧的 roughness。
 
-当前实际创建 `REBLUR_DIFFUSE_SPECULAR`，使用独立 diffuse/specular 输入、输出与各自命中距离。
+当前在同一 SDK instance 注册 `REBLUR_DIFFUSE` / `REBLUR_SPECULAR`，
+使用独立 diffuse/specular 输入、输出、历史与各自命中距离。
 镜面 RGB 在纹理化时除以 `max(F0,0.02)`，降噪后乘回相同因子；该正下限使解调可逆。
 
 准备齐了才打一行（一次进程）：
@@ -2274,17 +2528,17 @@ NRD 4.18 是静态库（`MCDR\external\nrd\`），DXIL 内嵌在库里，不用�
 `Illusion\src\main\kotlin\io\github\dxegp\experimental\raytracing\D3D12RtNrd.kt` 的 `inspectOnce()` 在首帧派发后把这个
 清单打一次。`MCDR_ABI` 里对应 `D3D12NrdInspect`（ABI v11）。
 
-### 20.2 实测数字（NRD 4.18，`REBLUR_DIFFUSE_SPECULAR`）
+### 20.2 实测数字（NRD 4.18，独立 diffuse/specular）
 
 | 字段 | 值 | 用途 |
 | --- | --- | --- |
-| `pipelinesNum` | `14` | 每次 `GetComputeDispatches` 的 pipeline 下标都落在这个范围内 |
+| `pipelinesNum` | `24` | 每次 `GetComputeDispatches` 的 pipeline 下标都落在这个范围内 |
 | `constantBufferMaxDataSize` | `912` 字节 | root CBV 一次上传的上限，超过就截断 |
 | `constantBufferAndSamplersSpaceIndex` / `resourcesSpaceIndex` | `1` / `0` | 两套根签名空间不能混 |
 | `constantBufferRegisterIndex` / `resourcesBaseRegisterIndex` / `samplersBaseRegisterIndex` | `0` / `0` / `0` | 与上面两个空间联用 |
 | `samplersNum` | `2` | `NEAREST_CLAMP` + `LINEAR_CLAMP` |
-| `permanentPoolSize` / `transientPoolSize` | `13` / `8` | 纹理池条目数，格式由 `TextureDesc` 给出 |
-| `perSetTexturesMaxNum` / `perSetStorageTexturesMaxNum` / `setsMaxNum` | `18` / `7` / `36` | 描述符池上限 |
+| `permanentPoolSize` / `transientPoolSize` | `16` / `7` | 纹理池条目数，格式由 `TextureDesc` 给出 |
+| `perSetTexturesMaxNum` / `perSetStorageTexturesMaxNum` / `setsMaxNum` | `14` / `5` / `48` | 描述符池上限 |
 | `pipelines[0].computeShaderDXIL.size` | `3596` 字节 | 库自带 DXIL，我们只建 PSO 不编译 |
 | `shaderEntryPoint` | `main` | **不是**手册里写的 `NRD_CS_MAIN` |
 
@@ -2305,13 +2559,13 @@ native 帧上下文按 Plan 和 render 尺寸保存初始化失败状态，同�
 ### 20.4 日志样例
 
 ```
-nrd: pipelines=14
+nrd: pipelines=24
 nrd: cb max=912 bytes
 nrd: spaces cb=1 res=0
 nrd: registers cb=0 srv=0 smp=0
 nrd: samplers=2
-nrd: pool permanent=13 transient=8
-nrd: desc set srv=18 uav=7 sets=36
+nrd: pool permanent=16 transient=7
+nrd: desc set srv=14 uav=5 sets=48
 nrd: pipeline0 dxil=3596 cb=1
 nrd: entry=main
 ```
@@ -2395,7 +2649,7 @@ pack 由 native 帧入口拥有 PSO 与两张目标，降噪开启时增加一�
 
 ## 22. NRD 常驻上下文（S4 4-c）
 
-NRD 的 14 条降噪管线不能每帧新建：`PipelineDesc` 里带的是库内编译好的 DXIL，根签名、纹理池、描述符堆
+NRD 的 24 条降噪管线不能每帧新建：`PipelineDesc` 里带的是库内编译好的 DXIL，根签名、纹理池、描述符堆
 也必须与 `InstanceDesc` 逐字段对上。这一层做成常驻上下文，随设备与画面尺寸重建。
 
 ### 22.1 根签名四项从 `InstanceDesc` 抄
@@ -2410,7 +2664,7 @@ NRD 的 14 条降噪管线不能每帧新建：`PipelineDesc` 里带的是库内
 | `[2]` | 描述符表（UAV） | `u0` 起 | `space0` | 同上（NRD 的 SRV/UAV 共用一个空间） |
 | `[3]` | 描述符表（采样器） | `s0` 起 | `space1` | `samplersBaseRegisterIndex` + `constantBufferAndSamplersSpaceIndex` |
 
-今天读出来的值是 `spaces cb=1 res=0`、`registers cb=0 srv=0 smp=0`、`samplers=2`，与 `REBLUR_DIFFUSE_SPECULAR`
+实际读取值为 `spaces cb=1 res=0`、`registers cb=0 srv=0 smp=0`、`samplers=2`，与独立 diffuse/specular
 的约定一致；库升级后这些数字可能变，代码按字段读，不按常量写。
 
 ### 22.2 格式映射
@@ -2424,7 +2678,7 @@ nrd: context failed, create pool texture 0
 ```
 
 映射错的症状相反 —— 不报错，降噪读到另一种精度，画面慢慢发糊。`D3D12RtNrd` 的清单给出 `ToDxgi` 的输入
-（`nrd: pool permanent=13 transient=8`），改动格式后先看清单再跑。
+（`nrd: pool permanent=16 transient=7`），改动格式后先看清单再跑。
 
 ### 22.3 重建时机
 
@@ -2441,7 +2695,7 @@ nrd: context failed, create pool texture 0
 独立初始化接口成功时 `outText` 两行：
 
 ```
-nrd: context ready, psos=14 pool=13/8 heap=900
+nrd: context ready, psos=24 pool=16/7 heap=7296
 nrd: cb max=912 samplers=2
 ```
 
@@ -2454,11 +2708,15 @@ nrd: cb max=912 samplers=2
 | `create root signature` | `CreateRootSignature` 失败（根参数与 `InstanceDesc` 不符） |
 | `create pipeline state` | `CreateComputePipelineState` 失败（根签名与库内 DXIL 不匹配） |
 | `create pool texture` | 池纹理建不出来（格式映射或堆属性） |
+| `invalid pool texture` | 下采样后宽/高为零，或格式不受支持；在驱动调用前拒绝 |
+| `managed memory budget exhausted` | 池纹理或常量上传无法通过 RT 共享分配准入 |
 | `create descriptor heap` | 描述符堆建不出来（`setsMaxNum × perSet` 超出堆上限） |
 
 `mcdr_dx12NrdInit` 返回 `0`（`nrd: not built in`）表示这份 DLL 没编进 `MCDR_HAS_NRD`；返回 `-1` 表示上面某一步
 失败。`outText` 的容量由调用方给，native 帧调用时为 2048 B，写满截断不报错。
-生产帧只在状态变化时报告 `rt NRD: initialization failed` 或 `rt denoise: NRD (31 passes)`。
+内部 `mcdr_nrd_context_init` 用 -2 区分预算拒绝，公开入口继续返回 -1；
+生产帧不把预算拒绝锁成永久失败，相同 plan/尺寸的下一帧可以重试。总账与物理退休见 §9.2。
+生产帧只在状态变化时报告 `rt NRD: initialization failed` 或实际 `rt denoise: NRD (N passes)`。
 
 ### 22.5 门
 
@@ -2507,7 +2765,7 @@ nrd: cb max=912 samplers=2
 
 ### 23.3 当前状态
 
-`REBLUR_DIFFUSE_SPECULAR` 已接入帧内，成功派发后将双通道结果交给合光。
+`REBLUR_DIFFUSE` / `REBLUR_SPECULAR` 已接入帧内，成功派发后将双通道结果交给合光。
 首次成功日志中的 pass 数与 missing 数只证明派发与资源映射成功；画面质量仍须在世界内验收。
 
 游戏外回归覆盖两类问题：
@@ -2515,7 +2773,8 @@ nrd: cb max=912 samplers=2
 - Compute 描述符探针：3 个 encoder，各自 3 张在途列表，每张使用 600 个描述符，10,800 条记录全部匹配，调试层错误为 0。
 - NRD 槽位与彩色信号探针：2,048 次派发、256 次忙槽拒绝。diffuse/specular 各 2,048/2,048 像素解码后分别接近线性 RGB `{0.9,0.4,0.3}` / `{0.2,0.7,1.1}`，调试层错误为 0。两路颜色不同且含负 chroma，能够发现通道交换或复制。
 - 同一 NRD 探针交替开关 SDK `enableValidation`，1,024 次启用派发均包含独立 validation pass。
-  常态派发数比相邻关闭帧多 1；诊断图 2,048/2,048 像素有限且 alpha 合法，存在非透明输出。
+  常态派发数比相邻关闭帧多 2，两个 identifier 顺序写同一诊断纹理，最终为镜面图；
+  诊断图 2,048/2,048 像素有限且 alpha 合法，存在非透明输出。
   SDK validation 是诊断图，不是错误计数；该检查不代替画质验收。
 
 已知限制：`NRD_SR` 的独立 SR 依赖所选后端的运行库，不可用时降噪结果由合光插值到显示尺寸；
@@ -2532,6 +2791,19 @@ Streamline DLSS-D 不可用时回退 NRD。长时间运行、转动相机、窗�
 - JVM 瞬时映射常量和 staging 共用 512 KiB 起的上传块，按请求对齐且不回绕覆写。分配前结算异步提交并打开列表，保存当前 encoder fence 加一作为该切片的目标值；块复用和延迟队列释放均检查真实完成 fence。不能用 `rotate()` 次数代替 GPU 完成，不能在 native 录制快照之前覆盖已返回的源切片。具体规则见 [瞬时内存](../misc/backend-and-device.md#42-分块与回收)。
 - BLAS 的 vertex/index 与 DEFAULT 堆 TLAS instance 输入在构建前转为 `NON_PIXEL_SHADER_RESOURCE`，scratch 转为 `UNORDERED_ACCESS`；UPLOAD instance 输入保持 `GENERIC_READ`，AS 结果保持 AS 状态。
 - 双 lobe 的池、PSO 与描述符需求按 NRD `InstanceDesc` 动态生成；资源映射同时包含 `IN_SPEC_RADIANCE_HITDIST` 与 `OUT_SPEC_RADIANCE_HITDIST`。
+- `mcdr_dx12NrdDenoise` / `mcdr_dx12NrdDenoiseTemporal` 可选第八张独立镜面 `R32_FLOAT` viewZ；七纹理调用共用深度。
+  十纹理布局在八纹理末尾增加 diffuse/specular history confidence，启用 SDK 的历史降权输入；
+  两张标量纹理使用上一帧图像坐标，不能替代当前 missing 排除，也不保证严格局部清空。
+  九纹理可在八纹理后追加 `R8_UINT` / `R32_UINT` 历史撤销 mask；十一纹理在十纹理后追加它。
+  bit 0/1 分别撤销 diffuse/specular 的指定 previous texel，清除永久池资格、慢/快历史与镜面 tracking。
+  撤销外扩两像素以覆盖 Catmull-Rom；空间滤波仍可能从 mask 外引入历史，必须由完整累积依赖生成 mask。
+  生产统一 RT 帧保持八纹理，通过内部累积依赖生成 mask，见 §7.5；RR/SR 对应接入分别推进。
+  接口、支持格式与独立复跑见 [native NRD](../../../MCDR/docs/advanced/nrd.md#逐-texel-历史撤销)。
+  深度按 `DispatchDesc.identifier` 映射，不能根据 pipeline 下标推断 lobe。常量环每槽容纳 64 段，避免拆分后的首次清理超额。
+  `denoisingRange=500000` 外的当前输入可按 lobe 排除，输出可能未写，消费端必须使用同帧资格拒读。
+  生产 RT 帧使用八纹理与独立 diffuse/specular 当前深度，保留原始主表面 viewZ；合光与 SR 重调制拒读排除区。
+  曝光只消费完整当前估计，RR/SR 的同帧全色降级见 §23.6。接口与 GPU 检查见
+  [NRD 当前输入排除](../../../MCDR/docs/advanced/nrd.md#当前输入排除)，世界画质仍由用户目视判断。
 - native 内部帧可提供 `validationOutput` 以启用 SDK validation 并映射 `OUT_VALIDATION`；公开七纹理入口保持该指针为空。独立探针负责诊断纹理的 UAV 状态与在途生命周期，默认游戏路径不额外派发 validation。
 
 ABI 另提供 `mcdr_dx12NrdDenoiseTemporal`，在同一组输入上增加独立的四 float 偏移数组：
@@ -2562,12 +2834,30 @@ GPU 总门使用 `--jitter-interface`，通过标记包含 `engineering checks p
 - `t0 gDirect / t1 gIndirect / t2 gAux` 每条记录均为 16 字节；`t3 gViewZ` 读取 render 尺寸的视空间深度。
 - `t4 gAlbedo / t5 gEmissive` 提供主表面材质，仅在线性 RR 模式中重调制为最终颜色。
 - `t6 gSpecular / t7 gSpecularGrazing` 读取镜面 Schlick 系数，`t8 gSpecularMaterial / t9 gNormalRoughness` 提供 F0 与线性 roughness。
+- `t10 gSource / t11 gExposure` 提供当前光栅源与本帧曝光；b1 为 encodeReblur、hasRasterSource 和两个 contentJitter float。
 - `aux.x` 是相机主射线距离，`aux.y` 是太阳可见性，`aux.z` 是第一次 diffuse 弹射的距离。弹射打空写 `1e9`，归一化后为 1；`aux.w` 是主命中材质 ID 的原始 uint 位。
 - `u0 gRadiance / u1 gSpecularRadiance` 均为 `RGBA16_FLOAT`。REBLUR 分别存解调 diffuse/specular 的 YCoCg；DLSS-D 的 u0 输入为 `albedo * irradiance + specularColor + emissive` 的带噪线性 RGB。
-- `u2 gSpecularHitDistance` 为 `R32_FLOAT`，写世界单位首次反射距离；无效距离与天空主像素写 0，反射打空写 `1e9`。RR 读取这张独立纹理，禁止传入 NRD 的归一化 alpha。
+- `u2 gSpecularHitDistance` 为 `R32_FLOAT`，写世界单位首次反射距离；无效距离、未知镜面、天空主像素与 RR 全色降级写 0，反射打空写 `1e9`。RR 读取这张独立纹理，禁止传入 NRD 的归一化 alpha。
+- `u3 gRasterFallback` 为 `RGBA16_FLOAT`，保存当前 source 转换到 RT 辐射域的全色降级输入。
 - Diffuse 的归一化距离为 `saturate(aux.z / (3 + abs(viewZ) * 0.1))`，对应默认 REBLUR hit-distance 参数与 diffuse roughness=1。不得用 `denoisingRange` 作除数。
 - Specular 使用独立反射距离，除数为 `(3+abs(viewZ)*0.1)*lerp(20,1,(1-exp2(-200*roughness²))*sqrt(roughness))`，与 NRD 默认参数一致。
 - `CommonSettings.denoisingRange` 与 JVM 常量均为 500000。无效 G-Buffer 像素写两倍该范围的 viewZ，并使用有限的备用法线；零深度不会被 NRD 当作天空。
+
+次级查询 unknown 仅清除对应 direct、diffuse 或 specular 占位值，保留可靠主命中、材质与其它当前信号。
+`RtDiffuseCurrent` 要求 direct 与 diffuse 均可靠，`RtSpecularCurrent` 独立判断镜面；
+pack 在原始 viewZ 之外维护各路当前深度，缺少资格时写范围外值并交 NRD 排除。
+曝光只采纳完整当前照明；没有完整样本时保留已有倍率或 reset 补偿。
+
+统一事务在编码阶段提供本次 source。取样坐标为 `(pixel+0.5-contentJitter)/traceSize`，
+经过 sRGB 解码、ACES 拟合反解和当前曝光除法后，RR 的不完整像素改用完整同帧光栅颜色，镜面命中距离写 0。
+这是有偏降级，不能恢复 source 中已裁剪的 HDR 或原 Monte Carlo 缺样本，不复用旧 source 或旧照明。
+NRD 后独立 SR 的重调制同样使用该降级填补当前全色输入；不让排除区的未写输出进入重建。
+最终缺任一当前照明信号的像素仍由本次 source 整像素所有，避免重复加光；通用逐 lobe 估计恢复继续开放。
+上下文持有五张降噪 guide 与四张信号纹理，逻辑成本为 56 B/px；公开帧输出仍返回原六张借用输入。
+
+定向产品链检查使用 `rt_pending_frame_check.py --consumer-eligibility`，真实 XeSS 与 RR 分别使用
+`--consumer-sr` / `--consumer-rr`。XeSS 检查以 compute 写高亮值到被排除的实际 NRD 输出；
+RR 检查当前降级色的编码域往返与镜面距离。不比较不同 provider 或独立重建运行的成图数值。
 
 native 帧入口先追踪并补写主命中材质，再产生 motion 与 packed guides，最后纹理化辐亮度。
 `signalEncoding=1` 写 REBLUR 输入，`2` 写线性 RR 输入；`0` 跳过三次降噪输入 compute。
@@ -2598,7 +2888,7 @@ native 输入录制失败不发布当前帧，调用方直通原版。`denoiseFr
 | 颜色与距离 | REBLUR 编码/解码 YCoCg，diffuse 使用 secondary hit distance，相机淡出使用主射线距离 |
 | 运动矢量 | 二维屏幕像素位移，`motionVectorScale={1/w,1/h,0}`、`isMotionVectorInWorldSpace=false`；NRD 从矩阵推导 viewZ 变化 |
 | 历史 | 统一 `InvalidationReason` 位掩码与逐消费者确认，常态继续累积；见 §23.7 |
-| 资源状态 | 五张输入 SRV，两张输出 UAV，完成后回 COMMON |
+| 资源状态 | 生产六张输入 SRV、两张输出 UAV，七纹理兼容入口为五张输入；完成后回 COMMON |
 | 双 lobe | 实际双通道实例、specular 资源映射、独立命中距离与可逆 F0 解调 |
 | RR 反射 | 八张纹理、世界单位距离标签、diffuse/specular seed 随实际帧号更新 |
 | 轨道闸门 | OFF / RAW 早退，每帧先清空上次输出 |
@@ -2893,7 +3183,7 @@ Diffuse 与 specular 的采样 seed 必须包含实际帧号，使静止画面�
 ### 25.3 回退
 
 `RR` 轨道上 SL 拒绝一次（返回 0 或负数）后，在当前 Plan 内停止重试，打一行
-`rt RR: unavailable, using NRD`，这一帧起退回 NRD 的 `REBLUR_DIFFUSE_SPECULAR` 路径。
+`rt RR: unavailable, using NRD`，这一帧起退回 NRD 的独立 diffuse/specular 路径。
 设备重建、光追关闭重开或 Plan 代际变化允许 native 上下文重新尝试。
 Plan 包含轨道、超分方案和实际输入/输出/trace 尺寸；历史按失效事件复位，SDK 帧号继续递增。
 
@@ -3275,11 +3565,15 @@ Plan 变化重置相机历史与降噪签名；纹理替换后释放旧目标，
 native 的 `upscaleRtFrame` 拥有重调制 PSO、颜色/设备深度/显示输出、失败状态与 SR 历史；先执行
 `rt_nrd_remodulate.hlsl`：在 render 尺寸分别解码 diffuse/specular YCoCg，乘同帧 albedo 与 `max(F0,0.02)`，加 emissive，生成线性 HDR 颜色；
 同一 pass 将正 viewZ 经本帧投影转换为设备深度。SR 输入禁止直接使用解调辐照度或正 viewZ。
+任一路当前深度处于排除范围时，不读取该区 NRD 输出，使用 §23.6 的当前全色光栅降级输入。
+统一事务自动提供 source；细粒度接口须先用同帧 source 合光准备输入，再执行 SR 和最终合光。
+缺少 source 时 SR 返回 `rt sr: current raster source required`；细粒度 RR 没有完整降级输入时转 NRD。
 
 NRD 时间累积会抑制光照信号的子像素偏移。进入 SR 前，用当前屏幕内容偏移 `(Jx,-Jy)`
 在 `pixel - contentJitter` 位置重采样两路 NRD 光照，使其与当前 G-Buffer 的采样位置对齐。
 `RtReblurSampleJittered` 使用四邻域双线性权重，拒绝 viewZ 差超过 `max(0.01 × centerDepth, 0.01)` 的邻点；
-零偏移直接读取中心像素。albedo、F0、emissive 与设备深度保持当前像素采样，禁止连材质一起再次偏移。
+中心或邻点的深度在排除范围时拒读其信号；合法中心的零偏移直接取样。
+albedo、F0、emissive 与设备深度保持当前像素采样，禁止连材质一起再次偏移。
 重调制 b1 载荷为四个深度投影系数加两个偏移 float；SDK 的 jitter 仍使用同一份当前偏移。
 该处理只用于 NRD 后独立 SR；RR 原始输入与不运行独立 SR 的 NRD 输出不经过这一步。
 
@@ -3375,14 +3669,32 @@ ABI 38 的 scene 请求追加非零 `frameId`，JVM 传入 `D3D12Temporal.frameI
 仅执行前取消退还该录制消耗的额度；已执行后 Signal 失败仍计费，实际完成也不能在同帧重新领取。
 独立 AS 自检入口的列表预算与生产 scene 分开，不能用命令列表或 RT 派发次数代替真实帧身份。
 scene 只构建当前 live 表中 node/layer/version 匹配的记录，缺席或过期记录保持 unknown，不占 16 条额度。
-待建 BLAS 按完整键首次请求的真实帧排序；候选替换、重排和执行前取消重试保留仍在目标中的工作年龄。
-同帧首次请求的任务保留当前记录顺序；退出目标或版本改变丢弃旧年龄，空场景、换世界和释放时清空。
+请求年龄从当前 live node/layer/version 与实际 targets 起算，不等待载荷上传；预算省略、缺载荷、
+候选替换、重排和执行前取消重试保留仍在目标中的当前版本年龄。
+待建 BLAS 按首次请求帧排序，同帧首次请求保留当前记录顺序；有效 GPU 需求与最老请求交替准入。
+退出目标或版本改变丢弃旧年龄，
+显式撤销场景、换世界和释放时清空。年龄表随当前作用域裁剪，不按历史版本无限累积。
 这能避免新记录持续抢占已等待的工作，但不构成整个 scene 的时间或内存预算。
+
+B-DXR 在已认证待建组无法完成原查询时，将组首 record 写入 indirect 尾部 8192 B 的调度位图，
+不占 diffuse 辐亮度区域。native 最多三份反馈，不隐藏提交或等待；满额或分配失败时省略本次提示。
+只有已确认提交、最终合光成功且实际 fence 完成的反馈可用，最长年龄为八个真实 scene 帧。
+冻结的 node/layer/version 与独立请求身份负责记录重排、编辑、撤销/重加和换世界验证。
+选择器从普通最老请求开始，每次成功录制 BLAS 后切换普通/需求轮次；没有需求时仍按年龄推进，
+预算受阻不增加额度。该反馈只补建当前数据，不保留跨帧样本或改变 unknown；当前 SDK 消费规则见 §23.6。
+具体协议、资源寿命与输入限制见 [native 待建组需求反馈](../../../MCDR/docs/advanced/rt-frame.md#15-待建组需求反馈)。
+普通有限 unknown 代理复用同一位图的独立槽，反馈当前 source 身份后交给有界捕获队列，
+见 [有限缺口的捕获需求](../../../MCDR/docs/advanced/rt-frame.md#16-有限缺口的捕获需求)。
+RT 帧号仅用于匹配提交，需求寿命使用独立的 scene 帧号；关闭 RT、未执行帧或重放次数不改变计龄单位。
 `rt_stats.json` 每个统计窗口的 `scene` 对象记录真实帧、目标/pending 快照、scene/live 版本、
 目标记录、已录制记录、待建记录、过期/缺席记录、已发布代理 section、本帧构建数和最老待建年龄。
 它通过 `D3D12GetRtSceneStats` 在 CPU 读取，不提交或等待 GPU；兼容 ABI 中缺少该可选入口时写 `null`。
 这些字段是采样时刻的状态，不是整个统计窗口的峰值；`recorded` 不表示 GPU 已完成，
 `pending_builds=0` 也不证明无覆盖缺口。过期载荷仍须等当前版本，目标清单外的覆盖另行验证。
+`full_domain` 随成功追踪交给统计帧保存，在统计窗口排队时与其它指标一起冻结。
+下一次 `beginFrame` 先排队上一帧再清除当前统计 profile；当前渲染输出失效不撤销已记录的上一帧元数据。
+当前统计帧未成功派发时保留 `null`，`release` 清除引用；禁止从已清空或后续更新的渲染输出重新取值。
+尚未上传的当前层已登记请求年龄，但这些统计只计目标快照中的记录，不代表完整捕获/上传积压。
 启用分信号统计时，250 ms 间隔的 `rt_validity.jsonl` 样本同时冻结该帧的 scene 统计，
 要求 world/场景真实帧/scene/live/目标快照全部匹配，随对应 GPU 计数一起异步写出；不匹配或入口缺失写 `scene:null`。
 顶层 `frame` 是 RT 输出帧号，`scene_frame` 是传给场景调度的真实帧号；后者须与 `scene.frame_id` 相等。
@@ -3392,6 +3704,8 @@ scene 只构建当前 live 表中 node/layer/version 匹配的记录，缺席或
 其中仍有效的不透明 BLAS 可按 §16.3 作为阴影专用证明，不能被最近表面查询接纳。
 TLAS、实例表与配对镜像一起形成当前可查询场景；静态复用还须核对阴影证明集合。
 JVM 按返回的 snapshotId 借用对应 CPU 镜像；候选不会因尚未追上已发布 revision 而逐帧重置。
+准备失败时按 native 的实际错误记录跳过原因；只有有效待建结果使用 pending 原因。
+创建 scene、设置预算或准备失败都清除本次输出，不能保留旧场景绕过当前失效集合；合光沿用派发失败原因。
 近场内容或层集合变化时，立即重新选择镜像并把当前几何交给同一 native scene；不能等待旧候选完成才提交新内容。
 否则 live 表已经撤销旧版本，native 拒建过期记录，而 JVM 又继续复用旧镜像，候选可能无法完成。
 未变选择集仍复用原镜像，远处上传不生成新的近场 GPU 快照。替换候选共享已建 BLAS，不能补充同一真实帧的 16 条额度。
@@ -3449,7 +3763,15 @@ section 键保留完整 node 和 layer，不能用左移 section 编码再拼 la
 只增加要求而没有改变可用载荷时，复用既有几何镜像与 GPU snapshot，native 按更新后的版本表重新认证资格。
 容量失败不永久停收：释放空间后，后续完整上传可以重新分配。世界切换清空 active、dormant、待补齐要求和 arena。
 
-`MirrorSlice` 在池锁内复制到独立 direct 缓冲，native 几何快照持有自己的 GPU 资源。
+实际域的 `mirrorFor` 先在与 `@JvmStatic @Synchronized` 写点相同的类 monitor 内冻结 epoch、revision 与记录引用，
+在锁外按完整 section/layer 组选择、排序和核算预算。再次短锁复核同代后导出所选不可变 `Content`，
+64 B 记录表的 direct 分配、填充和内容比较在锁外；记录表打包后再次核对 epoch/revision 才更新镜像缓存。
+每次调用只做一次有界尝试，编辑、缺载荷、材质替换或换世界令候选过期时返回 `Residency.superseded=true`。
+生产 `mirrorsFor` 保留同世界的已有镜像并在后续调用重试；仍用当前 live/targets 撤销旧内容，不能把旧镜像视为当前几何证明。
+首帧没有可复用镜像时跳过该次 RT，不把过期选择当成完整空场景。
+`full_domain.geometry_selection.superseded` 记录该结果，同时保留 `GEOMETRY_SELECTION_STALE` 缺口。
+显式近域工具 `mirrorNear` 仍在池锁内选取与导出；`MirrorSlice` 的完整载荷只在实际访问时惰性打包。
+native 几何快照持有自己的 GPU 资源。
 回收 CPU 段不修改既有镜像，也不需要等待 GPU fence；GPU 快照仍遵守本节的提交与退休规则。
 `vertexBytes()` / `indexBytes()` / `materialBytes()` 返回保留逻辑 offset 的独立只读导出快照，不借用 arena 内部缓冲。
 这些导出包含逻辑地址空洞，不用于生产镜像热路径。
@@ -3482,9 +3804,15 @@ native 检查快照节点与独立目标清单的并集；预算整组省略的�
 另有六阶段 GPU 检查：完整 solid、cutout 首次导出失败、当前载荷恢复、cutout 编辑失败、明确移除 cutout、
 非空 solid 缺少 CPU 字节。缺层阶段保留 unknown，恢复后命中当前距离；新增纯要求不重新上传镜像，恢复只新建一条 BLAS。
 六阶段中的无 CPU 字节阶段用仍注册的旧快照核查 native 撤销旧资格。
-`--content-only` 包含 11 项所需版本检查，覆盖失败、恢复、删除、复制异常、半透明排除及世界退出。
+`--content-only` 包含 11 项所需版本检查，覆盖失败、恢复、删除、复制异常、透明载荷与实际层版本及世界退出。
 `--publication-only` 检查完整原版层清单、部分/全无暂存、null/零字节顶点、取消、错 section/epoch、真实空网格、
-不匹配的 draw 数、自定义索引缺失与重试，以及首次完整快照保持。测试使用 `SectionMesh` 的真实接口与空/未编译哨兵。
+不匹配的 draw 数、自定义索引缺失与重试，以及首次完整快照保持。
+28 项检查还覆盖包含透明层的三层原子发布、完整组预算和透明层移除；使用 `SectionMesh` 的真实接口与空/未编译哨兵。
+`--fluid-publication-only` 使用实际 `FluidRenderer` 和 `BufferBuilder` 的 BLOCK 字节，经 staging 与当前编译安装发布，
+覆盖静水、流动水、负坐标和 SOLID 熔岩对照，以及缺层、恢复、实际删除、资源 reload 和世界退出。
+`_port/rt_translucent_capture_check.py` 将这些实际镜像、所需版本与输出支持传给 native scene，
+以独立三角形求交检查产品普通/背景/阴影和有界补查，并直接调用产品积分。
+其查询使用受控已认证空间目录来隔离几何归属；生产空间状态由独立空间检查验证，不据此声明世界空间完整。
 GPU 回归沿生产 `mirrorsFor`、scene 和原 RayQuery 验证 12 个发布阶段；缺层保持 unknown，完整恢复命中当前几何，
 明确删除 cutout 后可命中 solid，真实空段后才允许命中后方表面。`UNCOMPILED` 不改变镜像；仅变化的几何新建 BLAS。
 该入口另含 10 项范围目标检查，验证预算省略、整段缺失、零载荷时的元数据、去重、缓存、只读快照及退休。
@@ -3532,7 +3860,7 @@ CPU 录制恢复检查另验待建期间的近场更新、删除、远处上传�
 
 | 视图 | 色标 | 诊断边界 |
 | --- | --- | --- |
-| `PRIMARY_VALIDITY` | 绿：主命中且满足合光覆盖；青：已有主命中但不满足合光覆盖 | 青色可能来自总 invalid 或 G-Buffer 覆盖缺失，结合其它视图判断 |
+| `PRIMARY_VALIDITY` | 绿：主命中与材质覆盖有效；青：已有主命中但覆盖不足 | 不包含次级照明资格；绿色像素也可能因次级缺口回到 source |
 | `DIRECT_VALIDITY` | 红：直射阴影查询 unknown；深灰：未报告该缺口 | 不表示直射亮度，也不代表历史可信度 |
 | `DIFFUSE_VALIDITY` | 红：次级几何 unknown；橙：次级阴影 unknown；黄：两者；深灰：未报告缺口 | 对应本帧实际 diffuse 查询 |
 | `SPECULAR_VALIDITY` | 与 diffuse 相同 | 对应本帧实际 specular 查询，未执行的合法零贡献不标缺口 |
@@ -3542,8 +3870,8 @@ CPU 录制恢复检查另验待建期间的近场更新、删除、远处上传�
 diffuse geometry/shadow unknown、specular geometry/shadow unknown。RGB 消费继续只读取前三个分量。
 追踪自检的常量模式使用独立布局，不用于这些视图。
 
-这些位记录总 invalid 处理前的结果；当前总 invalid 仍会清除主命中标记及光照并触发直通，
-分信号视图不会修复该行为，也没有把 unknown 作为当前缺样本传给 NRD/RR。
+这些位保留各类当前查询结果。次级缺口不再清除可靠主命中，只清对应占位信号；
+NRD 使用独立当前深度排除，RR/SR 使用同帧全色降级，最终缺口像素保持 source 所有，见 §23.6。
 深灰只表示本帧没有报告对应缺口，不能证明驻留范围之外无几何或 SDK 历史正常。
 `_port/rt_signal_validity_check.py` 以受控 trace 结果执行实际积分 HLSL，检查 23 类状态传播与查询需求。
 九类确切零贡献情况与可靠阴影基线的辐亮度逐位相等；极小正响应、单通道光源和部分局部可见性仍报告真实缺口。
@@ -3554,7 +3882,7 @@ diffuse geometry/shadow unknown、specular geometry/shadow unknown。RGB 消费�
 不要按乘积或 epsilon 判断，防止极小非零响应因乘法下溢被省略；单通道正响应同样保留原查询。
 主命中、法线、材质、specular 与自发光独立保留；NRD 接收合法零 diffuse，RR 准备颜色仍包含当前 specular 与自发光。
 aux 的未查询可见性仅为局部 relief 值，不证明外部无遮挡。该规则只消除无贡献查询引发的假失效；
-真实非零 lobe 的缺口、总 invalid 与通用 SDK/合光恢复继续开放。离线完整链入口为 `_port/rt_zero_diffuse_check.py`。
+真实非零 lobe 的 unknown 保留；通用逐 lobe 估计恢复继续开放。零响应链入口为 `_port/rt_zero_diffuse_check.py`。
 
 开启 `[rt] invalidationLog`，在正常视图中最多每 250 ms 采样一次输入网格，写入
 `<user.dir>/dxrmc/rt_validity.jsonl`。两次 compute 将逐组计数缩为 48 B，复制后使用独立 query snapshot
@@ -3570,13 +3898,13 @@ aux 的未查询可见性仅为局部 relief 值，不证明外部无遮挡。�
 
 | 计数键 | 输入网格上的含义 |
 | --- | --- |
-| `pixels` / `primary_hit` / `primary_unknown` / `primary_miss` | 实际像素总数及总 invalid 处理前的主查询状态 |
+| `pixels` / `primary_hit` / `primary_unknown` / `primary_miss` | 实际像素总数及当前主查询状态 |
 | `direct_unknown` | 主表面直射阴影查询缺口 |
 | `diffuse_geometry_unknown` / `diffuse_shadow_unknown` | 当前 diffuse 方向上的次级几何/阴影缺口 |
 | `specular_geometry_unknown` / `specular_shadow_unknown` | 当前 specular 方向上的次级几何/阴影缺口 |
-| `primary_rejected` | 已知主命中，但 `direct.w` 未保留；可与次级缺口同帧关联 |
-| `gbuffer_missing` | 已知且保留的主命中，对应 albedo coverage 不足 |
-| `rt_owned` | 已知且保留的主命中，对应 albedo coverage 通过 |
+| `primary_rejected` | 已知主命中，但主表面或任一当前照明资格不足，最终回到 source |
+| `gbuffer_missing` | 主命中与当前照明均有效，对应 albedo coverage 不足 |
+| `rt_owned` | 主命中、完整当前照明和 albedo coverage 均通过 |
 
 `primary_rejected + gbuffer_missing + rt_owned = primary_hit`。这些是输入网格计数，
 不计 SR、jitter 映射和半径淡出后的最终显示像素；它们不是画面质量或 SDK 内部历史的证明。

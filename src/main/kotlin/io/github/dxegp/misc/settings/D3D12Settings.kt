@@ -92,6 +92,8 @@ object D3D12Settings {
     val rtBuildCpuMicros: Int,
     val rtBuildGpuMicros: Int,
     val rtBuildTriangles: Int,
+    val rtGeometryPayloadMiB: Int,
+    val rtManagedMemoryMiB: Int,
     val rtExposureMode: RtExposureMode,
     val rtExposureEv: Float,
     val rtExposureSpeed: Float,
@@ -169,6 +171,9 @@ object D3D12Settings {
     val rtBuildBudget: RtBuildBudget get() = snapshot().let { settings ->
         RtBuildBudget(settings.rtBuildCpuMicros, settings.rtBuildGpuMicros, settings.rtBuildTriangles)
     }
+
+    val rtGeometryPayloadMiB: Int get() = snapshot().rtGeometryPayloadMiB
+    val rtManagedMemoryMiB: Int get() = snapshot().rtManagedMemoryMiB
 
     val rtExposureMode: RtExposureMode get() = snapshot().rtExposureMode
     val rtExposureEv: Float get() = snapshot().rtExposureEv
@@ -485,6 +490,8 @@ object D3D12Settings {
             rtBuildCpuMicros = config(3000) { IllusionConfig.RAYTRACING_BUILD_CPU_MICROS.get() },
             rtBuildGpuMicros = config(1000) { IllusionConfig.RAYTRACING_BUILD_GPU_MICROS.get() },
             rtBuildTriangles = config(65536) { IllusionConfig.RAYTRACING_BUILD_TRIANGLES.get() },
+            rtGeometryPayloadMiB = config(128) { IllusionConfig.RAYTRACING_GEOMETRY_PAYLOAD_MIB.get() },
+            rtManagedMemoryMiB = config(2048) { IllusionConfig.RAYTRACING_MANAGED_MEMORY_MIB.get() },
             rtExposureMode = config(RtExposureMode.MANUAL) { IllusionConfig.RAYTRACING_EXPOSURE_MODE.get() },
             rtExposureEv = config(0.0) { IllusionConfig.RAYTRACING_EXPOSURE_EV.get() }.toFloat(),
             rtExposureSpeed = config(1.5) { IllusionConfig.RAYTRACING_EXPOSURE_SPEED.get() }.toFloat(),

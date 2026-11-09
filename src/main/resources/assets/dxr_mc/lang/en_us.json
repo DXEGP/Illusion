@@ -322,6 +322,8 @@
   "dxr_mc.configuration.rt.exposure_ev": "Exposure compensation (EV)",
   "dxr_mc.configuration.rt.exposure_speed": "Automatic exposure response rate",
   "dxr_mc.configuration.rt.build_cpu_micros": "Scene AS CPU budget (microseconds)",
+  "dxr_mc.configuration.rt.geometry_payload_mib": "Scene geometry payload limit (MiB)",
+  "dxr_mc.configuration.rt.managed_memory_mib": "Native RT managed memory limit (MiB)",
   "dxr_mc.configuration.rt.build_gpu_micros": "Scene AS GPU estimate budget (microseconds)",
   "dxr_mc.configuration.rt.build_triangles": "Scene AS triangle budget"
 }

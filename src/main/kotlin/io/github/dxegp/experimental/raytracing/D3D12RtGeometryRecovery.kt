@@ -67,6 +67,7 @@ object D3D12RtGeometryRecovery {
         pending.set(emptyList())
         flights.clear()
         backoff.clear()
+        D3D12RtGeometryPool.clearCaptureDemands()
     }
 
     fun stats(): Stats = Stats(D3D12RtGeometryPool.captureBacklog(), pending.get().size, flights.size,
@@ -111,6 +112,7 @@ object D3D12RtGeometryRecovery {
         if (!D3D12Settings.rtEnabled) {
             flights.clear()
             backoff.clear()
+            D3D12RtGeometryPool.clearCaptureDemands()
             return
         }
         val client = Minecraft.getInstance()

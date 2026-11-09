@@ -12,7 +12,7 @@ import org.spongepowered.asm.mixin.injection.At;
 @Mixin(ClientboundLevelChunkPacketData.class)
 public abstract class ChunkPacketSectionArrayPublicationMixin {
     @WrapOperation(method = {"calculateChunkSize", "extractChunkData"}, at = @At(value = "INVOKE",
-            target = "Lnet/minecraft/world/level/chunk/LevelChunk;getSections:()[Lnet/minecraft/world/level/chunk/LevelChunkSection;"))
+            target = "Lnet/minecraft/world/level/chunk/LevelChunk;getSections()[Lnet/minecraft/world/level/chunk/LevelChunkSection;"))
     private static LevelChunkSection[] dxr_mc$borrow(LevelChunk chunk, Operation<LevelChunkSection[]> original) {
         try (var access = D3D12RtSectionArrays.borrow(chunk)) {
             return original.call(chunk);

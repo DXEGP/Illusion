@@ -10,6 +10,7 @@ import net.minecraft.client.renderer.chunk.SectionRenderDispatcher
 import net.minecraft.core.DefaultedMappedRegistry
 import net.minecraft.core.MappedRegistry
 import net.minecraft.core.IdMapper
+import net.minecraft.core.Holder
 import net.minecraft.core.registries.BuiltInRegistries
 import net.minecraft.world.level.block.Block
 import net.minecraft.world.level.block.state.BlockState
@@ -50,6 +51,8 @@ class D3D12RtSourceUniverse private constructor(private val candidate: Snapshot,
         private val blockTable = field(BlockStateModelSet::class.java, "modelByState")
         private val fluidTable = field(FluidStateModelSet::class.java, "modelByFluid")
         private val frozen = field(MappedRegistry::class.java, "frozen")
+        private val registryValues = field(MappedRegistry::class.java, "byId")
+        private val mappedValues = field(IdMapper::class.java, "idToT")
         private val dispatcherCompiler = field(SectionRenderDispatcher::class.java, "sectionCompiler")
         private val dispatcherClosed = field(SectionRenderDispatcher::class.java, "closed")
         private val compilerBlocks = field(SectionCompiler::class.java, "blockModelSet")
@@ -77,12 +80,16 @@ class D3D12RtSourceUniverse private constructor(private val candidate: Snapshot,
                 compilerBlocks?.get(compiler) === models && compilerFluids?.get(compiler) === fluids
         }
 
-        private fun <Value> sameIdentities(current: Iterable<Value>, original: List<Value>): Boolean {
-            val iterator = current.iterator()
-            for (value in original) {
-                if (!iterator.hasNext() || iterator.next() !== value) return false
+        private fun sameIdentities(current: List<*>?, original: List<*>, holders: Boolean = false): Boolean {
+            if (current == null) return false
+            var originalIndex = 0
+            for (index in current.indices) {
+                val entry = current[index] ?: continue
+                val value = if (holders) (entry as? Holder.Reference<*>)?.value() ?: return false else entry
+                if (originalIndex == original.size || original[originalIndex] !== value) return false
+                originalIndex++
             }
-            return !iterator.hasNext()
+            return originalIndex == original.size
         }
 
         internal fun create(resources: D3D12SectionGeometry.ModelResources): D3D12RtSourceUniverse {
@@ -134,8 +141,10 @@ class D3D12RtSourceUniverse private constructor(private val candidate: Snapshot,
                 D3D12RtSourceUniverse(Snapshot(bounds, "bounded", blockStates, fluidStates), {
                     frozen.getBoolean(blockRegistry) && frozen.getBoolean(fluidRegistry) &&
                         blockRegistry.size() == blocks.size && fluidRegistry.size() == fluidTypes.size &&
-                        stateRegistry.size() == mappedStates.size && sameIdentities(blockRegistry, blocks) &&
-                        sameIdentities(fluidRegistry, fluidTypes) && sameIdentities(stateRegistry, mappedStates)
+                        stateRegistry.size() == mappedStates.size &&
+                        sameIdentities(registryValues?.get(blockRegistry) as? List<*>, blocks, true) &&
+                        sameIdentities(registryValues?.get(fluidRegistry) as? List<*>, fluidTypes, true) &&
+                        sameIdentities(mappedValues?.get(stateRegistry) as? List<*>, mappedStates)
                 }, { hasCurrentCompiler(models, fluids) })
             } catch (_: Exception) {
                 unknown

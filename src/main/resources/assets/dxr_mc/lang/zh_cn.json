@@ -322,6 +322,8 @@
   "dxr_mc.configuration.rt.exposure_ev": "曝光补偿（EV）",
   "dxr_mc.configuration.rt.exposure_speed": "自动曝光响应速率",
   "dxr_mc.configuration.rt.build_cpu_micros": "场景 AS 的 CPU 预算（微秒）",
+  "dxr_mc.configuration.rt.geometry_payload_mib": "场景几何载荷上限（MiB）",
+  "dxr_mc.configuration.rt.managed_memory_mib": "Native 光追受管内存上限（MiB）",
   "dxr_mc.configuration.rt.build_gpu_micros": "场景 AS 的 GPU 估计预算（微秒）",
   "dxr_mc.configuration.rt.build_triangles": "场景 AS 的三角形预算"
 }

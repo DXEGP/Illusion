@@ -1,6 +1,7 @@
 package io.github.dxegp.d3d12.render.advanced.mesh
 
 import io.github.dxegp.experimental.raytracing.D3D12RtGeometryPool
+import io.github.dxegp.experimental.raytracing.D3D12RtLightingChanges
 import io.github.dxegp.experimental.raytracing.D3D12RtMaterialTable
 import io.github.dxegp.experimental.raytracing.D3D12RtModelSupport
 import io.github.dxegp.experimental.raytracing.D3D12RtSourceUniverse
@@ -2503,7 +2504,8 @@ object D3D12SectionGeometry {
         val inputs = longArrayOf(sectionNode)
         val dependent = dependentSections(inputs)
         val affected = (inputs.asList() + dependent.asList()).distinct().toLongArray()
-        D3D12RtGeometryPool.invalidateSections(affected) { revokeSections(inputs, dependent) }
+        D3D12RtGeometryPool.invalidateSections(affected,
+            D3D12RtLightingChanges.Reason.COMPILE_NOTIFICATION) { revokeSections(inputs, dependent) }
     }
 
     fun find(sectionNode: Long): SectionGeometry? = sections[sectionNode]

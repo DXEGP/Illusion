@@ -38,9 +38,11 @@
 - `SectionUploadCaptureMixin` 在 `addSectionBuffersToUberBuffer` HEAD 按 mesh 对象暂存各层 CPU 字节，
   同时生成该版本的 meshlet；同一层首次完整快照保持不变，不完整采集允许后续完整重试替换。
   已安装 mesh 的 index-only 排序上传不再建立待提交几何。
-  `setSectionMesh` 包装器在安装前校验当前未取消任务、结果对象、world、epoch、sectionNode 和内容令牌；
-  安装后确认当前 mesh 仍是该对象，再从 `SectionMesh.getSectionDraw` 枚举完整非空层清单并原子提交。
-  不合格结果交还原版释放，不能返回仍在使用的当前 mesh；晚到提交不得切换几何注册表的 world/epoch。
+  `setSectionMesh` 包装器在安装前校验当前未取消任务、结果对象、world、epoch 和 sectionNode。
+  RT 内容令牌缺失或失效不得阻断当前任务的原版安装、更新通知和旧网格回收。
+  安装后确认当前 mesh 仍是该对象，再单独核验 RT 编译来源与内容令牌；有效时从
+  `SectionMesh.getSectionDraw` 枚举完整非空层清单并原子提交，无效时丢弃待提交的 RT 字节。
+  任务归属不符的结果交还原版释放，不能返回仍在使用的当前 mesh；晚到提交不得切换几何注册表的 world/epoch。
   层清单决定 `indexCount`、`hasCustomIndexBuffer` 和 `indexType().bytes`，不能从暂存 map 或缺失索引推断层已删除。
   缺暂存、null/零字节顶点、复制失败、draw 数不匹配或缺自定义索引时，保留当前所需版本并撤销旧载荷；
   后续完整采集才能恢复。错 section 的提交不消费源 section 的暂存，错 epoch 的数据不能复用。
@@ -52,7 +54,8 @@
 - 采集内容按层：`indexCount`、`vertexBytes`、`indexBytes`，以及切好的 meshlet 列表。
 - 关闭 RT 时非空上传仍登记当前要求并撤销旧 RT 载荷；开启后由局部重捕获补齐，不作废全部已编译 mesh。
   `SectionUploadCaptureMixin` 记录新建编译任务身份；`SectionCompileTaskMixin` 记录其实际结果，
-  `setSectionMesh` 的真实安装结束该任务的等待。CPU 完成、旧任务的晚到结果与共享空 mesh 身份均不能提前结束等待。
+  `setSectionMesh` 的真实安装结束该任务的等待，即使本次没有 RT 发布资格也必须结束；
+  CPU 完成、旧任务的晚到结果与共享空 mesh 身份均不能提前结束等待。
   空结果调用点还须核对实际生产任务，避免取消或被替换任务借共享 EMPTY 身份覆盖当前 mesh。
   reset 在原版回收前撤销安装资格与 RT 表示；chunk 仍登记该来源时转换为新的无界整段恢复要求，
   保持原输入代次和最早缺口年龄。section 临界区不包住原版 reset/cancel 的 copyLock 路径。
@@ -62,7 +65,8 @@
   令牌冻结输入段内容代次、当前模型资源代 `modelRevision` 及 block/fluid 模型集合对；安装同时核验。
   编译调用处读取实际 `SectionCompiler` 的两个模型字段，记录后才可接受其结果；
   该记录须发生在任务绑定之后、安装之前，不能在捕获结果后补授绑定资格。
-  未记录来源、集合不匹配或资源已经换代的非空/EMPTY 结果均拒绝，并按当前任务身份重排 dirty。
+  未记录来源、集合不匹配或资源已经换代的非空/EMPTY 结果均不得提交 RT；原版当前结果仍正常安装。
+  已安装但缺 RT 内容的段由有预算、背压和退避的恢复队列继续捕获，不因 RT 校验失败额外发送世界 dirty。
   实际编译同时捕获已知模型全部候选的分层支持界与 renderer 真正使用的 float offset；
   weighted 枚举全部分支，multipart 保守并集全部 selector 子模型，不按命名空间或一次采样结果认证。
   不可变候选清单与原始 scope、实际层内容版本一起安装；未知子模型、fluid、additional renderer 保持未证明。

@@ -213,12 +213,15 @@ object MCDR_ABI {
     private var MH_getshaderidentifier: MethodHandle? = null
     private var MH_dispatchrays: MethodHandle? = null
     private var MH_creatertframe: MethodHandle? = null
+    private var MH_creatertworkgraphframe: MethodHandle? = null
     private var MH_releasertframe: MethodHandle? = null
     private var MH_creatertgbufferprogram: MethodHandle? = null
     private var MH_creatertgeometrysnapshot: MethodHandle? = null
     private var MH_creatertgeometrydelta: MethodHandle? = null
     private var MH_getrtgeometrymemory: MethodHandle? = null
     private var MH_getrtaccelerationbudget: MethodHandle? = null
+    private var MH_setrtmanagedmemorybudget: MethodHandle? = null
+    private var MH_getrtmanagedmemorybudget: MethodHandle? = null
     private var MH_setrtsceneworkbudget: MethodHandle? = null
     private var MH_getrtsceneworkbudget: MethodHandle? = null
     private var MH_releasertgeometrysnapshot: MethodHandle? = null
@@ -232,10 +235,12 @@ object MCDR_ABI {
     private var MH_preparertscene: MethodHandle? = null
     private var MH_preparertscenetargets: MethodHandle? = null
     private var MH_getrtscenestats: MethodHandle? = null
+    private var MH_getrtscenecapturedemands: MethodHandle? = null
     private var MH_releasertgbufferprogram: MethodHandle? = null
     private var MH_rtframe: MethodHandle? = null
     private var MH_rtframetransaction: MethodHandle? = null
     private var MH_rtframesetspatial: MethodHandle? = null
+    private var MH_rtframetransactionlighting: MethodHandle? = null
     private var MH_rtframereblur: MethodHandle? = null
     private var MH_rtframedenoise: MethodHandle? = null
     private var MH_rtframeupscale: MethodHandle? = null
@@ -535,7 +540,7 @@ object MCDR_ABI {
      * This constant, the Kotlin mirrors and the native `layoutTable()` must agree — [verifyABI]
      * aborts before device creation otherwise.
      */
-    const val MCDR_ABI_VERSION: Int = 45
+    const val MCDR_ABI_VERSION: Int = 46
     /** `MCDR_FG_BACKEND_*`, value for value with `mcdr_abi.h`. */
     const val FG_BACKEND_NONE: Int = 0
     const val FG_BACKEND_DLSSG: Int = 1
@@ -2872,9 +2877,10 @@ object MCDR_ABI {
         rayDxil: ByteArray, guideDxil: ByteArray, exposureDxil: ByteArray,
         motionDxil: ByteArray, packDxil: ByteArray, signalDxil: ByteArray,
         remodulateDxil: ByteArray, compositeDxil: ByteArray,
+        workGraph: Boolean = false,
     ): Long {
         requireLoaded()
-        val handle = MH_creatertframe ?: return 0L
+        val handle = (if (workGraph) MH_creatertworkgraphframe else MH_creatertframe) ?: return 0L
         Arena.ofConfined().use { arena ->
             val program = arena.allocate(MCDRLayout.RT_FRAME_PROGRAM)
             val rayData = arena.allocate(rayDxil.size.toLong()).also { it.asByteBuffer().put(rayDxil) }
@@ -3262,6 +3268,41 @@ object MCDR_ABI {
         }
     }
 
+    data class RtMemoryAccount(val byteCount: Long, val limitBytes: Long, val rejectionCount: Long, val peakBytes: Long)
+
+    data class RtManagedMemoryBudget(val total: RtMemoryAccount, val geometryGpu: RtMemoryAccount,
+                                     val geometryUpload: RtMemoryAccount, val acceleration: RtMemoryAccount,
+                                     val frameGpu: RtMemoryAccount, val frameHost: RtMemoryAccount)
+
+    fun D3D12SetRtManagedMemoryBudget(bytes: Long): Boolean {
+        requireLoaded()
+        val handle = MH_setrtmanagedmemorybudget ?: return false
+        try {
+            return ok(handle.invokeExact(bytes) as Int)
+        } catch (failure: Throwable) {
+            throw unexpected(failure)
+        }
+    }
+
+    fun D3D12GetRtManagedMemoryBudget(): RtManagedMemoryBudget? {
+        requireLoaded()
+        val handle = MH_getrtmanagedmemorybudget ?: return null
+        Arena.ofConfined().use { arena ->
+            val output = arena.allocate(MCDRLayout.I64, 24L)
+            try {
+                if (!ok(handle.invokeExact(output, 24) as Int)) return null
+            } catch (failure: Throwable) {
+                throw unexpected(failure)
+            }
+            fun account(index: Int): RtMemoryAccount {
+                val offset = index * 32L
+                return RtMemoryAccount(output.get(MCDRLayout.I64, offset), output.get(MCDRLayout.I64, offset + 8),
+                    output.get(MCDRLayout.I64, offset + 16), output.get(MCDRLayout.I64, offset + 24))
+            }
+            return RtManagedMemoryBudget(account(0), account(1), account(2), account(3), account(4), account(5))
+        }
+    }
+
     data class RtAccelerationOutput(
         val snapshotId: Long, val acceleration: Long, val instances: Long, val byteCount: Long,
         val instanceCount: Int, val blasCount: Int, val buildCount: Int, val ready: Boolean,
@@ -3371,6 +3412,30 @@ object MCDR_ABI {
                 values[6], values[7], values[8], values[9], values[10], values[11], values[12], values[13],
                 values[14], values[15], values[16], values[17], values[18], values[19], values[20], values[21],
                 values[22], values[23])
+        }
+    }
+
+    data class RtSceneCaptureDemands(val worldEpoch: Long, val liveRevision: Long, val frameId: Long,
+                                    val nodes: LongArray)
+
+    fun D3D12GetRtSceneCaptureDemands(scene: Long): RtSceneCaptureDemands? {
+        requireLoaded()
+        val handle = MH_getrtscenecapturedemands ?: return null
+        Arena.ofConfined().use { arena ->
+            val output = arena.allocate(MCDRLayout.I64, 132L)
+            try {
+                if (!ok(handle.invokeExact(scene, output, 132) as Int)) return null
+            } catch (failure: Throwable) { throw unexpected(failure) }
+            val count = output.get(MCDRLayout.I64, 24)
+            if (count !in 0L..64L) return null
+            val frame = output.get(MCDRLayout.I64, 16)
+            val nodes = LongArray(count.toInt()) { index ->
+                val demandFrame = output.get(MCDRLayout.I64, 40L + index * 16L)
+                if (demandFrame <= 0L || demandFrame > frame || frame - demandFrame > 8L) return null
+                output.get(MCDRLayout.I64, 32L + index * 16L)
+            }
+            return RtSceneCaptureDemands(output.get(MCDRLayout.I64, 0),
+                output.get(MCDRLayout.I64, 8), frame, nodes)
         }
     }
 
@@ -3573,11 +3638,13 @@ object MCDR_ABI {
         ctx: Long, frame: Long, trace: RtFrameRequest, liveRevision: Long, spatial: ByteBuffer,
         historyGeneration: Long, historyFrame: Long, planRevision: Long, width: Int, height: Int,
         nrdMatrices: FloatArray, slConstants: FloatArray, source: Long, upscaler: Int, debugMode: Int,
-        timestamps: Long, firstTimestamp: Int,
+        timestamps: Long, firstTimestamp: Int, lighting: ByteBuffer? = null,
     ): RtTransactionOutput? {
         require(nrdMatrices.size == 64 && slConstants.size == 104)
         requireLoaded()
         val handle = MH_rtframetransaction ?: return null
+        val lightingHandle = MH_rtframetransactionlighting
+        if (lighting != null && lightingHandle == null) return null
         Arena.ofConfined().use { arena ->
             val description = arena.allocate(MCDRLayout.RT_TRANSACTION_DESC)
             val output = arena.allocate(MCDRLayout.RT_TRANSACTION_OUTPUT)
@@ -3608,8 +3675,14 @@ object MCDR_ABI {
             description.set(MCDRLayout.PTR, 232, ptr(timestamps))
             description.set(MCDRLayout.I32, 240, firstTimestamp)
             description.set(MCDRLayout.I32, 244, 0)
+            val lightingData = lighting?.let {
+                arena.allocate(it.remaining().toLong(), 8).apply { asByteBuffer().put(it.duplicate()) }
+            }
             try {
-                if (!ok(handle.invokeExact(ptr(ctx), frame, description, output) as Int)) return null
+                val status = if (lightingData == null) handle.invokeExact(ptr(ctx), frame, description, output) as Int
+                    else requireNotNull(lightingHandle).invokeExact(ptr(ctx), frame, description, lightingData,
+                        lightingData.byteSize(), output) as Int
+                if (!ok(status)) return null
             } catch (failure: Throwable) {
                 throw unexpected(failure)
             }
@@ -5256,12 +5329,15 @@ object MCDR_ABI {
             MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I64,
             MCDRLayout.I32, MCDRLayout.I32
         ))
-        MH_creatertframe = skip("mcdr_dx12CreateRtFrame", fd(MCDRLayout.I64, MCDRLayout.PTR))
+        MH_creatertframe = skip("mcdr_dx12CreateRtFrame", MCDRLayout.RT_FRAME_CREATE)
+        MH_creatertworkgraphframe = skip("mcdr_dx12CreateRtWorkGraphFrame", MCDRLayout.RT_FRAME_CREATE)
         MH_creatertgbufferprogram = skip("mcdr_dx12CreateRtGBufferProgram", fd(MCDRLayout.I64, MCDRLayout.PTR))
         MH_creatertgeometrysnapshot = skip("mcdr_dx12CreateRtGeometrySnapshot", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_creatertgeometrydelta = skip("mcdr_dx12CreateRtGeometryDelta", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_getrtgeometrymemory = skip("mcdr_dx12GetRtGeometryMemory", fd(MCDRLayout.I32, MCDRLayout.PTR))
         MH_getrtaccelerationbudget = skipOptional("mcdr_dx12GetRtAccelerationBudget", MCDRLayout.RT_ACCELERATION_BUDGET)
+        MH_setrtmanagedmemorybudget = skipOptional("mcdr_dx12SetRtManagedMemoryBudget", MCDRLayout.RT_MANAGED_MEMORY_SET)
+        MH_getrtmanagedmemorybudget = skipOptional("mcdr_dx12GetRtManagedMemoryBudget", MCDRLayout.RT_MANAGED_MEMORY_GET)
         MH_setrtsceneworkbudget = skipOptional("mcdr_dx12SetRtSceneWorkBudget", MCDRLayout.RT_SCENE_WORK_SET)
         MH_getrtsceneworkbudget = skipOptional("mcdr_dx12GetRtSceneWorkBudget", MCDRLayout.RT_SCENE_WORK_GET)
         MH_releasertgeometrysnapshot = skip("mcdr_dx12ReleaseRtGeometrySnapshot", fd(MCDRLayout.I32, MCDRLayout.I64))
@@ -5275,6 +5351,7 @@ object MCDR_ABI {
         MH_preparertscene = skip("mcdr_dx12PrepareRtScene", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_preparertscenetargets = skip("mcdr_dx12PrepareRtSceneTargets", MCDRLayout.RT_SCENE_TARGETS_CALL)
         MH_getrtscenestats = skipOptional("mcdr_dx12GetRtSceneStats", MCDRLayout.RT_SCENE_STATS)
+        MH_getrtscenecapturedemands = skipOptional("mcdr_dx12GetRtSceneCaptureDemands", MCDRLayout.RT_SCENE_CAPTURE_DEMANDS)
         MH_releasertgbufferprogram = skip("mcdr_dx12ReleaseRtGBufferProgram", fd(MCDRLayout.I32, MCDRLayout.I64))
         MH_releasertframe = skip("mcdr_dx12ReleaseRtFrame", fd(MCDRLayout.I32, MCDRLayout.I64))
         MH_rtframebegingbuffer = skip("mcdr_dx12RtFrameBeginGBuffer",
@@ -5294,6 +5371,7 @@ object MCDR_ABI {
             fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_rtframetransaction = skip("mcdr_dx12RtFrameTransaction", MCDRLayout.RT_FRAME_TRANSACTION)
         MH_rtframesetspatial = skip("mcdr_dx12RtFrameSetSpatial", MCDRLayout.RT_FRAME_SET_SPATIAL)
+        MH_rtframetransactionlighting = skip("mcdr_dx12RtFrameTransactionLighting", MCDRLayout.RT_FRAME_TRANSACTION_LIGHTING)
         MH_rtframereblur = skip("mcdr_dx12RtFrameReblur",
             fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.I64))
         MH_rtframedenoise = skip("mcdr_dx12RtFrameDenoise",

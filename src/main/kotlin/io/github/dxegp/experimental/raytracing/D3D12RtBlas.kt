@@ -946,7 +946,12 @@ internal object D3D12RtBlas {
 
     fun diagnosticState(): MCDR_ABI.RtSceneOutput? = sceneOutput
 
+    val preparationFailure: String? get() = prepareError
+
     fun sceneStats(): MCDR_ABI.RtSceneStats? = if (scene == 0L) null else MCDR_ABI.D3D12GetRtSceneStats(scene)
+
+    fun captureDemands(): MCDR_ABI.RtSceneCaptureDemands? =
+        if (scene == 0L) null else MCDR_ABI.D3D12GetRtSceneCaptureDemands(scene)
 
     fun workBudget(): MCDR_ABI.RtSceneWorkBudget? = if (scene == 0L) null else MCDR_ABI.D3D12GetRtSceneWorkBudget(scene)
 
@@ -984,7 +989,11 @@ internal object D3D12RtBlas {
     ): Boolean {
         prepareError = null
         if (scene == 0L) scene = MCDR_ABI.D3D12CreateRtScene()
-        if (scene == 0L) return false
+        if (scene == 0L) {
+            prepareError = MCDR_ABI.D3D12LastError()
+            sceneOutput = null
+            return false
+        }
         val budget = D3D12Settings.rtBuildBudget
         if (!MCDR_ABI.D3D12SetRtSceneWorkBudget(scene, budget.cpuMicros.toLong(), budget.gpuMicros.toLong(),
                 budget.triangles.toLong())) {

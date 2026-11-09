@@ -279,11 +279,9 @@ object D3D12RtMaterialTable {
         }
         val look = lookOf(path)
         val sourceMaps = D3D12RtMaterialMaps.look(contents.name(), width, height)
-        val albedoMap = if (sourceMaps.spec != null || sourceMaps.normal != null) {
-            D3D12RtMaterialMaps.Image(width, height, IntArray(width * height) { pixel ->
-                sprite.getPixelARGB(0, pixel % width, pixel / width)
-            })
-        } else null
+        val albedoMap = D3D12RtMaterialMaps.Image(width, height, IntArray(width * height) { pixel ->
+            sprite.getPixelARGB(0, pixel % width, pixel / width)
+        })
         val maps = D3D12RtMaterialMaps.Look(sourceMaps.spec, sourceMaps.normal, albedoMap)
         val roughness = look.roughness
         val metalness = 0f
@@ -307,7 +305,9 @@ object D3D12RtMaterialTable {
     private fun linear(value: Float): Double = value.toDouble().pow(2.2)
 
     private fun packTextures(sprites: Array<Sprite?>, parallaxDepth: Float): ByteArray {
-        val mapped = sprites.filterNotNull().filter { it.maps.spec != null || it.maps.normal != null }
+        val mapped = sprites.filterNotNull().filter {
+            it.maps.spec != null || it.maps.normal != null || it.maps.albedo != null
+        }
         val size = mapped.sumOf { sprite ->
             64L + 4L * ((sprite.maps.spec?.pixels?.size ?: 0) + (sprite.maps.normal?.pixels?.size ?: 0) +
                 (sprite.maps.albedo?.pixels?.size ?: 0))

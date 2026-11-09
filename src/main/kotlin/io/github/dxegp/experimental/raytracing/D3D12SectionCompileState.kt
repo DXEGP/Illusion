@@ -133,14 +133,17 @@ class D3D12SectionCaptureState {
     }
 
     @Synchronized
+    fun canInstallRenderMesh(mesh: SectionMesh, sectionNode: Long, worldIdentity: Any?, epoch: Int): Boolean =
+        bound && !installed && !cancelled && result === mesh && worldIdentity != null &&
+            this.sectionNode == sectionNode && this.worldIdentity === worldIdentity && this.epoch == epoch
+
+    @Synchronized
     fun canInstall(mesh: SectionMesh, sectionNode: Long, worldIdentity: Any?, epoch: Int): Boolean =
-        bound && !installed && result === mesh && worldIdentity != null &&
-            this.sectionNode == sectionNode && this.worldIdentity === worldIdentity && this.epoch == epoch &&
-            hasCurrentInputs()
+        canInstallRenderMesh(mesh, sectionNode, worldIdentity, epoch) && hasCurrentInputs()
 
     @Synchronized
     fun observeInstall(mesh: SectionMesh, sectionNode: Long, worldIdentity: Any?, epoch: Int): Boolean {
-        if (!canInstall(mesh, sectionNode, worldIdentity, epoch)) return false
+        if (!canInstallRenderMesh(mesh, sectionNode, worldIdentity, epoch)) return false
         installed = true
         sourceRegion = null
         revokeSourceSupport()

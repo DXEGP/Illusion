@@ -56,7 +56,7 @@ enum class RtMode {
 /**
  * `[rt] backend` — which ray-tracing backend the path tracer drives.
  *
- * AUTO selects the available hardware implementation. WG currently falls back to DXR.
+ * AUTO selects DXR. WG is experimental and falls back to DXR when unavailable.
  * Hardware ray tracing is required; unsupported devices keep the vanilla renderer.
  */
 enum class RtBackend {
@@ -227,6 +227,8 @@ object IllusionConfig {
     val RAYTRACING_BUILD_CPU_MICROS: ModConfigSpec.IntValue
     val RAYTRACING_BUILD_GPU_MICROS: ModConfigSpec.IntValue
     val RAYTRACING_BUILD_TRIANGLES: ModConfigSpec.IntValue
+    val RAYTRACING_GEOMETRY_PAYLOAD_MIB: ModConfigSpec.IntValue
+    val RAYTRACING_MANAGED_MEMORY_MIB: ModConfigSpec.IntValue
 
     val RAYTRACING_EXPOSURE_MODE: ModConfigSpec.EnumValue<RtExposureMode>
     val RAYTRACING_EXPOSURE_EV: ModConfigSpec.DoubleValue
@@ -629,7 +631,7 @@ object IllusionConfig {
         RAYTRACING_BACKEND = BUILDER
             .comment(
                 "Hardware ray-tracing backend (AUTO / DXR / WG).",
-                "AUTO uses DXR. WG currently falls back to DXR until its implementation is ready.",
+                "AUTO uses DXR. WG is experimental and falls back to DXR when unavailable.",
                 "Ray tracing stays off when hardware DXR is unavailable."
             )
             .translation("dxr_mc.configuration.rt.backend")
@@ -673,6 +675,22 @@ object IllusionConfig {
                 "An oversized oldest record proceeds alone and is reported as an overrun.")
             .translation("dxr_mc.configuration.rt.build_triangles")
             .defineInRange("buildTriangles", 65536, 1, 1000000000)
+
+        RAYTRACING_GEOMETRY_PAYLOAD_MIB = BUILDER
+            .comment("Selected scene geometry payload limit in MiB. Takes effect immediately.",
+                "Counts aligned vertex, index and quad content plus the 64-byte record table.",
+                "Arena capacity, materials, AS, upload and in-flight generations have separate limits.",
+                "Groups that do not fit remain missing scene targets.")
+            .translation("dxr_mc.configuration.rt.geometry_payload_mib")
+            .defineInRange("geometryPayloadMiB", 128, 1, 512)
+
+        RAYTRACING_MANAGED_MEMORY_MIB = BUILDER
+            .comment("Shared committed allocation limit for native RT geometry, AS and frame resources in MiB.",
+                "Includes NRD pools, uploads, readback and deferred deletion.",
+                "Opaque SDK allocations and CPU copies are separate.",
+                "Takes effect immediately. Lowering the limit keeps live resources and blocks new allocations.")
+            .translation("dxr_mc.configuration.rt.managed_memory_mib")
+            .defineInRange("managedMemoryMiB", 2048, 64, 16384)
 
         RAYTRACING_EXPOSURE_MODE = BUILDER
             .comment("Exposure metering: MANUAL uses a fixed multiplier; AUTO adapts to traced surfaces.",

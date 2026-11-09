@@ -51,10 +51,8 @@ object D3D12RtFrame {
     /** 常量缓冲的槽跨度：`WgaFrame` 416 B，CBV 偏移必须是 256 的倍数，取 512。 */
     private const val FRAME_SLOT_BYTES = 512
 
-    /** 镜像里最多放多少段：再多就是给 shader 的循环加无用功，追踪也够不到。 */
     private const val MIRROR_RECORDS = 384
 
-    /** 镜像三块缓冲合计的字节上限。世界加载时每帧都有新段进来，不设上限就会每帧传几百 MB。 */
     private const val MIRROR_BYTES = 128L * 1024 * 1024
     private val MIRROR_CAPACITIES = longArrayOf(256L shl 20, 64L shl 20, 8L shl 20)
     private const val HOT_MIRROR_LIMIT = 8
@@ -81,11 +79,7 @@ object D3D12RtFrame {
 
     /** `renderScale` 缩到 25% 时目标高度只剩 40 像素，再低就没有降噪的余地了。 */
 
-    /**
-     * 只扫相机这么远的段（方块单位）。0 表示不裁，自检场景用 0；真实世界必须裁，否则求交次数爆炸。
-     * 见 docs/rt/README.md
-     */
-    private const val TRACE_RADIUS = 96.0f
+    private const val NEAR_RADIUS = D3D12RtFullDomainProfile.LEGACY_RADIUS
 
     /** 一帧的相机与光照参数；坐标是世界坐标（方块单位）。 */
     class Camera(
@@ -105,6 +99,7 @@ object D3D12RtFrame {
         val cameraIdentity: Any? = null,
         val cameraMode: Any? = null,
         val fovSetting: Int? = null,
+        val domain: D3D12RtFullDomainProfile.Request? = null,
         )
 
     private class Radiance(
@@ -136,7 +131,9 @@ object D3D12RtFrame {
     private class Mirrors(
         val native: MCDR_ABI.RtGeometryOutput,
         val geometrySnapshot: D3D12RtGeometryPool.MirrorSlice,
+        var residency: D3D12RtGeometryPool.Residency?,
         val worldIdentity: Any,
+        val center: RtVec3,
         val geometryEpoch: Int,
         var key: Long,
         val geometryRevision: Long,
@@ -151,6 +148,7 @@ object D3D12RtFrame {
         val recordingIdentity: Any,
     ) {
         var committed = false
+        val sectionNodes: Set<Long> = geometrySnapshot.contents.mapTo(hashSetOf()) { it.record.sectionNode }
         val contentBytes: Map<Long, Int> = buildMap {
             for (entry in geometrySnapshot.contents) {
                 for (content in listOf(entry.vertices, entry.indices, entry.quads)) {
@@ -178,6 +176,9 @@ object D3D12RtFrame {
     @Volatile
     private var publishedMirrors: Mirrors? = null
 
+    private var requestedResidency: D3D12RtGeometryPool.Residency? = null
+    private var residencyDemandAttemptNanos = 0L
+
     private val hotMirrors = linkedMapOf<Long, Mirrors>()
 
     /** 这一帧的辐亮度缓冲是否真的被派发写过；没写成的话合光会把过期内容铺满屏幕。 */
@@ -191,7 +192,6 @@ object D3D12RtFrame {
     private var capturedCameraStamp = Long.MIN_VALUE
 
     private var accelLogged = false
-    private var wgWarned = false
     private var debugPipeline = 0L
     private var blasPipeline = 0L
     @Volatile
@@ -232,11 +232,16 @@ object D3D12RtFrame {
     private var pendingPreviousReady = false
     private var pendingSubmission: Any? = null
     private var pendingCompositeReady = false
+    private var lightingCursor = 0L
+    private var pendingLightingRevision = 0L
     private data class PreparedFrame(
         val device: D3D12Device, val recordingIdentity: Any, val camera: Camera,
         val plan: D3D12RtPipelinePlan.Plan, val gbufferRevision: Long,
     )
     private var preparedFrame: PreparedFrame? = null
+    @Volatile
+    var fullDomainProfile: D3D12RtFullDomainProfile.Snapshot? = null
+        private set
     @Volatile
     private var temporalResolveReady = false
     /** DLSS-D 的 `slSetConstants` 载荷：四个行主序矩阵 + 近/远/竖直视场/宽高比。 */
@@ -328,6 +333,9 @@ object D3D12RtFrame {
         radiance = null
         mirrors = null
         publishedMirrors = null
+        requestedResidency = null
+        residencyDemandAttemptNanos = 0L
+        D3D12RtGeometryPool.clearResidencyDemands()
         hotMirrors.clear()
         output = null
         frameValid = false
@@ -337,6 +345,8 @@ object D3D12RtFrame {
         pendingSubmission = null
         pendingCompositeReady = false
         preparedFrame = null
+        lightingCursor = 0L
+        pendingLightingRevision = 0L
         capturedCamera = null
         capturedCameraStamp = Long.MIN_VALUE
         history.clear()
@@ -376,6 +386,7 @@ object D3D12RtFrame {
 
     fun invalidateOutput() = synchronized(frameLock) {
         frameValid = false
+        fullDomainProfile = null
         preparedFrame = null
         compositeImage = null
     }
@@ -416,6 +427,7 @@ object D3D12RtFrame {
             cameraIdentity = client.cameraEntity,
             cameraMode = client.options.cameraType,
             fovSetting = client.options.fov().get(),
+            domain = D3D12RtFullDomainProfile.fromClient(world, client.options, transform.position),
         )
     }
 
@@ -460,7 +472,7 @@ object D3D12RtFrame {
                 transform.offset, transform.right, transform.up, transform.forward,
                 transform.view.copyOf(), transform.projection.copyOf()), camera.farPlane,
             camera.worldIdentity, camera.worldTime, camera.frameNanos,
-            camera.cameraIdentity, camera.cameraMode, camera.fovSetting)
+            camera.cameraIdentity, camera.cameraMode, camera.fovSetting, camera.domain)
         preparedFrame = PreparedFrame(device, encoder.recordingIdentity, frozenCamera, plan, replay.revision)
     }
 
@@ -482,6 +494,7 @@ object D3D12RtFrame {
                 } finally {
                     if (!dispatched) {
                         frameValid = false
+                        fullDomainProfile = null
                         temporalResolveReady = false
                         cancelPendingSubmission()
                     }
@@ -505,6 +518,7 @@ object D3D12RtFrame {
         debugMode: Int,
     ): Boolean {
         frameValid = false
+        fullDomainProfile = null
         denoisedRadiance = null
         val width = plan.displayWidth
         val height = plan.displayHeight
@@ -514,10 +528,6 @@ object D3D12RtFrame {
         if (encoder == null) return dispatchSkip("no encoder")
         if (camera == null) return dispatchSkip("no camera")
         if (width <= 0 || height <= 0) return dispatchSkip("empty target ${width}x$height")
-        if (!wgWarned && D3D12Settings.rtBackend == RtBackend.WG.ordinal) {
-            wgWarned = true
-            IllusionLogger.warnMessage("rt: WG unavailable, using DXR")
-        }
         if (!D3D12RtNativeFrame.prepare()) return dispatchSkip("DXR unavailable")
         val mirror = mirrorsFor(device, encoder, camera) ?: return false
         val traceWidth = plan.traceWidth
@@ -528,9 +538,15 @@ object D3D12RtFrame {
             (FrameGeneration.mode().toLong() shl 16) or FrameGeneration.frames().toLong()
         val jitter = D3D12Temporal.frameJitter(camera.frameNanos)
         val accelStart = System.nanoTime()
-        val coverage = D3D12RtGeometryPool.coverageNear(mirrorX, mirrorY, mirrorZ, TRACE_RADIUS + MIRROR_SLACK)
+        val domain = camera.domain?.takeIf { it.worldIdentity === camera.worldIdentity }
+        val coverage = domain?.let {
+            D3D12RtGeometryPool.coverageFor(it, camera.position.x, camera.position.y, camera.position.z,
+                NEAR_RADIUS + MIRROR_SLACK)
+        } ?: D3D12RtGeometryPool.coverageNear(mirrorX, mirrorY, mirrorZ, NEAR_RADIUS + MIRROR_SLACK)
         val versions = coverage.versions
         if (versions.epoch != mirror.geometryEpoch) return dispatchSkip("geometry epoch changed")
+        val lighting = D3D12RtGeometryPool.lightingChangesSince(versions, lightingCursor)
+            ?: return dispatchSkip("lighting version changed")
         val sceneFrameId = D3D12Temporal.frameIdentity + 1L
         val accelerationReady = D3D12RtBlas.prepareCoverage(
             encoder.nativeHandle(), mirror.geometryEpoch, mirror.identity, versions.records, versions.revision,
@@ -539,6 +555,14 @@ object D3D12RtFrame {
         if (!accelerationReady && D3D12RtBlas.wasGeometryRecordingCancelled()) {
             discardMirrors()
             return dispatchSkip("geometry recording cancelled")
+        }
+        D3D12RtBlas.preparationFailure?.let {
+            return dispatchSkip("scene ${it.substringAfterLast(": ")}")
+        }
+        D3D12RtBlas.captureDemands()?.let { demand ->
+            D3D12RtGeometryPool.requestCaptures(demand.worldEpoch, demand.liveRevision, demand.nodes)
+            if (domain != null) D3D12RtGeometryPool.requestResidency(
+                demand.worldEpoch, demand.liveRevision, demand.nodes, mirror.sectionNodes)
         }
         val activeMirror = when {
             D3D12RtBlas.activeMirrorId() == mirror.identity -> {
@@ -558,7 +582,7 @@ object D3D12RtFrame {
         historyInvalidation = history.begin(D3D12RtHistory.Snapshot(
             plan, camera.worldIdentity, device, D3D12RtGBuffer.targets()?.resourceIdentity,
             activeMirror.geometryEpoch, D3D12RtBlas.sceneRevision(), activeMirror.materialHistoryRevision,
-            RtBackend.DXR.ordinal,
+            D3D12RtNativeFrame.backend.ordinal,
             frameGeneration, camera.worldTime, camera.frameNanos, D3D12Temporal.frameIdentity,
             camera.position, camera.forward, camera.up,
             camera.transform.projection,
@@ -584,7 +608,7 @@ object D3D12RtFrame {
         val transaction = D3D12RtNativeFrame.recordTransaction(
             encoder.nativeHandle(), frameCounter, activeMirror.geometryEpoch, D3D12RtBlas.sceneRevision(),
             activeMirror.materialRevision, activeMirror.identity, traceWidth, traceHeight, D3D12RtBlas.identity(), frameConstants,
-            camera.frameNanos, exposureReset, coverage,
+            camera.frameNanos, exposureReset, coverage, lighting,
             plan, historyInvalidation, nrdMatrices, slConstants, source.handle(), debugMode,
             slConstants[68] - slConstants[70], slConstants[69] - slConstants[71],
             slConstants[68], slConstants[69],
@@ -605,6 +629,16 @@ object D3D12RtFrame {
             return false
         }
         val recorded = transaction.trace
+        fullDomainProfile = domain?.let {
+            D3D12RtFullDomainProfile.snapshot(it, coverage, activeMirror.center,
+                if (activeMirror.residency == null) NEAR_RADIUS + MIRROR_SLACK else null,
+                recorded.frameId, activeMirror.identity, activeMirror.geometryRevision,
+                activeMirror.recordCount, activeMirror.residency?.budget?.recordLimit ?: MIRROR_RECORDS,
+                activeMirror.residency?.budget?.byteLimit ?: MIRROR_BYTES, activeMirror.residency?.request?.primary,
+                requestedResidency,
+                requestedResidency?.slice === activeMirror.geometrySnapshot, D3D12RtBlas.sceneStats(), null, plan)
+                .copy(managedMemory = MCDR_ABI.D3D12GetRtManagedMemoryBudget())
+        }
         val frame = Radiance(traceWidth, traceHeight, recorded.direct, recorded.indirect, recorded.aux,
             recorded.specular, recorded.specularGrazing, recorded.exposure,
             recorded.motion, recorded.packedNormalRoughness, recorded.viewZ, recorded.byteCount,
@@ -614,9 +648,9 @@ object D3D12RtFrame {
         frameCbvOffset = 0L
         D3D12RtStats.onDispatches((if (plan.denoise) 5 else 2) + transaction.denoise.dispatchCount +
             transaction.upscale.dispatchCount + transaction.composite.dispatchCount)
-        val tier = "dxr"
+        val tier = if (D3D12RtNativeFrame.backend == RtBackend.WG) "wg" else "dxr"
         D3D12RtStats.setTier(tier)
-        D3D12RtStats.onTraceDispatched(traceWidth, traceHeight, activeMirror.recordCount)
+        D3D12RtStats.onTraceDispatched(traceWidth, traceHeight, activeMirror.recordCount, fullDomainProfile)
         D3D12RtStats.acceptNativeTimestamps(transaction.timestampMask)
         val reconstruction = transaction.upscale.takeIf { it.diffuse != 0L } ?: transaction.denoise
         denoiseBytes = transaction.denoise.byteCount
@@ -632,6 +666,7 @@ object D3D12RtFrame {
         compositeBytes = transaction.composite.byteCount
         compositeImage = CompositeImage(transaction.composite.diffuse, source.getWidth(0), source.getHeight(0), frame.frameId)
         pendingCompositeReady = true
+        pendingLightingRevision = lighting.revision
         frameValid = true
         if (compositeRan.compareAndSet(false, true)) {
             val flag = if (transaction.composite.encoding != 0) 1 else 0
@@ -675,7 +710,7 @@ object D3D12RtFrame {
                 "of ${width}x$height records=${activeMirror.recordCount} tier=$tier " +
                 "inst=${D3D12RtBlas.instances()} " +
                 "cam=${camera.position.x.toInt()},${camera.position.y.toInt()},${camera.position.z.toInt()} " +
-                "triangles=${D3D12RtGeometryPool.triangleCount()} radius=$TRACE_RADIUS")
+                "triangles=${D3D12RtGeometryPool.triangleCount()}")
         }
         return true
     }
@@ -742,7 +777,7 @@ object D3D12RtFrame {
         encoder.ensureListOpen()
         preparedFrame = null
         if (!dispatch(prepared.device, encoder, prepared.camera, prepared.plan, source, debugMode))
-            return compositeSkip("native transaction rejected")
+            return null
         return compositeImage
     }
 
@@ -921,13 +956,33 @@ object D3D12RtFrame {
         }
         val moved = abs(camera.position.x - mirrorX) + abs(camera.position.y - mirrorY) +
             abs(camera.position.z - mirrorZ) > MIRROR_SLACK
-        if (current != null && current.key == revisionKey && !moved) return current
-        // 只镜像相机附近的一小片：整池上传在世界加载时会每帧传几百 MB，直接把画面卡死。
+        val domain = camera.domain?.takeIf { it.worldIdentity === camera.worldIdentity }
+        val budget = domain?.let {
+            D3D12RtGeometryPool.ResidencyBudget(D3D12Settings.rtGeometryPayloadMiB.toLong() shl 20)
+        }
+        val unchanged = current != null && current.key == revisionKey && !moved &&
+            current.residency?.request == domain && current.residency?.budget == budget
+        val nowNanos = System.nanoTime()
+        val demandDue = unchanged && domain != null && checkNotNull(current).committed &&
+            D3D12RtBlas.activeMirrorId() == current.identity && !D3D12RtBlas.hasPendingMirror(current.identity) &&
+            (residencyDemandAttemptNanos == 0L || nowNanos - residencyDemandAttemptNanos >= 100_000_000L) &&
+            D3D12RtGeometryPool.hasResidencyDemands(domain, current.sectionNodes, nowNanos)
+        if (unchanged && !demandDue) {
+            requestedResidency = current.residency
+            return current
+        }
+        if (demandDue) residencyDemandAttemptNanos = nowNanos
         val packingStartedAt = System.nanoTime()
-        val slice = D3D12RtGeometryPool.mirrorNear(
+        val residency = domain?.let {
+            D3D12RtGeometryPool.mirrorFor(it, camera.position.x, camera.position.y, camera.position.z,
+                checkNotNull(budget), current?.sectionNodes?.takeIf { unchanged }.orEmpty())
+        }
+        requestedResidency = residency
+        if (residency?.superseded == true) return current
+        val slice = (if (domain != null) residency?.slice else D3D12RtGeometryPool.mirrorNear(
             camera.position.x, camera.position.y, camera.position.z,
-            TRACE_RADIUS + MIRROR_SLACK, MIRROR_RECORDS, MIRROR_BYTES,
-        ) ?: run {
+            NEAR_RADIUS + MIRROR_SLACK, MIRROR_RECORDS, MIRROR_BYTES,
+        )) ?: run {
             discardMirrors()
             return null
         }
@@ -936,6 +991,8 @@ object D3D12RtFrame {
         if (current != null && current.geometrySnapshot === slice &&
             current.materialRevision == materialRevision) {
             current.key = revisionKey
+            current.residency = residency
+            if (current.committed) residency?.let(D3D12RtGeometryPool::completeResidencyDemands)
             mirrorX = camera.position.x
             mirrorY = camera.position.y
             mirrorZ = camera.position.z
@@ -969,12 +1026,14 @@ object D3D12RtFrame {
             val native = MCDR_ABI.D3D12CreateRtGeometryDelta(encoder.nativeHandle(),
                 slice.geometryEpoch.toLong(), slice.geometryRevision, materialRevision,
                 current?.identity ?: 0L, current?.takeIf { materials == null }?.identity ?: 0L,
-                slice.records, contents, materials, MIRROR_CAPACITIES)
+                slice.records, contents, materials, budget?.capacities() ?: MIRROR_CAPACITIES)
                 ?: throw IllegalStateException(MCDR_ABI.D3D12LastError())
             Mirrors(
                 native = native,
                 geometrySnapshot = slice,
+                residency = residency,
                 worldIdentity = camera.worldIdentity,
+                center = camera.position,
                 geometryEpoch = slice.geometryEpoch,
                 key = key,
                 geometryRevision = slice.geometryRevision,
@@ -1057,6 +1116,7 @@ object D3D12RtFrame {
             starvedTicks = 0
             starvedReported = false
             frameValid = false
+            fullDomainProfile = null
             discardMirrors()
             history.invalidate(D3D12RtHistory.InvalidationReason.WORLD)
         }
@@ -1065,10 +1125,14 @@ object D3D12RtFrame {
 
     private fun discardMirrors() {
         temporalResolveReady = false
+        fullDomainProfile = null
         D3D12RtBlas.invalidateGeometry()
         val retained = (listOfNotNull(mirrors, publishedMirrors) + hotMirrors.values).distinct()
         mirrors = null
         publishedMirrors = null
+        requestedResidency = null
+        residencyDemandAttemptNanos = 0L
+        D3D12RtGeometryPool.clearResidencyDemands()
         hotMirrors.clear()
         retained.forEach(Mirrors::close)
         previousValid = false
@@ -1121,7 +1185,8 @@ object D3D12RtFrame {
                 sunRadiance = camera.sunColor,
                 sunStrength = SUN_STRENGTH,
                 frameIndex = frameCounter.toInt(),
-                radius = TRACE_RADIUS,
+                radius = D3D12RtFullDomainProfile.compositeRadius(
+                    camera.domain?.takeIf { it.worldIdentity === camera.worldIdentity }),
                 recordCount = recordCount,
                 debugMode = 0,
                 previousViewProjection = if (previousValid) previousViewProjection else null,
@@ -1153,7 +1218,10 @@ object D3D12RtFrame {
     internal fun commitPendingSubmission(recordingIdentity: Any) = synchronized(frameLock) {
         if (preparedFrame?.recordingIdentity === recordingIdentity) preparedFrame = null
         for (mirror in listOfNotNull(mirrors, publishedMirrors)) {
-            if (mirror.recordingIdentity === recordingIdentity) mirror.committed = true
+            if (mirror.recordingIdentity === recordingIdentity) {
+                mirror.committed = true
+                mirror.residency?.let(D3D12RtGeometryPool::completeResidencyDemands)
+            }
         }
         if (pendingSubmission !== recordingIdentity) return@synchronized
         if (!pendingCompositeReady) {
@@ -1162,6 +1230,8 @@ object D3D12RtFrame {
         }
         pendingSubmission = null
         pendingCompositeReady = false
+        lightingCursor = pendingLightingRevision
+        pendingLightingRevision = 0L
         history.commit()
         if (!pendingPreviousReady) return@synchronized
         pendingViewProjection.copyInto(previousViewProjection)
@@ -1176,8 +1246,10 @@ object D3D12RtFrame {
         if (pendingSubmission !== recordingIdentity) return@synchronized
         pendingSubmission = null
         pendingCompositeReady = false
+        pendingLightingRevision = 0L
         history.cancel()
         frameValid = false
+        fullDomainProfile = null
         temporalResolveReady = false
         compositeImage = null
         pendingPreviousReady = false

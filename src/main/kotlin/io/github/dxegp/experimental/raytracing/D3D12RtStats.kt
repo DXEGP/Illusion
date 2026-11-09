@@ -69,6 +69,7 @@ object D3D12RtStats {
     private var traceWidth = 0
     private var traceHeight = 0
     private var recordCount = 0
+    private var frameFullDomainProfile: D3D12RtFullDomainProfile.Snapshot? = null
 
     private var blasBuilds = 0L
     private var blasRefits = 0L
@@ -124,6 +125,7 @@ object D3D12RtStats {
         }
         frameWidth = width
         frameHeight = height
+        frameFullDomainProfile = null
         writtenSlots = 0
         deepestSlot = SLOT_START
         sampleFrame++
@@ -210,10 +212,12 @@ object D3D12RtStats {
     }
 
     /** 派发规模只有真正派发的那一帧才知道，记下来给 JSON 行用。 */
-    fun onTraceDispatched(width: Int, height: Int, records: Int) {
+    fun onTraceDispatched(width: Int, height: Int, records: Int,
+                          profile: D3D12RtFullDomainProfile.Snapshot? = null) {
         traceWidth = width
         traceHeight = height
         recordCount = records
+        frameFullDomainProfile = profile
     }
 
     fun sceneJson(scene: MCDR_ABI.RtSceneStats?): String = if (scene == null) "null" else buildString {
@@ -304,6 +308,7 @@ object D3D12RtStats {
             append("\"tlas_ms\":").append(tlasMs()).append(',')
             append("\"scene\":").append(sceneJson(scene)).append(',')
             append("\"scene_work\":").append(workBudgetJson(work)).append(',')
+            append("\"full_domain\":").append(D3D12RtFullDomainProfile.json(frameFullDomainProfile)).append(',')
             append("\"capture_recovery\":").append(captureRecoveryJson()).append(',')
         }
         pendingWindow = PendingWindow(metrics, count, sampleFrame)
@@ -393,6 +398,7 @@ object D3D12RtStats {
         traceWidth = 0
         traceHeight = 0
         recordCount = 0
+        frameFullDomainProfile = null
         cpuNanosTotal = 0L
         dispatchesTotal = 0L
         vramPeakBytes = 0L

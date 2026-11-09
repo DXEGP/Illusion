@@ -39,14 +39,14 @@ public abstract class PaletteArrayPublicationMixin<Value> {
     }
 
     @WrapOperation(method = "onResize", at = @At(value = "INVOKE",
-            target = "Lnet/minecraft/world/level/chunk/PalettedContainer$Data;copyFrom:(Lnet/minecraft/world/level/chunk/Palette;Lnet/minecraft/util/BitStorage;)V"))
+            target = "Lnet/minecraft/world/level/chunk/PalettedContainer$Data;copyFrom(Lnet/minecraft/world/level/chunk/Palette;Lnet/minecraft/util/BitStorage;)V"))
     private void dxr_mc$copyData(@Coerce Object data, Palette<?> palette, BitStorage storage, Operation<Void> original) {
         var copy = D3D12SectionGeometry.beginPaletteDataCopy(data, palette, storage);
         original.call(data, palette, storage);
         D3D12SectionGeometry.finishPaletteDataCopy(copy, data);
     }
 
-    @WrapOperation(method = "read", at = @At(value = "INVOKE", target = "Lnet/minecraft/util/BitStorage;getRaw:()[J"))
+    @WrapOperation(method = "read", at = @At(value = "INVOKE", target = "Lnet/minecraft/util/BitStorage;getRaw()[J"))
     private long[] dxr_mc$borrowDecode(BitStorage storage, Operation<long[]> original) {
         try (var access = D3D12RtPaletteArrays.borrow(storage)) {
             return original.call(storage);
@@ -54,7 +54,7 @@ public abstract class PaletteArrayPublicationMixin<Value> {
     }
 
     @WrapOperation(method = "read", at = @At(value = "INVOKE",
-            target = "Lnet/minecraft/network/FriendlyByteBuf;readFixedSizeLongArray:([J)[J"))
+            target = "Lnet/minecraft/network/FriendlyByteBuf;readFixedSizeLongArray([J)[J"))
     private long[] dxr_mc$decodeArray(FriendlyByteBuf buffer, long[] array, Operation<long[]> original) {
         try (var publication = D3D12SectionGeometry.beginPaletteArrayWrite(array, true)) {
             long[] result = original.call(buffer, array);
@@ -63,7 +63,7 @@ public abstract class PaletteArrayPublicationMixin<Value> {
         }
     }
 
-    @WrapOperation(method = "unpack", at = @At(value = "INVOKE", target = "Ljava/util/stream/LongStream;toArray:()[J"))
+    @WrapOperation(method = "unpack", at = @At(value = "INVOKE", target = "Ljava/util/stream/LongStream;toArray()[J"))
     private static long[] dxr_mc$unpackArray(LongStream stream, Operation<long[]> original) {
         long[] result = original.call(stream);
         D3D12RtPaletteArrays.unpacked(stream, result);

@@ -49,11 +49,15 @@ object MCDRLayout {
     @JvmField
     val RT_FRAME_SET_SPATIAL: FunctionDescriptor = FunctionDescriptor.of(I32, PTR, I64, I64, I64, I64, PTR, I64)
     val RT_FRAME_TRANSACTION: FunctionDescriptor = FunctionDescriptor.of(I32, PTR, I64, PTR, PTR)
+    val RT_FRAME_TRANSACTION_LIGHTING: FunctionDescriptor = FunctionDescriptor.of(I32, PTR, I64, PTR, PTR, I64, PTR)
 
     @JvmField
     val QUERY_POLL: FunctionDescriptor = FunctionDescriptor.of(I32, PTR, I32, I32, PTR)
     val RT_SCENE_STATS: FunctionDescriptor = FunctionDescriptor.of(I32, I64, PTR, I32)
+    val RT_SCENE_CAPTURE_DEMANDS: FunctionDescriptor = FunctionDescriptor.of(I32, I64, PTR, I32)
     val RT_ACCELERATION_BUDGET: FunctionDescriptor = FunctionDescriptor.of(I32, PTR, I32)
+    val RT_MANAGED_MEMORY_SET: FunctionDescriptor = FunctionDescriptor.of(I32, I64)
+    val RT_MANAGED_MEMORY_GET: FunctionDescriptor = FunctionDescriptor.of(I32, PTR, I32)
     val RT_SCENE_WORK_SET: FunctionDescriptor = FunctionDescriptor.of(I32, I64, I64, I64, I64)
     val RT_SCENE_WORK_GET: FunctionDescriptor = FunctionDescriptor.of(I32, I64, PTR, I32)
 
@@ -547,6 +551,7 @@ object MCDRLayout {
     @JvmField val RT_HIT_GROUP_INTERSECTION: Long = offset(RT_HIT_GROUP, "intersection")
 
     @JvmField
+    val RT_FRAME_CREATE: FunctionDescriptor = FunctionDescriptor.of(I64, PTR)
     val RT_FRAME_PROGRAM: MemoryLayout = MemoryLayout.structLayout(
         PTR.withName("rayDxil"), I64.withName("rayBytes"),
         PTR.withName("guideDxil"), I64.withName("guideBytes"),

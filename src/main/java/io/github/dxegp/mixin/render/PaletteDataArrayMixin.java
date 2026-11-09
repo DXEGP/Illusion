@@ -22,7 +22,7 @@ public abstract class PaletteDataArrayMixin {
     }
 
     @WrapOperation(method = {"getSerializedSize", "write"}, at = @At(value = "INVOKE",
-            target = "Lnet/minecraft/util/BitStorage;getRaw:()[J"))
+            target = "Lnet/minecraft/util/BitStorage;getRaw()[J"))
     private long[] dxr_mc$borrowSerialization(BitStorage storage, Operation<long[]> original) {
         try (var access = D3D12RtPaletteArrays.borrow(storage)) {
             return original.call(storage);

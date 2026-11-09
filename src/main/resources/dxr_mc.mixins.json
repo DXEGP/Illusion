@@ -1,5 +1,8 @@
 {
   "required": true,
+  "mixinextras": {
+    "minVersion": "0.5.5"
+  },
   "package": "io.github.dxegp.mixin",
   "compatibilityLevel": "JAVA_25",
   "mixins": [],

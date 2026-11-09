@@ -1013,8 +1013,7 @@ tasks.withType<JavaCompile>().configureEach {
 // ---------------------------------------------------------------------------
 // Kotlin
 // ---------------------------------------------------------------------------
-// The whole JVM side of this mod is Kotlin except the mixins (Mixin cannot
-// target Kotlin classes reliably, and the mixins only touch vanilla types).
+// Mixin language and bytecode constraints: docs/misc/mixins-and-earlywindow.md §1.4.
 //
 // Three rules encoded here, all load-bearing and easy to break by accident:
 //

@@ -12,7 +12,7 @@ import org.spongepowered.asm.mixin.injection.At;
 @Mixin(EntityFluidInteraction.class)
 public abstract class EntityFluidSectionArrayPublicationMixin {
     @WrapOperation(method = "hasFluidAndLoaded", at = @At(value = "INVOKE",
-            target = "Lnet/minecraft/world/level/chunk/ChunkAccess;getSections:()[Lnet/minecraft/world/level/chunk/LevelChunkSection;"))
+            target = "Lnet/minecraft/world/level/chunk/ChunkAccess;getSections()[Lnet/minecraft/world/level/chunk/LevelChunkSection;"))
     private static LevelChunkSection[] dxr_mc$borrow(ChunkAccess chunk, Operation<LevelChunkSection[]> original) {
         try (var access = D3D12RtSectionArrays.borrow(chunk)) {
             return original.call(chunk);
