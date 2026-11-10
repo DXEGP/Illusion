@@ -18,7 +18,7 @@ DLSS 是本工程里唯一「不是我们自己实现」的超分后端：它由
 SuperResolution（门面）── DLSS 开关变化时只做「认领后端 + 让位」
         │
         ▼
-DeepLearningSuperSampling（本篇主角，dxrmc/sr/dlss/DLSS.kt）
+DeepLearningSuperSampling（本篇主角，render/reconstruction/dlss/DLSS.kt）
   ├─ 开关 / 档位 / preset 的持久化与推送
   ├─ 每帧数据面：速度 pass、深度快照、相机矩阵、jitter
   ├─ 抗锯齿互斥与 DLAA 的锁定/释放
@@ -28,7 +28,7 @@ DeepLearningSuperSampling（本篇主角，dxrmc/sr/dlss/DLSS.kt）
 MCDR_ABI（mcdr_dx12EvaluateDlss / SetDlssEnabled / SetDlssQuality /
           SetDlssRenderPreset / SnapshotDlssDepth / SetDlssOutput / QueryDlss）
         ▼
-MCDR\src\advanced\d3d12_dlss.cpp ── Streamline（sl.interposer + sl.dlss_g）── NGX
+MCDR\src/render/reconstruction/d3d12_dlss.cpp ── Streamline（sl.interposer + sl.dlss_g）── NGX
 ```
 
 `DeepLearningSuperSampling` 只在**渲染线程**上被调用；它的 native 内存（参数包、状态串）
@@ -314,31 +314,31 @@ recreate）后进程直接消失、没有任何 Java 异常**，与「设备移�
 
 ## 9. 文件导航
 
-路径以 `Illusion\src\main\kotlin\dev\nts\expdxr\` 为起点（mixin 在 `Illusion\src\main\java\` 下，已标注）。
+路径以 `Illusion\src\main\kotlin\io\github\dxegp\` 为起点（mixin 在 `Illusion\src\main\java\` 下，已标注）。
 
 | 文件 | 职责 |
 | --- | --- |
-| `dxrmc/sr/dlss/DLSS.kt` | 本篇主体：开关/档位/preset、数据面、深度快照、相机常量、DLAA、抗锯齿互斥、旧 DLL 兼容桥 |
-| `dxrmc/sr/dlss/DLSSOutput.kt` | 输出纹理的创建、交接、释放顺序与失败降级 |
-| `dxrmc/sr/SuperResolution.kt` | 门面：DLSS 与 FSR/XeSS 的分流、让位、后端认领 |
-| `dxrmc/sr/FrameGenerationConstants.kt` | 帧生成常量（与 DLSS 常量是两条独立通路） |
-| `d3d12/extern/MCDR_ABI.kt` | `mcdr_dx12*Dlss*` 的 FFM 绑定与返回值语义（`skipOptional` → `Int.MIN_VALUE`） |
-| `d3d12/render/advanced/taa/D3D12Temporal.kt` | Halton(2,3) jitter、消费者判定、投影/相机捕获 |
-| `d3d12/render/advanced/taa/D3D12Velocity.kt` | 速度 pass、闩锁与 `forceEnable` |
-| `d3d12/render/advanced/vrs/D3D12RenderScale.kt` | 渲染比例两套键、DLAA 锁、帧边界重建 |
-| `d3d12/render/advanced/smaa/D3D12GuiSplit.kt` | `pInOutput` 来源（`targetForFrame` / `ensureTargetForDlss`）、`markWorldLayerDone`、hudless |
-| `d3d12/render/advanced/D3D12AntiAliasing.kt` | 抗锯齿取值域与 DLSS 锁 |
-| `mixin/render/GameRendererSmaaWorldMixin.java` | 清深度之前（记账）、`GuiRenderer.render` 之前（TAA→SMAA→SR→prepareForGui） |
-| `mixin/render/LevelRendererMainPassDepthMixin.java` | main pass RETURN：速度 pass、深度快照 |
+| `render/reconstruction/dlss/DLSS.kt` | 本篇主体：开关/档位/preset、数据面、深度快照、相机常量、DLAA、抗锯齿互斥、旧 DLL 兼容桥 |
+| `render/reconstruction/dlss/DLSSOutput.kt` | 输出纹理的创建、交接、释放顺序与失败降级 |
+| `render/reconstruction/SuperResolution.kt` | 门面：DLSS 与 FSR/XeSS 的分流、让位、后端认领 |
+| `render/presentation/framegen/FrameGenerationConstants.kt` | 帧生成常量（与 DLSS 常量是两条独立通路） |
+| `d3d12/ffi/MCDR_ABI.kt` | `mcdr_dx12*Dlss*` 的 FFM 绑定与返回值语义（`skipOptional` → `Int.MIN_VALUE`） |
+| `render/temporal/D3D12Temporal.kt` | Halton(2,3) jitter、消费者判定、投影/相机捕获 |
+| `render/temporal/D3D12Velocity.kt` | 速度 pass、闩锁与 `forceEnable` |
+| `render/resolution/D3D12RenderScale.kt` | 渲染比例两套键、DLAA 锁、帧边界重建 |
+| `render/presentation/D3D12GUISplit.kt` | `pInOutput` 来源（`targetForFrame` / `ensureTargetForDlss`）、`markWorldLayerDone`、hudless |
+| `render/antialiasing/D3D12AntiAliasing.kt` | 抗锯齿取值域与 DLSS 锁 |
+| `mixin/antialiasing/GameRendererSmaaWorldMixin.java` | 清深度之前（记账）、`GuiRenderer.render` 之前（TAA→SMAA→SR→prepareForGui） |
+| `mixin/temporal/LevelRendererMainPassDepthMixin.java` | main pass RETURN：速度 pass、深度快照 |
 
-native 侧（本仓库 `MCDR\`）：`MCDR\src\advanced\d3d12_dlss.cpp`、
+native 侧（相邻工程 `MCDR/`）：`MCDR\src/render/reconstruction/d3d12_dlss.cpp`、
 `MCDR\include\mcdr_abi.h`（`mcdr_dlss_input` / `mcdr_dlss_constants` 布局）。
 
 ---
 
 ## 10. 文档维护
 
-- 本文对应源码：`Illusion\src\main\kotlin\dev\nts\expdxr\dxrmc\sr\dlss\`（`DLSS.kt`、`DLSSOutput.kt`），
+- 本文对应源码：`Illusion\src\main\kotlin\io\github\dxegp\render\reconstruction\dlss\`（`DLSS.kt`、`DLSSOutput.kt`），
   以及上表列出的 jitter / 速度 / 渲染比例 / GUI 拆分 / mixin 挂点。
 - 改 DLSS 这条路时最容易破坏的四件事：**返回值语义**（第 2 节）、**比例必须与档位一致**（第 3 节）、
   **输出纹理的创建方与释放顺序**（第 8 节）、**帧内顺序**（总览第 3 节）。

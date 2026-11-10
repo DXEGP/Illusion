@@ -489,27 +489,27 @@ mip 会选得偏高（更模糊）。
 
 ## 9. 文件导航
 
-路径相对于 `Illusion\src\main\kotlin\dev\nts\expdxr\`。
+路径相对于 `Illusion\src\main\kotlin\io\github\dxegp\`。
 
 | 文件 | 一句话职责 |
 | --- | --- |
-| `d3d12\render\advanced\mesh\D3D12MeshShader.kt` | 唯一的能力查询出口：12_2 + mesh tier ≥ 1 + DXC 是否齐备 |
-| `d3d12\render\advanced\mesh\D3D12MeshletBuilder.kt` | CPU 侧切 meshlet：量化 AABB、方向掩码、32 B 打包 |
-| `d3d12\render\advanced\mesh\D3D12MeshletShader.kt` | 生成 MS/AS 的 HLSL 文本（AS 剔除、算术索引、可选的逐图元档位） |
-| `d3d12\render\advanced\mesh\D3D12MeshDrawCapture.kt` | 捕获原版每帧的 MDI 段列表，拼出段表与 meshlet 表 |
-| `d3d12\render\advanced\mesh\D3D12MeshVertexDecode.kt` | 把 VS 输入结构逐字段翻译成 ByteAddressBuffer 解码代码 |
-| `d3d12\render\advanced\mesh\D3D12SectionGeometry.kt` | 段几何注册表：段上传时采集并切 meshlet（切分失败静默） |
-| `d3d12\render\advanced\terrain\D3D12TerrainSampler.kt` | 地形图集专用 mip LOD bias（随渲染比例与超分状态） |
-| `d3d12\render\advanced\vrs\D3D12VariableShadingRate.kt` | VRS 选项、距离带、作用域、组合器、F3 文本、options.txt 持久化 |
-| `d3d12\render\advanced\vrs\D3D12ShadingRateImage.kt` | Tier 2 着色率图：16×16 tile 的逐帧 compute、ping-pong、失败闩锁 |
-| `d3d12\render\advanced\vrs\D3D12RenderScale.kt` | 渲染比例滑条、附件尺寸换算、主目标重建、`options.txt` 两个键 |
-| `d3d12\backend\D3D12RenderPassBackend.kt` | 地形识别、VRS 作用域包裹、meshlet 派发与前置条件检查 |
-| `d3d12\render\adapter\D3D12Device.kt` | mesh 变体创建与三级回退；地形采样器 `release()` 调用点 |
-| `d3d12\render\adapter\D3D12AdapterInfo.kt` | 设备能力字段：`shadingRateTier` / `shadingRateTileSize` / `additionalShadingRates` |
-| `misc\settings\D3D12Settings.kt` | 把 `IllusionConfig` 解析成 `meshTerrain` / `meshTerrainCull` 等属性 |
-| `IllusionConfig.kt` | 配置定义与注释（`[mesh]` / `[vrs]` / `[debug]` 三张表） |
-| `misc\gui\D3D12VideoSettingsContent.kt` | 视频设置第四组里注册渲染比例与 VRS 两个控件 |
-| `d3d12\debug\D3D12VrsDebugEntry.kt` | 把 VRS 那一行挂进 F3 |
+| `render/terrain/mesh/D3D12MeshShader.kt` | 唯一的能力查询出口：12_2 + mesh tier ≥ 1 + DXC 是否齐备 |
+| `render/terrain/mesh/D3D12MeshletBuilder.kt` | CPU 侧切 meshlet：量化 AABB、方向掩码、32 B 打包 |
+| `render/terrain/mesh/D3D12MeshletShader.kt` | 生成 MS/AS 的 HLSL 文本（AS 剔除、算术索引、可选的逐图元档位） |
+| `render/terrain/mesh/D3D12MeshDrawCapture.kt` | 捕获原版每帧的 MDI 段列表，拼出段表与 meshlet 表 |
+| `render/terrain/mesh/D3D12MeshVertexDecode.kt` | 把 VS 输入结构逐字段翻译成 ByteAddressBuffer 解码代码 |
+| `render/terrain/mesh/D3D12SectionGeometry.kt` | 段几何注册表：段上传时采集并切 meshlet（切分失败静默） |
+| `render/terrain/D3D12TerrainSampler.kt` | 地形图集专用 mip LOD bias（随渲染比例与超分状态） |
+| `render/vrs/D3D12VariableShadingRate.kt` | VRS 选项、距离带、作用域、组合器、F3 文本、options.txt 持久化 |
+| `render/vrs/D3D12ShadingRateImage.kt` | Tier 2 着色率图：16×16 tile 的逐帧 compute、ping-pong、失败闩锁 |
+| `render/resolution/D3D12RenderScale.kt` | 渲染比例滑条、附件尺寸换算、主目标重建、`options.txt` 两个键 |
+| `d3d12/command/D3D12RenderPassBackend.kt` | 地形识别、VRS 作用域包裹、meshlet 派发与前置条件检查 |
+| `d3d12/device/D3D12Device.kt` | mesh 变体创建与三级回退；地形采样器 `release()` 调用点 |
+| `d3d12/device/D3D12AdapterInfo.kt` | 设备能力字段：`shadingRateTier` / `shadingRateTileSize` / `additionalShadingRates` |
+| `config/D3D12Settings.kt` | 把 `IllusionConfig` 解析成 `meshTerrain` / `meshTerrainCull` 等属性 |
+| `config/IllusionConfig.kt` | 配置定义与注释（`[mesh]` / `[vrs]` / `[debug]` 三张表） |
+| `client/settings/D3D12VideoSettingsContent.kt` | 视频设置第四组里注册渲染比例与 VRS 两个控件 |
+| `diagnostics/D3D12VrsDebugEntry.kt` | 把 VRS 那一行挂进 F3 |
 
 ---
 

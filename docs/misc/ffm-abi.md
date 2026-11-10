@@ -7,8 +7,8 @@
 | 层 | 文件 | 角色 |
 | --- | --- | --- |
 | 契约 | `MCDR\include\mcdr_abi.h` | 唯一真相：`extern "C"` 导出、结构体定义、错误码约定 |
-| 布局 | `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\extern\MCDR_Layout.kt` | 结构体的 `MemoryLayout` 镜像 + 自检 |
-| 句柄 | `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\extern\MCDR_ABI.kt` | 195 个 `downcallHandle` + 每个导出的调用封装 |
+| 布局 | `Illusion/src/main/kotlin/io/github/dxegp/d3d12/ffi/MCDR_Layout.kt` | 结构体的 `MemoryLayout` 镜像 + 自检 |
+| 句柄 | `Illusion/src/main/kotlin/io/github/dxegp/d3d12/ffi/MCDR_ABI.kt` | 195 个 `downcallHandle` + 每个导出的调用封装 |
 
 适用范围：Java 25 / Minecraft release-26.1 起 FFM 已退出预览。**本项目禁止 JNI**（`System.loadLibrary`、`external fun`、`RegisterNatives` 一律不许出现），native 侧也不许再提供 `JNIEXPORT` 入口。
 
@@ -406,17 +406,17 @@ upcall 这条要单独说：`onFenceComplete` 在 native 线程上执行，异�
 
 ## 6 文件导航
 
-相对 `Illusion\src\main\kotlin\dev\nts\expdxr\`：
+相对 `Illusion\src\main\kotlin\io\github\dxegp\`：
 
 | 文件 | 职责 |
 | --- | --- |
-| `d3d12\extern\MCDR_ABI.kt` | 唯一入口：解包 DLL、绑定 195 个方法句柄、封装每个导出、维护 `isAvailable()` |
-| `d3d12\extern\MCDR_Layout.kt` | 结构体的 `MemoryLayout` 镜像、尺寸断言、与运行中 DLL 的字段偏移比对 |
-| `d3d12\extern\MCDR_PipelineDesc.kt` | 图形管线描述符 → `mcdr_pipeline_desc` 的 arena 打包 |
-| `d3d12\extern\MCDR_MeshPipelineDesc.kt` | mesh 管线描述符（DXIL）→ `mcdr_mesh_pipeline_desc` 的 arena 打包 |
-| `misc\IllusionLogger.kt` | FFM 调用失败时的唯一日志出口（`infoMessage` / `warnMessage`） |
-| `misc\settings\D3D12Settings.kt` | 配置 → 启动期快照，再经 `MCDR_ABI` 的 `Set*` 入口推给 native |
-| `IllusionConfig.kt` | 所有开关的定义处（本层不读环境变量，只读这里） |
+| `d3d12/ffi/MCDR_ABI.kt` | 唯一入口：解包 DLL、绑定 195 个方法句柄、封装每个导出、维护 `isAvailable()` |
+| `d3d12/ffi/MCDR_Layout.kt` | 结构体的 `MemoryLayout` 镜像、尺寸断言、与运行中 DLL 的字段偏移比对 |
+| `d3d12/ffi/MCDR_PipelineDesc.kt` | 图形管线描述符 → `mcdr_pipeline_desc` 的 arena 打包 |
+| `d3d12/ffi/MCDR_MeshPipelineDesc.kt` | mesh 管线描述符（DXIL）→ `mcdr_mesh_pipeline_desc` 的 arena 打包 |
+| `diagnostics/IllusionLogger.kt` | FFM 调用失败时的唯一日志出口（`infoMessage` / `warnMessage`） |
+| `config/D3D12Settings.kt` | 配置 → 启动期快照，再经 `MCDR_ABI` 的 `Set*` 入口推给 native |
+| `config/IllusionConfig.kt` | 所有开关的定义处（本层不读环境变量，只读这里） |
 
 本层之外但必须一起看：
 
@@ -432,3 +432,8 @@ upcall 这条要单独说：`onFenceComplete` 在 native 线程上执行，异�
 - **不要在这里复制源码**。要引代码就引签名与一行关键逻辑，实现细节以源码注释为准 —— 两处都写必然会漂移，而漂移的注释比没有注释更贵。
 - **只写当下**。不写设计史与方案对比；必须遵守的写法写成祈使句，已经发现的缺陷单独列成警告清单。
 - **新增坑位就加进 §5**，并尽量给出"触发条件 + 失败形式"，因为这一节的价值在于让人一眼认出自己正踩的是哪一条。
+
+## native 资源所有者
+
+`d3d12.ffi.NativeLibraryResources` 负责读取 vendor 清单、按内容刷新运行库与 MCDR.dll。
+`MCDR_ABI` 先调用解包，再用自身共享 Arena 完成唯一 libraryLookup、绑定与布局校验；资源组件不反向初始化 ABI。

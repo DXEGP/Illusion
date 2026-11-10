@@ -348,7 +348,7 @@ tasks.named<ProcessResources>("processResources") {
 // the build -- it stages MCDR.dll when it can find one, and logs a warning and
 // skips when it cannot.
 //
-// The DLL is staged at the RESOURCE ROOT because MCDR_ABI.extractLibrary() looks
+// The DLL is staged at the RESOURCE ROOT because NativeLibraryResources.extractLibrary() looks
 // it up as `/MCDR.dll` on the classpath -- which resolves both from the packaged
 // mod JAR and from build/resources/main during `runClient`.
 //
@@ -419,7 +419,7 @@ sourceSets.named("main") {
 // ---------------------------------------------------------------------------
 // Third-party SDK runtimes: what ships inside the JAR, and what does not
 // ---------------------------------------------------------------------------
-// MCDR_ABI.extractLibrary() writes MCDR.dll into `<user.dir>/dxrmc/`, and the
+// NativeLibraryResources.extractLibrary() writes MCDR.dll into `<user.dir>/dxrmc/`, and the
 // Windows loader resolves a native library's LoadLibrary calls from the
 // *application* directory first -- so anything MCDR.dll loads at run time has to
 // sit in that same `dxrmc/` folder. PATH is not enough: the application directory
@@ -431,7 +431,7 @@ sourceSets.named("main") {
 //
 //   vendorJarLibs  -- REDISTRIBUTABLE and SHIPPED: these ride inside the released
 //                     mod JAR as resources and are extracted to `dxrmc/` at startup
-//                     by MCDR_ABI.extractVendorResources(). Each entry ships its own
+//                     by NativeLibraryResources.extractVendorResources(). Each entry ships its own
 //                     licence text as `LICENSE-<licenseName>.txt`:
 //                       * XeSS      -- Intel Simplified Software License (permits
 //                                      binary redistribution with the notice);
@@ -461,15 +461,16 @@ data class VendorJarLib(val dir: File, val files: List<String>, val license: Fil
 // 所以这三个 DLL 从 P216 起**必须随发行包走**，否则用户机上图形管线一条都建不出来。
 // 来源是 native 的 vcpkg manifest（`MCDR\vcpkg_installed\x64-windows\`），与开发目录里那份同一版本；
 // 许可证文件分别来自 vcpkg 的 `share\<port>\copyright`（Microsoft DirectX / LLVM-NCSA）。
-val vcpkgBinDir = file("../MCDR/vcpkg_installed/x64-windows/bin")
-val vcpkgShareDir = file("../MCDR/vcpkg_installed/x64-windows/share")
+val mcdrDependencyRoot = file(providers.gradleProperty("mcdrDependencyRoot").getOrElse("../MCDR"))
+val vcpkgBinDir = mcdrDependencyRoot.resolve("vcpkg_installed/x64-windows/bin")
+val vcpkgShareDir = mcdrDependencyRoot.resolve("vcpkg_installed/x64-windows/share")
 
 val vendorJarLibs = listOf(
     // XeSS 运行时仍在子模块里（上游 intel/xess 的 bin/ 自带这些 DLL，Intel 许可证允许再分发）。
     VendorJarLib(
-        dir = file("../MCDR/external/xess/bin"),
+        dir = mcdrDependencyRoot.resolve("external/xess/bin"),
         files = listOf("libxess.dll", "libxess_fg.dll", "libxell.dll"),
-        license = file("../MCDR/external/xess/LICENSE.txt"),
+        license = mcdrDependencyRoot.resolve("external/xess/LICENSE.txt"),
         licenseName = "xess",
     ),
     // P216：SM 6.9 的运行时来源。`D3D12Core.dll` 必须与 MCDR.dll 同目录（native 的
@@ -497,23 +498,23 @@ data class VendorDevLib(val dir: File, val pattern: String)
 
 val vendorDevLibs = listOf(
     // DLSS 运行时在 MCDR\lib\dlss\（上游 NVIDIA/DLSS 仓库不含运行时 DLL，且不可再分发）。
-    VendorDevLib(dir = file("../MCDR/lib/dlss"), pattern = "nvngx_*.dll"),
+    VendorDevLib(dir = mcdrDependencyRoot.resolve("lib/dlss"), pattern = "nvngx_*.dll"),
     // FidelityFX 运行时在 MCDR\lib\fidelityfx\（git 不记录，见 MCDR\.gitignore 的 /lib/；
     // 由 MCDR\scripts\sync-external.ps1 的第 4 步从 external\fidelityfx\Kits\FidelityFX\signedbin
     // 同步，目录名与 lib\dlss、lib\xess、lib\streamline 保持一致，旧名 lib\fsr 已不存在）。
     // 发行 JAR 不再包含它，开发目录仍然要有，否则 dev 侧无法试 FSR。
-    VendorDevLib(dir = file("../MCDR/lib/fidelityfx"), pattern = "amd_fidelityfx_*.dll"),
+    VendorDevLib(dir = mcdrDependencyRoot.resolve("lib/fidelityfx"), pattern = "amd_fidelityfx_*.dll"),
     // P213：Streamline 的插件与拦截面。sl.interposer 会按 `<module 目录>\sl.<feature>.dll`
     // 去找插件，所以它们必须和 MCDR.dll 并排落在 run/dxrmc/ 下；缺 sl.dlss_g.dll 时
     // DLSS-G 只会“支持但加载不了”，P213 的支持性探针就是用来抓这个的。
-    VendorDevLib(dir = file("../MCDR/lib/streamline"), pattern = "sl.*.dll"),
+    VendorDevLib(dir = mcdrDependencyRoot.resolve("lib/streamline"), pattern = "sl.*.dll"),
     // Reflex 的低延迟后端（sl.reflex.dll 会去加载它）。
-    VendorDevLib(dir = file("../MCDR/lib/streamline"), pattern = "NvLowLatencyVk.dll"),
+    VendorDevLib(dir = mcdrDependencyRoot.resolve("lib/streamline"), pattern = "NvLowLatencyVk.dll"),
     // NVIDIA NRC（神经辐照缓存）运行期。NRC_D3D12.dll 在加载期就要 cudart64_13.dll /
     // nvrtc64_130_0.dll / nvrtc-builtins64_134.dll（NVRTC 在 Configure 时 JIT 网络），
     // 四个必须与 MCDR.dll 同目录。由 `MCDR\scripts\sync-external.ps1` 从
     // external\nrc\Bin\x64 搬到 MCDR\lib\nrc\（git 不记录）。dev-only：发行版让用户自取。
-    VendorDevLib(dir = file("../MCDR/lib/nrc"), pattern = "*.dll"),
+    VendorDevLib(dir = mcdrDependencyRoot.resolve("lib/nrc"), pattern = "*.dll"),
 )
 
 
@@ -723,7 +724,7 @@ tasks.matching { it.name == "runClient" }.configureEach {
 //
 // `jarALL` collapses that into one artifact: identical to `jar`, except that the
 // `vendor/` tree also gets every dev-only DLL under `MCDR/lib/*`, and the manifest
-// `MCDR_ABI.extractVendorResources()` reads lists all of them -- so launching that
+// `NativeLibraryResources.extractVendorResources()` reads lists all of them -- so launching that
 // JAR unpacks the whole set next to MCDR.dll on its own.
 //
 // TEST ONLY, never publish: it redistributes binaries whose licences forbid it.
@@ -738,7 +739,7 @@ val stageVendorLibsAll = tasks.register("stageVendorLibsAll") {
     // Captured by value for the configuration cache, same as the other staging tasks.
     val root = vendorAllDir.get().asFile
     val jarLibs: List<VendorJarLib> = vendorJarLibs
-    val devLibRoot: File = file("../MCDR/lib")
+    val devLibRoot: File = mcdrDependencyRoot.resolve("lib")
     outputs.dir(root)
     outputs.upToDateWhen { false }
 
@@ -851,7 +852,7 @@ val earlyWindowJar = tasks.register<Jar>("earlyWindowJar") {
     archiveVersion.set("")
     destinationDirectory.set(layout.buildDirectory.dir("libs"))
     from(sourceSets.main.get().output) {
-        include("dev/nts/expdxr/earlywindow/**")
+        include("io/github/dxegp/bootstrap/earlywindow/service/**")
         include("META-INF/services/net.neoforged.neoforgespi.earlywindow.ImmediateWindowProvider")
     }
     // P271: artwork for the loading screen, decoded with AWT inside the provider.
@@ -868,7 +869,7 @@ val earlyWindowJar = tasks.register<Jar>("earlyWindowJar") {
 tasks.named<Jar>("jar") {
     // The early-window classes must exist exactly once, in the companion jar: a second copy on the
     // mod class path would give the bridge class two separate sets of static state.
-    exclude("dev/nts/expdxr/earlywindow/**")
+    exclude("io/github/dxegp/bootstrap/earlywindow/service/**")
     exclude("META-INF/services/net.neoforged.neoforgespi.earlywindow.ImmediateWindowProvider")
     // P270: ship the companion jar *inside* the mod jar so a release is a single download. FML only
     // recognises early services in top-level jars under mods/, so the mod extracts this resource into

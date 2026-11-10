@@ -16,10 +16,36 @@ Illusion（幻光影现）是 Minecraft NeoForge 模组，把渲染后端换成�
 - 高级特性：DLSS / FSR / XeSS 超分，DLSS-G / FSR-FG / XeSS-FG 帧生成，NVIDIA Reflex，
   TAA / SMAA，mesh shader（meshlet），VRS 与渲染比例；光线追踪**尚未实现**。
 
+## 当前源码组织
+
+现有代码使用 `io.github.dxegp` 包根；`RenderPipeline`、场景增量和集中式 RTX 管线尚未实现。
+以下业务目录对应当前可编译的 main 功能，未来接线契约见 `rendering/README.md`。
+
+当前完成包职责分类与资源所有者拆分，尚未形成无环的渲染领域契约。
+`config.D3D12Settings` 推送 native 配置，`d3d12.ffi.MCDR_ABI.PROF` 仍读取该配置；这条现有双向依赖仍需在未来接线中处理。
+
+| 包 | 当前职责 |
+| --- | --- |
+| `bootstrap.earlywindow` | 安装与接管早期窗口；`.service` 子包单独打成 early-service JAR |
+| `config`、`client.settings`、`client.compat` | NeoForge 配置快照、设置界面与原版选项兼容 |
+| `diagnostics` | 日志、崩溃、性能统计、PIX 与 `BackendSelfTests` 自检资源 |
+| `d3d12.ffi` | 唯一 FFM 门面、ABI 布局与 `NativeLibraryResources` 解包支持 |
+| `d3d12.backend/device/command/resource/surface/shader` | Blaze3D 适配、设备与 GPU 资源生命周期 |
+| `render.antialiasing/temporal/resolution/vrs` | AA、时间数据、比例与 VRS |
+| `render.terrain`、`.terrain.mesh` | 当前地形采集、采样器与 meshlet 路线 |
+| `render.reconstruction`、`.reconstruction.dlss` | 超分与独立 GPU/CPU 计时所有者 |
+| `render.presentation`、`.framegen`、`.latency` | HDR、GUI 分层、帧生成与 Reflex |
+| `mixin.<domain>` | 原版注入与 accessor，转交对应业务 |
+
+独立 early-service JAR 仅收 `bootstrap/earlywindow/service/**` 与服务声明。
+Kotlin 的 `EarlyWindowSurface`、`EarlyWindowJarInstaller` 留在主模组 JAR，避免早期 classloader 加载 Kotlin runtime。
+构建可用 `-PmcdrDependencyRoot=<MCDR 绝对路径>` 只读复用 SDK/runtime；`copyNative` 仍取相邻 MCDR 的构建产物。
+
 ## 文档地图
 
 | 文档 | 主题 | 什么时候看 |
 | --- | --- | --- |
+| [`rendering/README.md`](rendering/README.md) | 集中渲染器目标契约：业务封装、世界增量、Kotlin mixin、FFM、能力/资产/生命周期；尚未实现 | 实施新渲染器的 JVM 接线 |
 | [`superresolution/README.md`](superresolution/README.md) | 超分总览：后端抽象、渲染比例、超分掩码 | 改升采样、加新超分后端 |
 | [`superresolution/dlss.md`](superresolution/dlss.md) | DLSS / DLAA 专项：NGX、preset、输出纹理 | 动 DLSS 路径、排查 NGX 初始化 |
 | [`framegen/README.md`](framegen/README.md) | 帧生成与 Reflex：hudless 捕获、UI 合成、限帧 | 改插帧、改呈现时序 |
@@ -41,7 +67,7 @@ Illusion（幻光影现）是 Minecraft NeoForge 模组，把渲染后端换成�
   代码里没写清的地方标注「代码中未明确」，不要替它补脑。
 - **只写当下**：不写设计史、方案对比与"当初为什么这样"；必须遵守的写法写成祈使句，
   已经发现的缺陷单独列成警告清单。
-- **源码导航**：每篇结尾的表格用相对 `Illusion\src\main\kotlin\dev\nts\expdxr\` 的路径。
+- **源码导航**：每篇结尾的表格用相对 `Illusion\src\main\kotlin\io\github\dxegp\` 的路径。
 - **文档维护**：改了对应子系统的行为，同一次改动里更新文档；文档与代码冲突时以代码为准，
   并顺手把文档改对。
 - **注释与文档的分工**：源码注释只写"违反就会出错"的约束（一两行），解释性内容放这里，
@@ -49,5 +75,5 @@ Illusion（幻光影现）是 Minecraft NeoForge 模组，把渲染后端换成�
 
 ## 相关文档
 
-- `MCDR\docs\` —— native 库 MCDR 的设计文档（C++ 侧，另行编写）。
+- 相邻 MCDR 工程的 `docs/overview.md` —— native 库的文档入口。
 - `Illusion\README.md` / `Illusion\README_ZH.md` —— 面向玩家的功能介绍与使用说明。

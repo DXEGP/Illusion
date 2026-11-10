@@ -532,7 +532,7 @@ TAA 的锐化不是单独一趟：`sharpenAmount` 作为参数进 native 的 res
 | 负 w 守卫 | `1e-4` | `prevClip.w <= 1e-4` 直接输出 0 |
 | DLAA / DLSS 锐化 | `0.67f` | `DEFAULT_AMOUNT` / `[renderer] sharpenAmount` |
 | TAA 锐化 | `0.816f` | `TAA_AMOUNT` / `[renderer] taaSharpenAmount` |
-| 锐化 scratch 格式 | `RGBA8_UNORM` | 需 `RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC` |
+| 锐化 scratch 格式 | `RGBA8_UNORM` | 需 `RENDER_ATTACHMENT \| TEXTURE_BINDING \| COPY_SRC` |
 | GUI 目标格式 | `RGBA8_UNORM` | 深度跟随主目标（`D32_FLOAT_S8_UINT` / `D32_FLOAT`） |
 | hudless 未就绪日志节流 | `10` 秒 | `NOT_READY_LOG_INTERVAL_NANOS` |
 | SMAA 趟数 | `3` | native 三阶段，最后一趟经 scratch 拷回 |
@@ -547,31 +547,31 @@ TAA 的锐化不是单独一趟：`sharpenAmount` 作为参数进 native 的 res
 
 ## 9. 文件导航
 
-路径相对于 `Illusion\src\main\kotlin\dev\nts\expdxr\`。
+路径相对于 `Illusion\src\main\kotlin\io\github\dxegp\`。
 
 | 文件 | 职责 |
 | --- | --- |
-| `d3d12/render/advanced/D3D12AntiAliasing.kt` | 模式选项（OFF / SMAA / TAA / DLAA）、options.txt 读写、DLSS 互锁、画质预设映射 |
-| `d3d12/render/advanced/D3D12PostSharpen.kt` | 5-tap unsharp 的强度、scratch 纹理、导出探测与两趟落地 |
-| `d3d12/render/advanced/taa/D3D12Taa.kt` | TAA 的 JVM 侧薄壳：选模式、传 jitter / 代数 / 锐化量、失败自关闭 |
-| `d3d12/render/advanced/taa/D3D12Temporal.kt` | 时间性数据面：Halton 抖动、投影注入、相机矩阵快照、历史代数的唯一来源 |
-| `d3d12/render/advanced/taa/D3D12Velocity.kt` | 速度缓冲：双 RT 乒乓、常量块、内联 HLSL 全屏 pass、闩锁与资源释放 |
-| `d3d12/render/advanced/taa/D3D12ObjectMotion.kt` | 逐物体快照：位置外推、可见性/距离过滤、物体行缓冲 |
-| `d3d12/render/advanced/smaa/D3D12SmaaWorld.kt` | SMAA 的世界层挂点与「确实跑了」的结论性日志 |
-| `d3d12/render/advanced/smaa/D3D12GuiSplit.kt` | 窗口尺寸 GUI 目标、世界层搬运、hudless 武装与呈现源选择 |
-| `d3d12/backend/D3D12CommandEncoderBackend.kt` | 把四条 pass（velocity / SMAA / TAA / 锐化）追加进本帧命令列表 |
-| `d3d12/render/core/D3D12GpuSurface.kt` | 最终 blit 与 present：选呈现源、录兜底速度 pass、帧边界裁决 hudless |
-| `dxrmc/sr/dlss/DLSS.kt` | DLAA / DLSS 的升采样与锐化两趟、退出会话时的时间性复位 |
-| `dxrmc/framegen/FrameGeneration.kt` | `hudlessWanted()`：帧生成后端与「有没有世界层」的判定 |
-| `misc/settings/D3D12Settings.kt` | 配置到运行期快照的解析（含已弃用的 `-D` 逃生口） |
-| `IllusionConfig.kt` | TOML 定义：`sharpenAmount`、`taaSharpenAmount`、`temporalChain`、`temporalJitter` |
+| `render/antialiasing/D3D12AntiAliasing.kt` | 模式选项（OFF / SMAA / TAA / DLAA）、options.txt 读写、DLSS 互锁、画质预设映射 |
+| `render/antialiasing/D3D12PostSharpen.kt` | 5-tap unsharp 的强度、scratch 纹理、导出探测与两趟落地 |
+| `render/antialiasing/D3D12Taa.kt` | TAA 的 JVM 侧薄壳：选模式、传 jitter / 代数 / 锐化量、失败自关闭 |
+| `render/temporal/D3D12Temporal.kt` | 时间性数据面：Halton 抖动、投影注入、相机矩阵快照、历史代数的唯一来源 |
+| `render/temporal/D3D12Velocity.kt` | 速度缓冲：双 RT 乒乓、常量块、内联 HLSL 全屏 pass、闩锁与资源释放 |
+| `render/temporal/D3D12ObjectMotion.kt` | 逐物体快照：位置外推、可见性/距离过滤、物体行缓冲 |
+| `render/antialiasing/D3D12SMAAWorld.kt` | SMAA 的世界层挂点与「确实跑了」的结论性日志 |
+| `render/presentation/D3D12GUISplit.kt` | 窗口尺寸 GUI 目标、世界层搬运、hudless 武装与呈现源选择 |
+| `d3d12/command/D3D12CommandEncoderBackend.kt` | 把四条 pass（velocity / SMAA / TAA / 锐化）追加进本帧命令列表 |
+| `d3d12/surface/D3D12GpuSurface.kt` | 最终 blit 与 present：选呈现源、录兜底速度 pass、帧边界裁决 hudless |
+| `render/reconstruction/dlss/DLSS.kt` | DLAA / DLSS 的升采样与锐化两趟、退出会话时的时间性复位 |
+| `render/presentation/framegen/FrameGeneration.kt` | `hudlessWanted()`：帧生成后端与「有没有世界层」的判定 |
+| `config/D3D12Settings.kt` | 配置到运行期快照的解析（含已弃用的 `-D` 逃生口） |
+| `config/IllusionConfig.kt` | TOML 定义：`sharpenAmount`、`taaSharpenAmount`、`temporalChain`、`temporalJitter` |
 
 Java 侧挂点（不在上面的相对路径下）：
 
 | 文件 | 职责 |
 | --- | --- |
-| `Illusion\src\main\java\dev\nts\expdxr\mixin\render\GameRendererSmaaWorldMixin.java` | 抗锯齿 / SR / GUI 拆分的唯一顺序挂点，以及每帧的 DLSS 记账 |
-| `Illusion\src\main\java\dev\nts\expdxr\mixin\render\LevelRendererMainPassDepthMixin.java` | 主 pass RETURN：采集时域数据并录速度 pass（深度被清之前） |
+| `Illusion/src/main/java/io/github/dxegp/mixin/antialiasing/GameRendererSmaaWorldMixin.java` | 抗锯齿 / SR / GUI 拆分的唯一顺序挂点，以及每帧的 DLSS 记账 |
+| `Illusion/src/main/java/io/github/dxegp/mixin/temporal/LevelRendererMainPassDepthMixin.java` | 主 pass RETURN：采集时域数据并录速度 pass（深度被清之前） |
 
 ## 10. 文档维护
 

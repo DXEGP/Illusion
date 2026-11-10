@@ -110,7 +110,7 @@ dxr_mc.configuration.<section>.<key>.<ENUM_VALUE>  // 枚举取值名
 
 ### 3.1 职责
 
-`misc/settings/D3D12Settings.kt` 是「渲染开关的唯一解析处」：把配置读出来做范围收敛与旧来源
+`config/D3D12Settings.kt` 是「渲染开关的唯一解析处」：把配置读出来做范围收敛与旧来源
 兜底，存进不可变 `Snapshot` 用 `@Volatile` 发布，再把 native 必须在设备创建前知道的值通过专用
 ABI 推过去。
 
@@ -513,28 +513,28 @@ false 都会在下一帧被拉回），不是只在首帧设一次——只设�
 
 ## 9. 文件导航
 
-路径相对 `Illusion\src\main\kotlin\dev\nts\expdxr\`；最后一列标注不在该根下的真实位置。
+路径相对 `Illusion\src\main\kotlin\io\github\dxegp\`；最后一列标注不在该根下的真实位置。
 
 | 文件 | 一句话职责 |
 | --- | --- |
-| `IllusionConfig.kt` | 全部 TOML 选项的定义、默认值、注释与翻译键，以及文件顶部的枚举 |
-| `misc\settings\D3D12Settings.kt` | 把配置解析成不可变 `Snapshot`，处理旧来源兼容层，把关键值推给 native |
-| `misc\settings\D3D12HdrPresentation.kt` | HDR 呈现选项（`options.hdr`）、`options.txt` 读写、重启判定 |
-| `misc\settings\D3D12VRSSettings.kt` | VRS 的两个玩家可见取值（关/自动）与取值翻译键 |
-| `misc\settings\ImprovedTransparencyLock.kt` | D3D12 下把「改进的透明」强制常开并给出原因 |
-| `misc\gui\D3D12VideoSettingsScreen.kt` | 视频设置屏幕：布局、页签、滚动、绘制、输入、应用/撤销 |
-| `misc\gui\D3D12VideoSettingsContent.kt` | 四个页面的内容、条目类型、灰化联动与取值过滤 |
-| `misc\gui\D3D12Widget.kt` | 控件基类、`WidgetRenderer`（提取器的 alpha/scissor 封装）、调色板 |
-| `misc\gui\D3D12Widgets.kt` | 标题/分组/说明/页签/二级页签/设置行/按钮七种控件 |
-| `d3d12\render\advanced\vrs\D3D12RenderScale.kt` | 渲染缩放选项、25% 步进取值集合、DLAA 锁定 |
-| `d3d12\render\advanced\D3D12AntiAliasing.kt` | 抗锯齿选项（原版取值集合上的 `OptionInstance`） |
-| `dxrmc\nvidia\reflex\NvidiaReflex.kt` | Reflex 三档选项、`options.txt` 读写、与帧生成的互锁 |
+| `config/IllusionConfig.kt` | 全部 TOML 选项的定义、默认值、注释与翻译键，以及文件顶部的枚举 |
+| `config/D3D12Settings.kt` | 把配置解析成不可变 `Snapshot`，处理旧来源兼容层，把关键值推给 native |
+| `render/presentation/D3D12HdrPresentation.kt` | HDR 呈现选项（`options.hdr`）、`options.txt` 读写、重启判定 |
+| `render/vrs/D3D12VRSSettings.kt` | VRS 的两个玩家可见取值（关/自动）与取值翻译键 |
+| `config/ImprovedTransparencyLock.kt` | D3D12 下把「改进的透明」强制常开并给出原因 |
+| `client/settings/D3D12VideoSettingsScreen.kt` | 视频设置屏幕：布局、页签、滚动、绘制、输入、应用/撤销 |
+| `client/settings/D3D12VideoSettingsContent.kt` | 四个页面的内容、条目类型、灰化联动与取值过滤 |
+| `client/settings/D3D12Widget.kt` | 控件基类、`WidgetRenderer`（提取器的 alpha/scissor 封装）、调色板 |
+| `client/settings/D3D12Widgets.kt` | 标题/分组/说明/页签/二级页签/设置行/按钮七种控件 |
+| `render/resolution/D3D12RenderScale.kt` | 渲染缩放选项、25% 步进取值集合、DLAA 锁定 |
+| `render/antialiasing/D3D12AntiAliasing.kt` | 抗锯齿选项（原版取值集合上的 `OptionInstance`） |
+| `render/presentation/latency/NvidiaReflex.kt` | Reflex 三档选项、`options.txt` 读写、与帧生成的互锁 |
 | `…FrameGeneration`、`…SuperResolution` | 帧生成/超分的后端选择与状态行，向界面提供实时状态 |
-| `Illusion\src\main\java\…\mixin\options\OptionsScreenVideoMixin.java` | 把原版「视频设置…」按钮换成自绘界面 |
-| `…\mixin\options\OptionsRenderOptionsMixin.java` | 在 `Options.load`/`save` 上读写视频设置项的 `options.txt` 行，并补一票重启提示 |
-| `…\mixin\options\VideoSettingsScreenOptionsAccessor.java` | 取出原版三个私有选项数组 |
-| `…\mixin\options\OptionInstanceAccessor.java`、`TooltipAccessor.java` | 读 `OptionInstance` 的 tooltip（Kotlin 侧看不到织入接口） |
-| `…\mixin\render\MinecraftRenderFrameProfMixin.java` | 每帧调用「改进的透明」的强制开启 |
+| `Illusion/src/main/java/io/github/dxegp/mixin/options/OptionsScreenVideoMixin.java` | 把原版「视频设置…」按钮换成自绘界面 |
+| `mixin/options/OptionsRenderOptionsMixin.java` | 在 `Options.load`/`save` 上读写视频设置项的 `options.txt` 行，并补一票重启提示 |
+| `mixin/options/VideoSettingsScreenOptionsAccessor.java` | 取出原版三个私有选项数组 |
+| `mixin/options/OptionInstanceAccessor.java`、`TooltipAccessor.java` | 读 `OptionInstance` 的 tooltip（Kotlin 侧看不到织入接口） |
+| `mixin/diagnostics/MinecraftRenderFrameProfMixin.java` | 每帧调用「改进的透明」的强制开启 |
 | `Illusion\src\main\resources\assets\dxr_mc\lang\en_us.json`、`zh_cn.json` | 全部界面与配置文案，两份必须同步 |
 
 ### 待复核（代码里有不一致，本文未当成结论）

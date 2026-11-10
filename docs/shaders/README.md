@@ -424,23 +424,23 @@ daemon 线程 `backend-stack-sampler`（`MAX_PRIORITY`）每 2 ms 取一次 `tar
 
 ## 16. 文件导航
 
-路径相对于 `Illusion\src\main\kotlin\dev\nts\expdxr\`：
+路径相对于 `Illusion\src\main\kotlin\io\github\dxegp\`：
 
 | 文件 | 职责 |
 | --- | --- |
-| `d3d12\render\shader\D3D12ShaderCompiler.kt` | GLSL 预处理（define/include）、shaderc 编译、绑定条目构造、HLSL 补丁（Y / lightmap / blit） |
-| `d3d12\render\shader\D3D12IntermediaryShaderModule.kt` | SPIR-V 容器与反射、`rebind` 重编号、克隆、SPIRV-Cross → HLSL |
-| `d3d12\render\shader\D3D12CompiledShader.kt` | 一条管线的编译产物（HLSL 对、绑定条目、输入名、语义名） |
-| `d3d12\render\shader\D3D12FallbackShaderSource.kt` | 首次资源重载前，用捕获的 vanilla `ResourceProvider` 作后备源 |
-| `d3d12\render\shader\D3D12GpuSampler.kt` | `GpuSampler` 的 D3D12 实现（含 mip bias 与幂等关闭） |
-| `d3d12\render\shader\D3D12StackSampler.kt` | 渲染线程 CPU 栈采样的诊断工具（不是纹理采样器） |
-| `d3d12\render\adapter\D3D12Device.kt` | 着色器/管线缓存、`buildNativeDesc`、`compilePipeline`、mesh 与线宽变体 |
-| `d3d12\backend\D3D12CompiledRenderPipeline.kt` | 已编译管线（PSO 句柄、绑定推导、变体管理、幂等 `close`） |
-| `d3d12\backend\D3D12BindGroupEntry.kt` | 绑定条目类型（UBO / 采样纹理 / texel buffer） |
-| `d3d12\backend\D3D12RenderPassBackend.kt` | pass 内 `setPipeline`、`pushDescriptors`、uniform 下标映射 |
-| `d3d12\backend\D3D12PipelineBridge.kt` | `location` → `RenderPipeline` 的登记与查回 |
-| `d3d12\render\advanced\mesh\D3D12MeshletShader.kt` | 把地形顶点着色器包装成 `ms_main` / `as_main` |
-| `d3d12\extern\MCDR_ABI.kt` | FFM 绑定（含 `D3D12CompileShaderDxc` 的两次调用尺寸探测契约） |
+| `d3d12/shader/D3D12ShaderCompiler.kt` | GLSL 预处理（define/include）、shaderc 编译、绑定条目构造、HLSL 补丁（Y / lightmap / blit） |
+| `d3d12/shader/D3D12IntermediaryShaderModule.kt` | SPIR-V 容器与反射、`rebind` 重编号、克隆、SPIRV-Cross → HLSL |
+| `d3d12/shader/D3D12CompiledShader.kt` | 一条管线的编译产物（HLSL 对、绑定条目、输入名、语义名） |
+| `d3d12/shader/D3D12FallbackShaderSource.kt` | 首次资源重载前，用捕获的 vanilla `ResourceProvider` 作后备源 |
+| `d3d12/shader/D3D12GpuSampler.kt` | `GpuSampler` 的 D3D12 实现（含 mip bias 与幂等关闭） |
+| `d3d12/shader/D3D12StackSampler.kt` | 渲染线程 CPU 栈采样的诊断工具（不是纹理采样器） |
+| `d3d12/device/D3D12Device.kt` | 着色器/管线缓存、`buildNativeDesc`、`compilePipeline`、mesh 与线宽变体 |
+| `d3d12/backend/D3D12CompiledRenderPipeline.kt` | 已编译管线（PSO 句柄、绑定推导、变体管理、幂等 `close`） |
+| `d3d12/backend/D3D12BindGroupEntry.kt` | 绑定条目类型（UBO / 采样纹理 / texel buffer） |
+| `d3d12/command/D3D12RenderPassBackend.kt` | pass 内 `setPipeline`、`pushDescriptors`、uniform 下标映射 |
+| `d3d12/backend/D3D12PipelineBridge.kt` | `location` → `RenderPipeline` 的登记与查回 |
+| `render/terrain/mesh/D3D12MeshletShader.kt` | 把地形顶点着色器包装成 `ms_main` / `as_main` |
+| `d3d12/ffi/MCDR_ABI.kt` | FFM 绑定（含 `D3D12CompileShaderDxc` 的两次调用尺寸探测契约） |
 
 原生侧（`MCDR\src\`）：`core\d3d12_device.cpp` 的 `compileWithDxc` / `compileHlslToDxil` / DXIL 磁盘缓存 /
 `graphicsShaderModelProfile` / `createGraphicsPipeline`；`c_abi\abi_mesh.cpp` 的 `mcdr_dx12CompileShaderDxc`；

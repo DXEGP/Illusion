@@ -68,7 +68,7 @@ DeepLearningSuperSampling   打包 SR_DISPATCH      releaseIfCreated()
  mcdr_dx12EvaluateDlss   mcdr_dx12SrEvaluate
         │                     │
         ▼                     ▼
- MCDR\src\advanced\      MCDR\src\advanced\
+ MCDR/src/render/reconstruction/      MCDR/src/render/reconstruction/
    d3d12_dlss.cpp          d3d12_fsr.cpp / d3d12_xess.cpp
 ```
 
@@ -130,7 +130,7 @@ DeepLearningSuperSampling   打包 SR_DISPATCH      releaseIfCreated()
 
 ### 4.1 枚举与持久化
 
-`dev.nts.expdxr.IllusionConfig` 里的 `SrBackend`（`id` 与 `mcdr_abi.h` 的 `MCDR_SR_BACKEND_*` 逐值对应）：
+`io.github.dxegp.config.IllusionConfig` 里的 `SrBackend`（`id` 与 `mcdr_abi.h` 的 `MCDR_SR_BACKEND_*` 逐值对应）：
 
 | 枚举 | id | 含义 |
 | --- | --- | --- |
@@ -474,34 +474,34 @@ FG 打开 hudless 时，最终呈现源变成「超分输出的世界层」，UI
 
 ## 10. 文件导航
 
-路径以 `Illusion\src\main\kotlin\dev\nts\expdxr\` 为起点（mixin 在 `Illusion\src\main\java\` 下，已单独标注）。
+路径以 `Illusion\src\main\kotlin\io\github\dxegp\` 为起点（mixin 在 `Illusion\src\main\java\` 下，已单独标注）。
 
 | 文件 | 职责 |
 | --- | --- |
-| `dxrmc/sr/SuperResolution.kt` | 超分门面：后端选择与调度、`SR_DISPATCH` 打包、FSR/XeSS 的 evaluate 与 blit、UI 选项、CPU/GPU 耗时统计 |
-| `dxrmc/sr/D3D12SrMask.kt` | 反应性掩码：OIT 透射率的小波重建 HLSL、PSO、dispatch 与首帧统计 |
-| `dxrmc/sr/FrameGenerationConstants.kt` | 每帧给帧生成后端推 view/projection/jitter/mvScale/reset（与超分后端解耦） |
-| `dxrmc/sr/dlss/DLSS.kt` | DLSS / DLAA 主实现：数据面、NGX 开关与档位、preset、深度快照、输出交接、抗锯齿互斥 |
-| `dxrmc/sr/dlss/DLSSOutput.kt` | DLSS 输出纹理（JVM 侧创建、交给 native）与释放顺序 |
-| `IllusionConfig.kt` | `SrBackend` 枚举（`id` 与 native 宏逐值对应）及 `[sr]` 配置项 |
-| `d3d12/extern/MCDR_ABI.kt` | `mcdr_dx12Sr*` / `mcdr_dx12*Dlss*` 的 FFM 绑定、`SrCaps` 数据类、返回值语义 |
-| `d3d12/render/advanced/vrs/D3D12RenderScale.kt` | 渲染比例：两套取值域、DLAA 锁、帧边界重建主目标 |
-| `d3d12/render/advanced/taa/D3D12Temporal.kt` | Halton(2,3) 亚像素 jitter、相位长度协商、投影 / 相机矩阵捕获 |
-| `d3d12/render/advanced/taa/D3D12Velocity.kt` | 速度 pass：屏幕空间像素位移、自我关闭闩锁 |
-| `d3d12/render/advanced/smaa/D3D12GuiSplit.kt` | 窗口尺寸的 GUI 目标、`markWorldLayerDone` / `markWorldLayer`、hudless 呈现裁决 |
-| `d3d12/render/advanced/D3D12AntiAliasing.kt` | 抗锯齿取值域（OFF/SMAA/TAA/DLAA）与 DLSS 锁 |
-| `d3d12/render/advanced/D3D12PostSharpen.kt` | 升采样之后的后期锐化（两趟：target→scratch→target） |
-| `mixin/render/GameRendererSmaaWorldMixin.java` | 帧内挂点：清深度之前（DLSS 记账）、`GuiRenderer.render` 之前（TAA→SMAA→SR→prepareForGui） |
-| `mixin/render/LevelRendererMainPassDepthMixin.java` | 帧图 main pass RETURN：速度 pass、深度快照、OIT 透射率捕获 |
+| `render/reconstruction/SuperResolution.kt` | 超分门面：后端选择与调度、`SR_DISPATCH` 打包、FSR/XeSS 的 evaluate 与 blit、UI 选项、CPU/GPU 耗时统计 |
+| `render/reconstruction/D3D12SrMask.kt` | 反应性掩码：OIT 透射率的小波重建 HLSL、PSO、dispatch 与首帧统计 |
+| `render/presentation/framegen/FrameGenerationConstants.kt` | 每帧给帧生成后端推 view/projection/jitter/mvScale/reset（与超分后端解耦） |
+| `render/reconstruction/dlss/DLSS.kt` | DLSS / DLAA 主实现：数据面、NGX 开关与档位、preset、深度快照、输出交接、抗锯齿互斥 |
+| `render/reconstruction/dlss/DLSSOutput.kt` | DLSS 输出纹理（JVM 侧创建、交给 native）与释放顺序 |
+| `config/IllusionConfig.kt` | `SrBackend` 枚举（`id` 与 native 宏逐值对应）及 `[sr]` 配置项 |
+| `d3d12/ffi/MCDR_ABI.kt` | `mcdr_dx12Sr*` / `mcdr_dx12*Dlss*` 的 FFM 绑定、`SrCaps` 数据类、返回值语义 |
+| `render/resolution/D3D12RenderScale.kt` | 渲染比例：两套取值域、DLAA 锁、帧边界重建主目标 |
+| `render/temporal/D3D12Temporal.kt` | Halton(2,3) 亚像素 jitter、相位长度协商、投影 / 相机矩阵捕获 |
+| `render/temporal/D3D12Velocity.kt` | 速度 pass：屏幕空间像素位移、自我关闭闩锁 |
+| `render/presentation/D3D12GUISplit.kt` | 窗口尺寸的 GUI 目标、`markWorldLayerDone` / `markWorldLayer`、hudless 呈现裁决 |
+| `render/antialiasing/D3D12AntiAliasing.kt` | 抗锯齿取值域（OFF/SMAA/TAA/DLAA）与 DLSS 锁 |
+| `render/antialiasing/D3D12PostSharpen.kt` | 升采样之后的后期锐化（两趟：target→scratch→target） |
+| `mixin/antialiasing/GameRendererSmaaWorldMixin.java` | 帧内挂点：清深度之前（DLSS 记账）、`GuiRenderer.render` 之前（TAA→SMAA→SR→prepareForGui） |
+| `mixin/temporal/LevelRendererMainPassDepthMixin.java` | 帧图 main pass RETURN：速度 pass、深度快照、OIT 透射率捕获 |
 
-native 侧对应实现（本仓库 `MCDR\`，不在本文范围内）：`MCDR\src\advanced\d3d12_dlss.cpp`、
+native 侧对应实现（相邻工程 `MCDR/`，不在本文范围内）：`MCDR\src/render/reconstruction/d3d12_dlss.cpp`、
 `d3d12_fsr.cpp`、`d3d12_xess.cpp`，以及 `MCDR\include\mcdr_abi.h` 里的载荷布局。
 
 ---
 
 ## 11. 文档维护
 
-- 本文对应源码目录：`Illusion\src\main\kotlin\dev\nts\expdxr\dxrmc\sr\`（含 `dlss\` 子目录），
+- 本文对应源码目录：`Illusion\src\main\kotlin\io\github\dxegp\render\reconstruction\`（含 `dlss\` 子目录），
   以及上表列出的渲染比例 / jitter / 速度 / GUI 拆分 / mixin 挂点。
 - **改了代码就同步改本文**，尤其是：载荷字段的增删、质量档位的百分比、常量数值、
   帧内挂点顺序、掩码的生产方式、后端互斥规则。这些地方一旦文档与代码不一致，
@@ -509,3 +509,13 @@ native 侧对应实现（本仓库 `MCDR\`，不在本文范围内）：`MCDR\sr
 - 文档与代码冲突时**以代码为准**，并顺手把文档改对；代码里没写清的地方保留
   「代码中未明确」的标注，不要替它补脑。
 - DLSS / DLAA / NGX / 输出纹理的细节写在 [`dlss.md`](dlss.md)，本文只保留总览与跨子系统交互。
+
+## 计时资源生命周期
+
+`render.reconstruction.ReconstructionTiming` 独占 timestamp query pool、GPU 样本与 CPU evaluate/blit 成本采样。
+停止或切换超分仅重置样本，不在打开的 command list 上释放查询堆；池保留到设备关闭。
+计时组件在首次创建查询池前向 encoder 实例登记自身的 `AutoCloseable` 生命周期，并独占绑定到该 encoder；其他 encoder 不参与该池采样。
+`D3D12Device.close()` 先结束 encoder，再调用 encoder 的 `destroyCommandsAndReleaseResources()`；它等待当前已提交 fence、销毁 command context，最后关闭登记资源。
+一次性 encoder 的 `close()` 使用相同退休路径；共享 encoder 的普通 `close()` 保留资源至设备关闭。计时组件 `close()` 清空池、采样与 encoder 所有权。
+fence 等待上限为 5 秒；超时中断设备正常销毁并保留查询池，不把失败路径计作安全释放。
+完整批次仍按 120 帧读回，CPU 保留 128 个样本、每 120 帧报告一次。

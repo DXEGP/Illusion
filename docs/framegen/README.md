@@ -85,23 +85,23 @@ hudless 由 JVM 决定，因为只有 JVM 知道「这一帧有没有 3D 世界�
 ### 2.1 分层
 
 ```
-JVM（策略层，dev.nts.expdxr）
-  dxrmc/framegen/FrameGeneration.kt            ← 门面：选项、互锁、持久化、文案、push 到 native
-  dxrmc/framegen/FrameGenerationSelfTest.kt    ← 自动化验收钩子（不是功能入口）
-  dxrmc/nvidia/reflex/NvidiaReflex.kt          ← Reflex 模式 + 被帧生成强制开启的策略
-  dxrmc/sr/FrameGenerationConstants.kt         ← 插帧用的 view/projection/jitter 常量
-  d3d12/render/advanced/smaa/D3D12GuiSplit.kt  ← 世界层 / UI 层拆分与 hudless 裁决
-  d3d12/render/core/D3D12GpuSurface.kt         ← present：调 native、帧计数、裁决挂点
-  d3d12/extern/MCDR_ABI.kt + MCDRLayout.kt     ← FFM 绑定与结构体布局（唯一 native 入口）
+JVM（策略层，io.github.dxegp）
+  render/presentation/framegen/FrameGeneration.kt            ← 门面：选项、互锁、持久化、文案、push 到 native
+  diagnostics/FrameGenerationSelfTest.kt    ← 自动化验收钩子（不是功能入口）
+  render/presentation/latency/NvidiaReflex.kt          ← Reflex 模式 + 被帧生成强制开启的策略
+  render/presentation/framegen/FrameGenerationConstants.kt         ← 插帧用的 view/projection/jitter 常量
+  render/antialiasing/D3D12GuiSplit.kt  ← 世界层 / UI 层拆分与 hudless 裁决
+  d3d12/surface/D3D12GpuSurface.kt         ← present：调 native、帧计数、裁决挂点
+  d3d12/ffi/MCDR_ABI.kt + MCDR_Layout.kt   ← FFM 绑定与结构体布局（唯一 native 入口）
         │  fgPick / fgQueryCaps / fgSetMode / fgPresented / fgState / fgSetUiTexture /
         │  fgSetUiComposition / fgUiCompositionReady / fgSetConstants
         ▼
 native（MCDR，C++23 模块）
-  src/advanced/d3d12_framegen.cpp  ← 注册表（picked/applied/chainOwner）、门面、回滚判定
-  src/advanced/d3d12_dlss.cpp      ← DLSS-G provider（真正的 slDLSSGSetOptions 在这里下发）
-  src/advanced/d3d12_fsffg.cpp     ← FSR-FG provider（FFX 类型只在这个单元里）
-  src/advanced/d3d12_xessfg.cpp    ← XeSS-FG provider
-  src/core/d3d12_surface.cpp       ← Present 两侧的钩子时序
+  src/render/presentation/d3d12_framegen.cpp  ← 注册表（picked/applied/chainOwner）、门面、回滚判定
+  src/render/reconstruction/d3d12_dlss.cpp      ← DLSS-G provider（真正的 slDLSSGSetOptions 在这里下发）
+  src/render/presentation/d3d12_fsffg.cpp     ← FSR-FG provider（FFX 类型只在这个单元里）
+  src/render/presentation/d3d12_xessfg.cpp    ← XeSS-FG provider
+  src/render/presentation/d3d12_surface.cpp       ← Present 两侧的钩子时序
 ```
 
 为什么 native 的注册表在 `d3d12_framegen.cpp` 而不是各家 provider 里：注册表要在 Present 两侧挂钩、要看交换链状态、要解包 `Dx12Object`，这三件事只有 device 模块能做。provider 只管自己的 SDK。
@@ -341,22 +341,22 @@ Reflex 每帧两个点：`before_present`（帧起点 + 限帧 sleep）与 `afte
 
 ## 8. 文件导航
 
-相对 `Illusion\src\main\kotlin\dev\nts\expdxr\`：
+相对 `Illusion\src\main\kotlin\io\github\dxegp\`：
 
 | 路径 | 职责 |
 | --- | --- |
-| `dxrmc/framegen/FrameGeneration.kt` | 帧生成门面：后端选择、倍率、互锁、持久化、状态文案、推送 native |
-| `dxrmc/framegen/FrameGenerationSelfTest.kt` | 自动化自检：按 tick 改设置、打印能力表、强制选后端 |
-| `dxrmc/nvidia/reflex/NvidiaReflex.kt` | Reflex 模式、被帧生成强制开启、持久化 |
-| `dxrmc/sr/FrameGenerationConstants.kt` | 插帧的 view/projection/抖动/复位常量（行主序） |
-| `d3d12/render/advanced/smaa/D3D12GuiSplit.kt` | 世界层 / UI 层拆分、hudless 裁决、UI 纹理注册 |
-| `d3d12/render/core/D3D12GpuSurface.kt` | present 入口、F3 计数、调用 `armUiComposition` |
-| `d3d12/extern/MCDR_ABI.kt` | 帧生成与 Reflex 的 FFM 绑定 |
-| `d3d12/extern/MCDRLayout.kt` | `mcdr_fg_caps` / `mcdr_fg_dispatch` / 常量的字段偏移 |
-| `misc/gui/D3D12VideoSettingsContent.kt` | 视频设置里三段帧生成开关与状态行 |
-| `d3d12/debug/D3D12FrameStats.kt` | F3 的 `rendered/output fps (FG n.nx)` 改写 |
-| `IllusionConfig.kt` | `reflexFrameLimitUs` 配置定义 |
-| `d3d12/D3D12Settings.kt` | 把配置解析成 Snapshot 并推给 native |
+| `render/presentation/framegen/FrameGeneration.kt` | 帧生成门面：后端选择、倍率、互锁、持久化、状态文案、推送 native |
+| `diagnostics/FrameGenerationSelfTest.kt` | 自动化自检：按 tick 改设置、打印能力表、强制选后端 |
+| `render/presentation/latency/NvidiaReflex.kt` | Reflex 模式、被帧生成强制开启、持久化 |
+| `render/presentation/framegen/FrameGenerationConstants.kt` | 插帧的 view/projection/抖动/复位常量（行主序） |
+| `render/presentation/D3D12GUISplit.kt` | 世界层 / UI 层拆分、hudless 裁决、UI 纹理注册 |
+| `d3d12/surface/D3D12GpuSurface.kt` | present 入口、F3 计数、调用 `armUiComposition` |
+| `d3d12/ffi/MCDR_ABI.kt` | 帧生成与 Reflex 的 FFM 绑定 |
+| `d3d12/ffi/MCDR_Layout.kt` | `mcdr_fg_caps` / `mcdr_fg_dispatch` / 常量的字段偏移 |
+| `client/settings/D3D12VideoSettingsContent.kt` | 视频设置里三段帧生成开关与状态行 |
+| `diagnostics/D3D12FrameStats.kt` | F3 的 `rendered/output fps (FG n.nx)` 改写 |
+| `config/IllusionConfig.kt` | `reflexFrameLimitUs` 配置定义 |
+| `config/D3D12Settings.kt` | 把配置解析成 Snapshot 并推给 native |
 
 native 侧（相对 `MCDR\src\`）：
 

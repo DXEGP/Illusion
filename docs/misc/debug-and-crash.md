@@ -5,7 +5,7 @@
 
 涉及两个语言侧：
 
-- JVM（Kotlin）侧：`Illusion\src\main\kotlin\dev\nts\expdxr\`，负责崩溃报告与弹窗。
+- JVM（Kotlin）侧：`Illusion\src\main\kotlin\io\github\dxegp\`，负责崩溃报告与弹窗。
 - native 侧：`MCDR\src\`，负责 SEH 级取证、原生日志行与设备状态查询。
 
 ## 1. 崩溃路径全景
@@ -14,13 +14,13 @@
 
 | 路径 | 触发点（代码位置） | 谁写报告 | 谁弹窗 | 进程如何退出 |
 | --- | --- | --- | --- | --- |
-| Java 异常（后端初始化/自检失败） | `d3d12/backend/D3D12Backend.kt` 的 `createWindow` / `createDevice` → `d3d12/debug/D3D12Fatal.kt:crash` | `D3D12Fatal`：自定义 `CrashReport` + `ReportedException`，最终落到 `crash-reports/` | `D3D12Fatal.showPopup`（原生 `MessageBoxW`） | `ReportedException` 逃出原版候选后端循环，被 `Main.main` 的 `catch (Throwable)` 接住 → 原版崩溃流程 |
-| Java 异常（运行期任意异常） | 渲染/资源调用内部，例如 `d3d12/render/core/D3D12GpuBuffer.kt` 的 `mapFailureMessage` | 原版 `CrashReport.forThrowable`（DXRMC 不介入） | 无（原版崩溃界面是游戏内 GUI） | 原版崩溃流程；退出码代码中未明确 |
-| native 访问冲突 / 未处理 SEH | `MCDR\src\core\d3d12_device.cpp` 的 `dx12CrashFilter` | **不写文件**，只往 stderr 打 `FATAL` 行 | 无 | 过滤器返回 `EXCEPTION_EXECUTE_HANDLER`，由 Windows 按未处理异常终止进程；代码未设置退出码，实际退出码即异常码（如访问冲突 `0xC0000005`） |
-| 设备被移除 / 复位 | `MCDR\src\core\d3d12_surface.cpp` 的 `presentSurface`、`MCDR\src\core\d3d12_device.cpp` 的 `deviceRemoved` / `logDeviceStatus`，以及 JVM 侧 `D3D12GpuBuffer` | 不专门写报告；只有后续任意一个会失败的调用把它变成上表第二行 | 无 | 不主动退出，见 1.4 |
-| 卡死（watchdog） | `d3d12/debug/D3D12ExitWatchdog.kt` 的 `dumpAndExit` | 不写崩溃报告；把全部线程栈写 stderr 并追加到 `%TEMP%\backend-java.log` | 无 | `System.exit(1)` |
+| Java 异常（后端初始化/自检失败） | `d3d12/backend/D3D12Backend.kt` 的 `createWindow` / `createDevice` → `diagnostics/D3D12Fatal.kt:crash` | `D3D12Fatal`：自定义 `CrashReport` + `ReportedException`，最终落到 `crash-reports/` | `D3D12Fatal.showPopup`（原生 `MessageBoxW`） | `ReportedException` 逃出原版候选后端循环，被 `Main.main` 的 `catch (Throwable)` 接住 → 原版崩溃流程 |
+| Java 异常（运行期任意异常） | 渲染/资源调用内部，例如 `d3d12/resource/D3D12GpuBuffer.kt` 的 `mapFailureMessage` | 原版 `CrashReport.forThrowable`（DXRMC 不介入） | 无（原版崩溃界面是游戏内 GUI） | 原版崩溃流程；退出码代码中未明确 |
+| native 访问冲突 / 未处理 SEH | `MCDR/src/diagnostics/d3d12_diagnostics.cpp` 的 `dx12CrashFilter` | **不写文件**，只往 stderr 打 `FATAL` 行 | 无 | 过滤器返回 `EXCEPTION_EXECUTE_HANDLER`，由 Windows 按未处理异常终止进程；代码未设置退出码，实际退出码即异常码（如访问冲突 `0xC0000005`） |
+| 设备被移除 / 复位 | `MCDR\src/render/presentation/d3d12_surface.cpp` 的 `presentSurface`、`MCDR\src/backend/device/d3d12_device.cpp` 的 `deviceRemoved` / `logDeviceStatus`，以及 JVM 侧 `D3D12GpuBuffer` | 不专门写报告；只有后续任意一个会失败的调用把它变成上表第二行 | 无 | 不主动退出，见 1.4 |
+| 卡死（watchdog） | `diagnostics/D3D12ExitWatchdog.kt` 的 `dumpAndExit` | 不写崩溃报告；把全部线程栈写 stderr 并追加到 `%TEMP%\backend-java.log` | 无 | `System.exit(1)` |
 
-补充一条不在这四条里的：**native 库缺失/符号绑定失败**。`d3d12/extern/MCDR_ABI.kt` 把失败记进
+补充一条不在这四条里的：**native 库缺失/符号绑定失败**。`d3d12/ffi/MCDR_ABI.kt` 把失败记进
 `LOAD_FAILURE`，之后任何 `requireLoaded()` 都抛 `IllegalStateException("MCDR native library is unavailable: …")`，
 于是它走上表第一行——被 `createDevice` 的 `catch (t: Throwable)` 接住，交给 `D3D12Fatal.crash`。
 
@@ -208,7 +208,7 @@ watchdog 杀掉（watchdog 只看 `Render thread` 在不在），只能由用户
 
 ## 4. 日志体系
 
-### 4.1 唯一出口：`misc/IllusionLogger.kt`
+### 4.1 唯一出口：`diagnostics/IllusionLogger.kt`
 
 JVM 侧只有这一个门面，所有地方都不得直接 `println` / `System.err.println`：
 
@@ -223,9 +223,9 @@ JVM 侧只有这一个门面，所有地方都不得直接 `println` / `System.e
 | `applyOpt(level, nativeVerbose, shutdownTrace, nativeLogFile)` | 真正落地：改 log4j 级别 + 推给 native | — |
 | `applyFromConfig()` / `applyDefaults()` | 从 TOML / 内置默认值应用 | — |
 
-`OWN_LOGGERS = ["dev.nts.expdxr", "backend", "dxr_mc-temporal", "dxr_mc-velocity", "dxr_mc"]`：
+`OWN_LOGGERS = ["io.github.dxegp", "backend", "dxr_mc-temporal", "dxr_mc-velocity", "dxr_mc"]`：
 Minecraft 自带的 log4j2 配置里没有这些名字，不显式 `Configurator.setLevel` 的话它们会继承 root
-（INFO，开发环境下是 DEBUG），玩家配置的级别就形同虚设。`dev.nts.expdxr` 是包级 logger，
+（INFO，开发环境下是 DEBUG），玩家配置的级别就形同虚设。`io.github.dxegp` 是包级 logger，
 覆盖 `LogUtils.getLogger()` 派生的类名 logger，不必逐个枚举。
 
 启动时的级别来源优先级：`D3D12_LOG_VERBOSE=1`（开发逃生口，覆盖配置文件）> `[logging] logLevel` > 内置默认
@@ -326,7 +326,7 @@ int formatLogPrefix(char* out, size_t outSize, const char* level, const char* lo
 
 ## 5. 诊断开关清单
 
-全部在 `config/dxr_mc-client.toml`，由 `IllusionConfig.kt` 定义、`D3D12Settings` 解析成 `Snapshot`。
+全部在 `config/dxr_mc-client.toml`，由 `config/IllusionConfig.kt` 定义、`D3D12Settings` 解析成 `Snapshot`。
 需要 native 在建设备前就知道的值通过专用 ABI 或 `D3D12SetEnvironment` 推进去（配置是唯一入口）。
 
 ### 5.1 `[logging]`
@@ -369,7 +369,7 @@ int formatLogPrefix(char* out, size_t outSize, const char* level, const char* lo
 构建脚本里的 `-Pdxrmc.*` 只用于自动化跑测试，按项目约定**不是功能入口**：
 
 - `-Pdxrmc.selfTest=fg-on@20,fg-off@400` → 系统属性 `dxrmc.selfTest`，由
-  `dxrmc/framegen/FrameGenerationSelfTest.install()` 在 tick 上按时间点开关帧生成；没设属性时只做一次
+  `render/presentation/framegen/FrameGenerationSelfTest.install()` 在 tick 上按时间点开关帧生成；没设属性时只做一次
   `System.getProperty` 就返回，不注册任何监听器。
 - `-Pdxrmc.noPopup` → 系统属性 `dxrmc.noPopup`，等价于 `[debug] noCrashPopup = true` 的已弃用逃生口。
 
@@ -385,32 +385,33 @@ int formatLogPrefix(char* out, size_t outSize, const char* level, const char* lo
 
 ## 6. 文件导航
 
-JVM 侧（相对 `Illusion\src\main\kotlin\dev\nts\expdxr\`）：
+JVM 侧（相对 `Illusion\src\main\kotlin\io\github\dxegp\`）：
 
 | 路径 | 一句话职责 |
 | --- | --- |
-| `d3d12/debug/D3D12Fatal.kt` | 后端失败策略：复位首选图形 API、原生弹窗、自定义崩溃报告，抛 `ReportedException` |
-| `d3d12/debug/D3D12ExitWatchdog.kt` | 退出卡死看守：`Render thread` 消失 15 s 后 dump 全线程栈并 `System.exit(1)` |
-| `d3d12/debug/D3D12DebugInfo.kt` | F3 `system_specs` 组追加的分辨率/显存/后端行，以及地形行的 `with mesh` 后缀 |
-| `d3d12/debug/D3D12FrameStats.kt` | F3 帧率行的 `rendered/output` 双数值与 `(FG n.nx)` 倍率（1 s 窗口 + 指数平滑） |
-| `d3d12/debug/D3D12VrsDebugEntry.kt` | 独立的 F3 debug entry（`dxr_mc:vrs`），VRS 诊断行可由玩家在 F3+F6 里开关 |
-| `misc/IllusionLogger.kt` | JVM 侧唯一日志出口 + 级别枚举 + 把级别/关停标记/镜像文件路径推给 native |
-| `misc/settings/D3D12Settings.kt` | 把配置解析成不可变 `Snapshot`，并用 ABI/环境变量推给 native（建设备前就要的值） |
+| `diagnostics/D3D12Fatal.kt` | 后端失败策略：复位首选图形 API、原生弹窗、自定义崩溃报告，抛 `ReportedException` |
+| `diagnostics/D3D12ExitWatchdog.kt` | 退出卡死看守：`Render thread` 消失 15 s 后 dump 全线程栈并 `System.exit(1)` |
+| `diagnostics/D3D12DebugInfo.kt` | F3 `system_specs` 组追加的分辨率/显存/后端行，以及地形行的 `with mesh` 后缀 |
+| `diagnostics/D3D12FrameStats.kt` | F3 帧率行的 `rendered/output` 双数值与 `(FG n.nx)` 倍率（1 s 窗口 + 指数平滑） |
+| `diagnostics/D3D12VrsDebugEntry.kt` | 独立的 F3 debug entry（`dxr_mc:vrs`），VRS 诊断行可由玩家在 F3+F6 里开关 |
+| `diagnostics/IllusionLogger.kt` | JVM 侧唯一日志出口 + 级别枚举 + 把级别/关停标记/镜像文件路径推给 native |
+| `config/D3D12Settings.kt` | 把配置解析成不可变 `Snapshot`，并用 ABI/环境变量推给 native（建设备前就要的值） |
 | `d3d12/backend/D3D12Backend.kt` | 后端入口：窗口/设备创建、三组无条件自检、失败时调 `D3D12Fatal.crash` |
-| `d3d12/extern/MCDR_ABI.kt` | FFM 绑定；`LOAD_FAILURE`/`isAvailable()` 与日志/诊断相关导出（SetLogLevel、SetLogFile、SetPIX…） |
-| `d3d12/render/core/D3D12GpuBuffer.kt` | 识别设备移除（三个 HRESULT）、一次性报告、把 `mcdrLastError` 原文带进异常 |
-| `d3d12/render/core/D3D12GpuSurface.kt` | `present()`：blit/呈现推进、帧统计计数、`DXGI_STATUS_OCCLUDED` 等的 JVM 侧表现 |
-| `d3d12/backend/D3D12PixCaptureController.kt` | F9 键位与 PIX timing 抓帧的启停/帧数预算（配置在按下瞬间读） |
-| `dxrmc/framegen/FrameGenerationSelfTest.kt` | 只给自动化用的 tick 钩子（`dxrmc.selfTest` 属性驱动） |
-| `IllusionConfig.kt` | `[logging]` / `[debug]` 等全部配置项的定义与中英文注释（配置界面文案来源） |
+| `d3d12/ffi/MCDR_ABI.kt` | FFM 绑定；`LOAD_FAILURE`/`isAvailable()` 与日志/诊断相关导出（SetLogLevel、SetLogFile、SetPIX…） |
+| `d3d12/resource/D3D12GpuBuffer.kt` | 识别设备移除（三个 HRESULT）、一次性报告、把 `mcdrLastError` 原文带进异常 |
+| `d3d12/surface/D3D12GpuSurface.kt` | `present()`：blit/呈现推进、帧统计计数、`DXGI_STATUS_OCCLUDED` 等的 JVM 侧表现 |
+| `diagnostics/D3D12PixCaptureController.kt` | F9 键位与 PIX timing 抓帧的启停/帧数预算（配置在按下瞬间读） |
+| `diagnostics/FrameGenerationSelfTest.kt` | 只给自动化用的 tick 钩子（`dxrmc.selfTest` 属性驱动） |
+| `config/IllusionConfig.kt` | `[logging]` / `[debug]` 等全部配置项的定义与中英文注释（配置界面文案来源） |
 | `IllusionClient.kt` | 客户端入口：应用默认日志级别、启动 watchdog、注册 PIX 键位与自检钩子 |
 
 native 侧（相对仓库根）：
 
 | 路径 | 一句话职责 |
 | --- | --- |
-| `MCDR\src\core\d3d12_device.cpp` | `gLogLevel` / `formatLogPrefix` / `emitLogLine` / `dbgLog*` / 镜像文件 / SEH `dx12CrashFilter` / `deviceStatusText` / `deviceRemoved` |
-| `MCDR\src\core\d3d12_surface.cpp` | `presentSurface` 的 HRESULT 分支、`DXGI_ERROR_DEVICE_REMOVED` 时调 `logDeviceStatus` |
+| `MCDR/src/diagnostics/d3d12_diagnostics.cpp` | `gLogLevel` / `formatLogPrefix` / `emitLogLine` / `dbgLog*` / 镜像文件 / SEH `dx12CrashFilter` |
+| `MCDR/src/backend/device/d3d12_device.cpp` | `deviceStatusText` / `logDeviceStatus` / `deviceRemoved` |
+| `MCDR\src/render/presentation/d3d12_surface.cpp` | `presentSurface` 的 HRESULT 分支、`DXGI_ERROR_DEVICE_REMOVED` 时调 `logDeviceStatus` |
 | `MCDR\src\c_abi\abi_common.cpp` | 公共错误状态与字符串写出（`mcdrLastError` 的读写），供 JVM 侧把 native 原文带进异常/日志 |
 
 ## 7. 文档维护
