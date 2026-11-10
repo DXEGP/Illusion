@@ -22,17 +22,18 @@ import org.spongepowered.asm.mixin.injection.Inject
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo
 import java.nio.ByteBuffer
+import java.lang.ref.WeakReference
 
 @Mixin(targets = ["net.minecraft.client.renderer.chunk.SectionRenderDispatcher\$RenderSection"])
 abstract class SectionUploadCaptureMixin : D3D12SectionCompileState {
     @Unique @Volatile
-    private var `dxr_mc$compileTask`: SectionRenderDispatcher.RenderSection.SectionTask? = null
+    private var `dxr_mc$compileTask`: WeakReference<SectionRenderDispatcher.RenderSection.SectionTask>? = null
 
     override val compileTaskIdentity: Any?
-        get() = `dxr_mc$compileTask`
+        get() = `dxr_mc$compileTask`?.get()
 
     override fun hasPendingCompile(): Boolean {
-        val task = `dxr_mc$compileTask` ?: return false
+        val task = `dxr_mc$compileTask`?.get() ?: return false
         return !(task as SectionCompileTaskAccessor).`dxr_mc$isCancelled`().get() &&
             !(task as D3D12SectionTaskState).captureState.installed
     }
@@ -54,7 +55,7 @@ abstract class SectionUploadCaptureMixin : D3D12SectionCompileState {
             state.bind(getSectionNode(), level, D3D12SectionGeometry.epoch(),
                 (region as D3D12SectionRegionState).compileScope)
             state.bindSourceRegion(region)
-            `dxr_mc$compileTask` = task
+            `dxr_mc$compileTask` = WeakReference(task)
         }
     }
 
@@ -85,7 +86,7 @@ abstract class SectionUploadCaptureMixin : D3D12SectionCompileState {
     @WrapMethod(method = ["setSectionMesh"])
     private fun `dxr_mc$commitUpload`(mesh: SectionMesh, original: Operation<SectionMesh>): SectionMesh =
         synchronized(this) {
-            val task = `dxr_mc$compileTask`
+            val task = `dxr_mc$compileTask`?.get()
             if (task == null || (task as SectionCompileTaskAccessor).`dxr_mc$isCancelled`().get()) {
                 return@synchronized mesh
             }

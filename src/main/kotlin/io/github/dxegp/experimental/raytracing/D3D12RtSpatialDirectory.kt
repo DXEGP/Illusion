@@ -1,9 +1,11 @@
 package io.github.dxegp.experimental.raytracing
 
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet
+import it.unimi.dsi.fastutil.longs.LongSet
+import it.unimi.dsi.fastutil.longs.LongSets
 import net.minecraft.core.SectionPos
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.IdentityHashMap
 import java.util.PriorityQueue
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -13,7 +15,7 @@ object D3D12RtSpatialDirectory {
     const val MAX_PAGES = 512
     const val PAGE_BYTES = PAGE_SIDE * PAGE_SIDE * PAGE_SIDE * 4
     const val MAX_BYTES = 64 + MAX_PAGES * (16 + PAGE_BYTES)
-    const val MAX_CACHED_DEPENDENCIES = 32768
+    const val MAX_CACHED_DEPENDENCIES = 131072
 
     data class Page(val column: Int, val row: Int, val slice: Int)
 
@@ -27,18 +29,25 @@ object D3D12RtSpatialDirectory {
 
     internal data class Build(val bytes: ByteBuffer, val update: Update)
 
-    class Cache {
-        private data class Dependency(val source: D3D12RtSpatialSources.Source, val targeted: Boolean) {
-            fun matches(other: Dependency): Boolean = targeted == other.targeted && source.sameProof(other.source)
-        }
+    internal class Targets private constructor(internal val members: LongSet) : Set<Long> by members {
+        override fun equals(other: Any?): Boolean = this === other || members == other
+        override fun hashCode(): Int = members.hashCode()
 
+        companion object {
+            fun freeze(members: Set<Long>): Targets = Targets(LongSets.unmodifiable(LongOpenHashSet(members)))
+        }
+    }
+
+    class Cache {
         private class Content(val data: ByteArray, val populated: Boolean)
-        private data class Entry(val dependencies: List<Dependency>, val content: Content)
+        private data class Entry(val dependencies: Int, val content: Content)
         private val entries = linkedMapOf<Page, Entry>()
         private var dependencyCount = 0
         private var epoch: Int? = null
         private var universe: D3D12RtSourceUniverse.Snapshot? = null
         private var certifiable = false
+        private var previousSources: List<D3D12RtSpatialSources.Source>? = null
+        private var previousTargets: LongSet? = null
 
         fun clear() {
             entries.clear()
@@ -46,6 +55,95 @@ object D3D12RtSpatialDirectory {
             epoch = null
             universe = null
             certifiable = false
+            previousSources = null
+            previousTargets = null
+        }
+
+        private fun invalidatePage(page: Page) {
+            entries.remove(page)?.let { dependencyCount -= it.dependencies }
+        }
+
+        private fun invalidateSource(node: Long) {
+            if (entries.isEmpty()) return
+            val bounds = universe?.bounds
+            if (!certifiable || bounds == null) {
+                invalidatePage(Page(SectionPos.x(node).floorDiv(PAGE_SIDE), SectionPos.y(node).floorDiv(PAGE_SIDE),
+                    SectionPos.z(node).floorDiv(PAGE_SIDE)))
+                return
+            }
+            fun lower(origin: Int, minimum: Float): Int =
+                (origin.toLong() + ceil(minimum.toDouble() / 16.0).coerceIn(-8388608.0, 8388608.0).toLong() - 1L)
+                    .coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong()).toInt().floorDiv(PAGE_SIDE)
+            fun upper(origin: Int, maximum: Float): Int =
+                (origin.toLong() + floor(maximum.toDouble() / 16.0).coerceIn(-8388608.0, 8388608.0).toLong())
+                    .coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong()).toInt().floorDiv(PAGE_SIDE)
+            val minimumX = lower(SectionPos.x(node), bounds.minimumX)
+            val minimumY = lower(SectionPos.y(node), bounds.minimumY)
+            val minimumZ = lower(SectionPos.z(node), bounds.minimumZ)
+            val maximumX = upper(SectionPos.x(node), bounds.maximumX)
+            val maximumY = upper(SectionPos.y(node), bounds.maximumY)
+            val maximumZ = upper(SectionPos.z(node), bounds.maximumZ)
+            val width = maximumX.toLong() - minimumX + 1L
+            val height = maximumY.toLong() - minimumY + 1L
+            val depth = maximumZ.toLong() - minimumZ + 1L
+            if (width > entries.size || height > entries.size || depth > entries.size ||
+                width * height > entries.size || width * height * depth > entries.size) {
+                val iterator = entries.entries.iterator()
+                while (iterator.hasNext()) {
+                    val entry = iterator.next()
+                    val page = entry.key
+                    if (page.column in minimumX..maximumX && page.row in minimumY..maximumY &&
+                        page.slice in minimumZ..maximumZ) {
+                        dependencyCount -= entry.value.dependencies
+                        iterator.remove()
+                    }
+                }
+            } else {
+                for (slice in minimumZ..maximumZ) for (row in minimumY..maximumY) for (column in minimumX..maximumX)
+                    invalidatePage(Page(column, row, slice))
+            }
+        }
+
+        private fun updateSources(sources: D3D12RtSpatialSources.Snapshot, targets: Set<Long>) {
+            val current = sources.orderedSources
+            val previous = previousSources
+            val currentTargets = if (current.size <= MAX_CACHED_DEPENDENCIES && targets.size <= MAX_CACHED_DEPENDENCIES &&
+                (1 until current.size).none { current[it - 1].sectionNode == current[it].sectionNode })
+                (if (targets is Targets) targets.members else LongOpenHashSet(targets)) else null
+            if (previous == null || currentTargets == null) {
+                entries.clear()
+                dependencyCount = 0
+            } else {
+                val oldTargets = checkNotNull(previousTargets)
+                var before = 0
+                var after = 0
+                while (before < previous.size && after < current.size) {
+                    val old = previous[before]
+                    val next = current[after]
+                    when {
+                        old.sectionNode < next.sectionNode -> {
+                            invalidateSource(old.sectionNode)
+                            before++
+                        }
+                        old.sectionNode > next.sectionNode -> {
+                            invalidateSource(next.sectionNode)
+                            after++
+                        }
+                        else -> {
+                            if ((old !== next && !old.sameProof(next)) ||
+                                (oldTargets !== currentTargets &&
+                                    (old.sectionNode in oldTargets) != (next.sectionNode in currentTargets)))
+                                invalidateSource(next.sectionNode)
+                            before++
+                            after++
+                        }
+                    }
+                }
+                while (before < previous.size) invalidateSource(previous[before++].sectionNode)
+                while (after < current.size) invalidateSource(current[after++].sectionNode)
+            }
+            previousSources = if (currentTargets == null) null else current
+            previousTargets = currentTargets
         }
 
         internal fun build(region: Region, sources: D3D12RtSpatialSources.Snapshot, targets: Set<Long>): Build {
@@ -57,29 +155,27 @@ object D3D12RtSpatialDirectory {
                 certifiable = sources.certifiable
             }
             val selected = pages(region)
-            val candidates = sources.pageSources(selected)
-            val dependencies = IdentityHashMap<D3D12RtSpatialSources.Source, Dependency>(
-                minOf(sources.sources.size, candidates.sumOf { it.size }))
+            updateSources(sources, targets)
             val retained = selected.map { page ->
-                entries.remove(page)?.also { dependencyCount -= it.dependencies.size }
+                entries.remove(page)?.also { dependencyCount -= it.dependencies }
             }
+            val missing = selected.filterIndexed { index, _ -> retained[index] == null }
+            val candidates = if (missing.isEmpty()) emptyList() else sources.pageSources(missing)
+            var candidateIndex = 0
             var recomputed = 0
             var reused = 0
             var clipped = 0
             val populated = selected.mapIndexedNotNull { index, page ->
-                val required = candidates[index].map { source -> dependencies.getOrPut(source) {
-                    Dependency(source, source.layers.isNotEmpty() && source.sectionNode in targets)
-                } }
                 val previous = retained[index]
-                val entry = if (previous != null && previous.dependencies.size == required.size &&
-                    required.indices.all { required[it].matches(previous.dependencies[it]) }) {
+                val entry = if (previous != null) {
                     reused++
                     previous
                 } else {
                     recomputed++
+                    val current = candidates[candidateIndex++]
                     val states = sources.certifiedStates(page.column * PAGE_SIDE, page.row * PAGE_SIDE,
-                        page.slice * PAGE_SIDE, PAGE_SIDE, targets, candidates[index])
-                    for (source in candidates[index]) {
+                        page.slice * PAGE_SIDE, PAGE_SIDE, targets, current)
+                    for (source in current) {
                         val sectionX = SectionPos.x(source.sectionNode)
                         val sectionY = SectionPos.y(source.sectionNode)
                         val sectionZ = SectionPos.z(source.sectionNode)
@@ -87,19 +183,20 @@ object D3D12RtSpatialDirectory {
                             sectionZ.floorDiv(PAGE_SIDE) != page.slice) continue
                         val cell = ((sectionZ.mod(PAGE_SIDE) * PAGE_SIDE + sectionY.mod(PAGE_SIDE)) * PAGE_SIDE +
                             sectionX.mod(PAGE_SIDE))
-                        if (states[cell] !in 1..2) states[cell] = source.state
+                        if (states[cell] !in 1..2 && states[cell] != D3D12RtSpatialSources.PROXY_COVERED)
+                            states[cell] = source.state
                     }
                     val data = ByteArray(PAGE_BYTES)
                     ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).apply { for (state in states) putInt(state) }
-                    Entry(required, Content(data, states.any { it != 0 }))
+                    Entry(current.size, Content(data, states.any { it != 0 }))
                 }
-                if (entry.dependencies.size <= MAX_CACHED_DEPENDENCIES) {
+                if (entry.dependencies <= MAX_CACHED_DEPENDENCIES) {
                     entries[page] = entry
-                    dependencyCount += entry.dependencies.size
+                    dependencyCount += entry.dependencies
                 }
                 while (entries.size > MAX_PAGES || dependencyCount > MAX_CACHED_DEPENDENCIES) {
                     val oldest = entries.entries.iterator().next()
-                    dependencyCount -= oldest.value.dependencies.size
+                    dependencyCount -= oldest.value.dependencies
                     entries.remove(oldest.key)
                 }
                 val content = entry.content

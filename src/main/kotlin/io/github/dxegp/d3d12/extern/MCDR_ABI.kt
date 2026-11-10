@@ -540,7 +540,7 @@ object MCDR_ABI {
      * This constant, the Kotlin mirrors and the native `layoutTable()` must agree — [verifyABI]
      * aborts before device creation otherwise.
      */
-    const val MCDR_ABI_VERSION: Int = 46
+    const val MCDR_ABI_VERSION: Int = 47
     /** `MCDR_FG_BACKEND_*`, value for value with `mcdr_abi.h`. */
     const val FG_BACKEND_NONE: Int = 0
     const val FG_BACKEND_DLSSG: Int = 1
@@ -2876,7 +2876,7 @@ object MCDR_ABI {
     fun D3D12CreateRtFrame(
         rayDxil: ByteArray, guideDxil: ByteArray, exposureDxil: ByteArray,
         motionDxil: ByteArray, packDxil: ByteArray, signalDxil: ByteArray,
-        remodulateDxil: ByteArray, compositeDxil: ByteArray,
+        remodulateDxil: ByteArray, compositeDxil: ByteArray, environmentDxil: ByteArray,
         workGraph: Boolean = false,
     ): Long {
         requireLoaded()
@@ -2907,6 +2907,9 @@ object MCDR_ABI {
             val compositeData = arena.allocate(compositeDxil.size.toLong()).also { it.asByteBuffer().put(compositeDxil) }
             program.set(MCDRLayout.PTR, 112, compositeData)
             program.set(MCDRLayout.I64, 120, compositeDxil.size.toLong())
+            val environmentData = arena.allocate(environmentDxil.size.toLong()).also { it.asByteBuffer().put(environmentDxil) }
+            program.set(MCDRLayout.PTR, 128, environmentData)
+            program.set(MCDRLayout.I64, 136, environmentDxil.size.toLong())
             try {
                 return handle.invokeExact(program) as Long
             } catch (failure: Throwable) {

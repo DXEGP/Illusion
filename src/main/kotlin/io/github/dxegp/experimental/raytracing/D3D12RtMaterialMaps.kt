@@ -33,15 +33,20 @@ internal object D3D12RtMaterialMaps {
 
     /** 每次重烘前清空：图集换了就要重新解析一遍，缓存里的旧值不能再信。 */
     fun beginBake() {
-        cache.clear()
-        specHits = 0
-        normalHits = 0
-        looked = 0
+        clear()
         source = when {
             !D3D12Settings.materialsEnabled -> "off"
             D3D12Settings.materialsPackPath.isNotEmpty() -> "packPath"
             else -> "resources"
         }
+    }
+
+    fun clear() {
+        cache.clear()
+        specHits = 0
+        normalHits = 0
+        looked = 0
+        source = "off"
     }
 
     fun summary(): String {

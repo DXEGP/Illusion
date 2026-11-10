@@ -43,6 +43,9 @@ abstract class SectionCompileTaskMixin : D3D12SectionTaskState {
         additionalRenderers: List<AddSectionGeometryEvent.AdditionalSectionRenderer>,
         original: Operation<SectionCompiler.Results>
     ): SectionCompiler.Results {
+        if (captureState.compileScope == null) {
+            return original.call(compiler, position, region, sorting, buffers, additionalRenderers)
+        }
         captureState.captureCompiler(compiler)
         val renderers = additionalRenderers.toList()
         captureState.prepareSourceSupport(

@@ -34,6 +34,7 @@
     "render.LevelRendererRtDebugViewMixin",
     "render.ChunkSectionsToRenderSamplerMixin",
     "render.GuiRendererTargetMixin",
+    "render.LevelLoadingGridMixin",
     "render.ScreenshotMixin",
     "render.CubeMapTargetMixin",
     "render.GameRendererBlurTargetMixin",

@@ -561,6 +561,7 @@ object MCDRLayout {
         PTR.withName("signalDxil"), I64.withName("signalBytes"),
         PTR.withName("remodulateDxil"), I64.withName("remodulateBytes"),
         PTR.withName("compositeDxil"), I64.withName("compositeBytes"),
+        PTR.withName("environmentDxil"), I64.withName("environmentBytes"),
     ).withName("mcdr_rt_frame_program")
 
     @JvmField
@@ -767,7 +768,7 @@ object MCDRLayout {
         arrayOf<Any>("mcdr_rt_caps",              RT_CAPS,             80L),
         arrayOf<Any>("mcdr_rt_track_stats",       RT_TRACK_STATS,      92L),
         arrayOf<Any>("mcdr_rt_hit_group",         RT_HIT_GROUP,        32L),
-        arrayOf<Any>("mcdr_rt_frame_program",     RT_FRAME_PROGRAM,   128L),
+        arrayOf<Any>("mcdr_rt_frame_program",     RT_FRAME_PROGRAM,   144L),
         arrayOf<Any>("mcdr_rt_geometry_desc",     RT_GEOMETRY_DESC,   120L),
         arrayOf<Any>("mcdr_rt_geometry_output",   RT_GEOMETRY_OUTPUT, 56L),
         arrayOf<Any>("mcdr_rt_geometry_content", RT_GEOMETRY_CONTENT, 72L),

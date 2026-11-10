@@ -12,6 +12,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.function.Supplier
 import kotlin.math.abs
+import kotlin.math.floor
 import kotlin.math.pow
 
 /**
@@ -40,6 +41,7 @@ object D3D12RtTrace {
     // +0 albedo / +12 emissive / +24 roughness / +28 flags / +32 metalness（docs/rt/README.md §17.2）。
     private const val MATERIAL_BYTES = 40
     private const val SECTION_SIZE = 16f
+    private const val SPATIAL_SIDE = 3
     private const val RT_DIR = "dxrmc"
     private const val SELF_TEST_FILE = "rt_selftest.json"
     private const val SELF_TEST_PREV_FILE = "rt_selftest.prev.json"
@@ -325,8 +327,10 @@ object D3D12RtTrace {
      */
     private fun validateProbe(device: D3D12Device): Boolean {
         val scene = triangleScene()
+        val probeRecords = recordBytes(scene)
+        // 探针不求交，不需要空间目录。
         val result = runGpu(
-            device, scene, recordBytes(scene), vertexBytes(scene), indexBytes(scene),
+            device, scene, probeRecords, probeRecords, vertexBytes(scene), indexBytes(scene),
             materialBytes(scene), quadMaterialBytes(scene),
             // debugMode = 8 是探针；recordCount 给非零假值。
             sceneBytes(scene, debugMode = 8, recordCount = 3),
@@ -385,7 +389,7 @@ object D3D12RtTrace {
         val quads = quadMaterialBytes(scene)
         val camera = sceneBytes(scene)
 
-        val result = runGpu(device, scene, records, vertices, indices, materials, quads, camera)
+        val result = runGpu(device, scene, records, shaderRecords(scene, records), vertices, indices, materials, quads, camera)
             ?: return false
         val cpu = _reference(scene, records, vertices, indices, materials, quads, camera)
 
@@ -507,19 +511,20 @@ object D3D12RtTrace {
 
     private fun runGpu(
         device: D3D12Device, scene: Scene,
-        records: ByteBuffer, vertices: ByteBuffer, indices: ByteBuffer,
+        records: ByteBuffer, shaderRecords: ByteBuffer, vertices: ByteBuffer, indices: ByteBuffer,
         materials: ByteBuffer, quads: ByteBuffer, camera: ByteBuffer,
     ): GpuResult? {
         val accel = D3D12RtBlas.newAccel()
-        val sources = ArrayList<D3D12GpuBuffer>(6)
+        val sources = ArrayList<D3D12GpuBuffer>(7)
         val outputs = ArrayList<D3D12GpuBuffer>(5)
         val readbacks = ArrayList<D3D12GpuBuffer>(5)
         val constantHandles = ArrayList<D3D12GpuBuffer>(1)
         var ctx = 0L
+        var environment = 0L
         try {
             step = "${scene.label}:upload"
             for ((name, data) in listOf(
-                "records" to records, "vertices" to vertices, "indices" to indices,
+                "records" to shaderRecords, "vertices" to vertices, "indices" to indices,
                 // 顺序必须与着色器绑定一致：t4 = gQuadMaterials。
                 "materials" to materials, "quads" to quads,
             )) {
@@ -558,6 +563,9 @@ object D3D12RtTrace {
             val view = accel.view()
             if (view == 0L) return null
             srvs += view
+            environment = MCDR_ABI.ID3D12CreateTexture(36, 42, 6, 1, 1, 1)
+            if (environment == 0L) return null
+            srvs += environment
             D3D12RtBlas.noteSelftest(accel)
             val uavs = LongArray(outputs.size) { outputs[it].handle() }
             step = "${scene.label}:dispatch"
@@ -583,6 +591,7 @@ object D3D12RtTrace {
             if (ctx != 0L) MCDR_ABI.D3D12DestroyCommandEncoder(ctx)
             accel.release()
             for (buffer in sources + outputs + readbacks + constantHandles) buffer.close()
+            if (environment != 0L) MCDR_ABI.ID3D12DestroyResource(environment)
         }
     }
 
@@ -663,6 +672,29 @@ object D3D12RtTrace {
         out.putInt(52, scene.triangleCount / 2 + 1)         // quadCount
         out.putLong(56, 0L)                                 // sectionNode
         return out
+    }
+
+    /**
+     * 上传给着色器的 records：记录后接 v1 空间目录（着色器在 `recordCount * 64` 处读它）。
+     * 缺目录时每条光线都判 unknown，三个场景只剩作废像素、命中恒为 0。
+     * 场景周围 3×3×3 个 section 标已知，flags = 1 让盒外按世界外处理，与 CPU 参考「场景即世界」一致；
+     * 缓冲必须正好止于目录末尾，否则光照变化批次会判成全域变化。
+     */
+    private fun shaderRecords(scene: Scene, records: ByteBuffer): ByteBuffer {
+        val recordCount = if (scene.triangleCount == 0) 0 else 1
+        val minimum = listOf(scene.origin.x, scene.origin.y, scene.origin.z)
+            .map { floor(it / SECTION_SIZE).toInt() - 1 }
+        val cells = SPATIAL_SIDE * SPATIAL_SIDE * SPATIAL_SIDE
+        val out = buffer(recordCount * RECORD_BYTES + 64 + cells * 4)
+        out.put(records.duplicate().limit(recordCount * RECORD_BYTES))
+        out.putInt(0x53505452).putInt(1)                     // 魔数 / version 1（稠密）
+        minimum.forEach { out.putInt(it) }                   // 目录最小 section
+        repeat(3) { out.putInt(SPATIAL_SIDE) }
+        minimum.forEach { out.putInt(it * 16) }              // 世界盒 = 目录盒（方块坐标）
+        minimum.forEach { out.putInt((it + SPATIAL_SIDE) * 16) }
+        out.putInt(1).putInt(0)                              // flags = 世界盒有效；pageCount = 0
+        repeat(cells) { out.putInt(1) }                      // 1 = 已知
+        return out.flip()
     }
 
     private fun vertexBytes(scene: Scene): ByteBuffer {

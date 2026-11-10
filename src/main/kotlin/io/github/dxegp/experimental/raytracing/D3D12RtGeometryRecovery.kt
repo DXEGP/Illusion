@@ -44,7 +44,7 @@ object D3D12RtGeometryRecovery {
     data class Stats(val backlog: D3D12RtGeometryPool.CaptureBacklog, val preparedRegions: Int,
                      val inFlight: Int, val retryEntries: Int, val scanned: Long, val submitted: Long,
                      val deferred: Long, val discarded: Long, val copies: Long, val copyNanos: Long,
-                     val maxCopyNanos: Long, val overSliceCopies: Long)
+                     val maxCopyNanos: Long, val overSliceCopies: Long, val emptyCertified: Long)
 
     private val pending = AtomicReference<List<Prepared>>(emptyList())
     private val flights = ConcurrentHashMap<Any, Flight>()
@@ -57,6 +57,7 @@ object D3D12RtGeometryRecovery {
     private val copyNanos = AtomicLong()
     private val maxCopyNanos = AtomicLong()
     private val overSliceCopies = AtomicLong()
+    private val emptyCertified = AtomicLong()
     private val failures = AtomicLong()
 
     fun register() {
@@ -72,7 +73,7 @@ object D3D12RtGeometryRecovery {
 
     fun stats(): Stats = Stats(D3D12RtGeometryPool.captureBacklog(), pending.get().size, flights.size,
         backoff.size(), scanned.get(), submitted.get(), deferred.get(), discarded.get(), copies.get(),
-        copyNanos.get(), maxCopyNanos.get(), overSliceCopies.get())
+        copyNanos.get(), maxCopyNanos.get(), overSliceCopies.get(), emptyCertified.get())
 
     private fun prune(level: ClientLevel, epoch: Int) {
         flights.entries.removeAll { [task, flight] ->
@@ -122,6 +123,10 @@ object D3D12RtGeometryRecovery {
         prune(level, epoch)
         val renderer = client.levelRenderer
         val viewArea = renderer.viewArea() ?: return
+        val camera = client.gameRenderer.mainCamera()
+        if (camera.isInitialized) {
+            D3D12RtGeometryPool.requestCameraCaptures(epoch.toLong(), SectionPos.asLong(camera.blockPosition()))
+        }
         pending.set(prepareBatch(level, renderer, viewArea, RenderRegionCache()))
     }
 
@@ -165,6 +170,10 @@ object D3D12RtGeometryRecovery {
                     copyNanos.addAndGet(elapsed)
                     maxCopyNanos.accumulateAndGet(elapsed, ::maxOf)
                     if (elapsed > PREPARATION_SLICE_NANOS) overSliceCopies.incrementAndGet()
+                }
+                if (D3D12SectionGeometry.publishEmptyRegion(region, additional.isNotEmpty())) {
+                    emptyCertified.incrementAndGet()
+                    return@repeat
                 }
                 batch += Prepared(target, level, renderer, viewArea, section, mesh, task, region, additional)
             } catch (failure: Exception) {

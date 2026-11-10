@@ -14,6 +14,7 @@ object D3D12RtPresentation {
 
     fun blit(targets: LevelTargetBundle?) {
         val bundle = targets ?: return
+        if (D3D12RtFrame.currentCamera() == null) return
         val encoder = D3D12Device.sharedCommandEncoder()
         val main = try {
             bundle.main.get()

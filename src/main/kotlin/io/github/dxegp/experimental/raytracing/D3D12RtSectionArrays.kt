@@ -9,7 +9,7 @@ import java.util.WeakHashMap
 object D3D12RtSectionArrays {
     private val sectionsField = ChunkAccess::class.java.getDeclaredField("sections").apply { isAccessible = true }
     private val escaped = WeakHashMap<Array<LevelChunkSection>, Boolean>()
-    private val access = ThreadLocal<Access>()
+    private val access = ThreadLocal<Access?>()
     private var publisher: ((LevelChunk, Array<LevelChunkSection>) -> Unit)? = null
 
     class Access internal constructor(internal val chunk: ChunkAccess, internal val previous: Access?) : AutoCloseable {
@@ -19,7 +19,7 @@ object D3D12RtSectionArrays {
         override fun close() {
             if (closed) return
             check(Thread.currentThread() === thread && access.get() === this)
-            if (previous == null) access.remove() else access.set(previous)
+            access.set(previous)
             closed = true
         }
     }

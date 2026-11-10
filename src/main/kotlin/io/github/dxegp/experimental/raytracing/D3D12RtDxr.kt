@@ -16,7 +16,7 @@ import java.util.function.Supplier
  */
 internal object D3D12RtDxr {
 
-    const val SRV_COUNT = 6
+    const val SRV_COUNT = 7
     const val UAV_COUNT = 5
     const val MAX_RECURSION = 1
 

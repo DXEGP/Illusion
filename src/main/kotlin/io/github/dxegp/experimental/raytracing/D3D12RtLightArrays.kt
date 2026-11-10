@@ -10,7 +10,7 @@ object D3D12RtLightArrays {
     internal enum class Use { CONSTRUCTED, BORROWED, ESCAPED }
     private val arrays = WeakHashMap<ByteArray, Ownership>()
     private val externalReads = WeakHashMap<DataLayer, Int>()
-    private val access = ThreadLocal<Access>()
+    private val access = ThreadLocal<Access?>()
     private var publisher: ((DataLayer, ByteArray, Use) -> Unit)? = null
     private var reader: ((DataLayer, Supplier<ByteArray>) -> ByteArray)? = null
 
@@ -20,7 +20,7 @@ object D3D12RtLightArrays {
         override fun close() {
             if (closed) return
             check(Thread.currentThread() === thread && access.get() === this)
-            if (previous == null) access.remove() else access.set(previous)
+            access.set(previous)
             closed = true
         }
     }

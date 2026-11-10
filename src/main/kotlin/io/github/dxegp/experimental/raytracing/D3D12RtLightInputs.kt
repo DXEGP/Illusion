@@ -112,6 +112,7 @@ object D3D12RtLightInputs {
                             private var block: List<Read>, private var sky: List<Read>,
                             private var verifiedBlock: DataLayerStorageMap<*>?,
                             private var verifiedSky: DataLayerStorageMap<*>?) {
+        val skyStorage: LayerLightSectionStorage<*>? get() = descriptor.sky
         private var actualBlock = linkedMapOf<Long, Read>()
         private var actualSky = linkedMapOf<Long, Read>()
         private var rawBlock = linkedMapOf<Long, RawRead>()
@@ -435,6 +436,9 @@ object D3D12RtLightInputs {
 
     private fun map(storage: LayerLightSectionStorage<*>?): DataLayerStorageMap<*>? =
         storage?.let { checkNotNull(visibleMap?.get(it) as? DataLayerStorageMap<*>) }
+
+    internal fun isVisibleMap(storage: LayerLightSectionStorage<*>, candidate: DataLayerStorageMap<*>): Boolean =
+        map(storage) === candidate
 
     private fun read(map: DataLayerStorageMap<*>?, node: Long, sky: Boolean): Read {
         if (map == null) return Read(null)

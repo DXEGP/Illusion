@@ -408,7 +408,7 @@ RR 允许八/九纹理、RT SR 允许四/五纹理；可选最后一张为 1×1 
 ### 3.7 native RT 帧入口
 
 native RT 帧通过 `D3D12CreateRtFrame` / `D3D12RtFrame` / `D3D12ReleaseRtFrame` 管理；
-上下文使用 I64 编号，录制签名为 `PTR/I64/PTR/PTR -> I32`。128 / 128 / 128 B 三个结构体登记在
+上下文使用 I64 编号，录制签名为 `PTR/I64/PTR/PTR -> I32`。144 / 128 / 128 B 三个结构体登记在
 `MCDRLayout`，CPU 常量使用 confined arena，仅在调用内借用；返回的 GPU 资源不得由 JVM 销毁。
 描述末尾携带帧时间戳、曝光模式/EV/速率和 reset；native 持有曝光纹理及适应状态，输出附带同帧曝光句柄。
 还包括信号编码（0=RAW、1=REBLUR、2=RR）、当前减上一帧的屏幕 jitter 和 denoisingRange；输出附带同帧 motion、NRD packed-normal、viewZ、diffuse/specular 信号及反射距离借用句柄。

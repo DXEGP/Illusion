@@ -43,6 +43,7 @@ object D3D12RtIdMaps {
     }
 
     private val released = ReferenceQueue<Any>()
+    private val releasedStorageUses = ReferenceQueue<Any>()
     private val inputs = hashMapOf<Key, Input>()
     private class StorageUse(val input: D3D12RtPaletteStorage.Input, val version: Long, val ids: IntArray)
     private val storageUses = hashMapOf<Key, StorageUse>()
@@ -92,19 +93,21 @@ object D3D12RtIdMaps {
     internal fun strategyRegistry(strategy: Strategy<*>): IdMap<*>? =
         if (strategy.javaClass in strategyTypes) strategyRegistry.get(strategy) as IdMap<*> else null
 
+    @Synchronized
     private fun input(owner: Any): Input {
         reap()
         return inputs.getOrPut(Key(owner, released), ::Input)
     }
 
+    @Synchronized
     private fun reap() {
         while (true) {
             val key = released.poll() ?: return
             inputs.remove(key)
-            storageUses.remove(key)
         }
     }
 
+    @Synchronized
     internal fun begin(owner: Any, recover: Boolean): Mutation {
         val input = input(owner)
         val canRecover = recover && input.active.isEmpty()
@@ -112,6 +115,7 @@ object D3D12RtIdMaps {
         return Mutation(owner, input, input.version, input.failureRevision, canRecover).also { input.active.add(it) }
     }
 
+    @Synchronized
     internal fun finish(mutation: Mutation, completed: Boolean) {
         val input = mutation.input
         check(mutation in input.active)
@@ -126,12 +130,14 @@ object D3D12RtIdMaps {
         input.version++
     }
 
+    @Synchronized
     internal fun beginCopy(map: IdMap<*>?): Copy {
         val owner = map?.let(::owner)
         val input = owner?.let(::input)
         return Copy(owner, input, input?.version ?: 0L, input != null && !input.failed && input.active.isEmpty())
     }
 
+    @Synchronized
     internal fun matches(copy: Copy): Boolean = copy.available && copy.owner != null &&
         input(copy.owner) === copy.input && copy.input.let { !it.failed && it.active.isEmpty() && it.version == copy.version }
 
@@ -159,6 +165,7 @@ object D3D12RtIdMaps {
 
     internal fun empty(owner: Any): Boolean = values(owner).isEmpty() && ids(owner).isEmpty()
 
+    @Synchronized
     internal fun failed(owner: Any): Boolean = input(owner).failed
 
     internal fun sameDefault(owner: Any, value: Any?): Boolean = defaultValue.get(owner) === value
@@ -215,12 +222,12 @@ object D3D12RtIdMaps {
     }
 
     private fun storageIds(storage: BitStorage): IntArray {
-        reap()
+        while (true) storageUses.remove(releasedStorageUses.poll() ?: break)
         val copy = D3D12RtPaletteStorage.beginCopy(storage)
         storageUses[Key(storage)]?.takeIf { it.input === copy.input && it.version == copy.version }?.let { return it.ids }
         val ids = IntOpenHashSet()
         storage.getAll { value -> ids.add(value) }
-        return ids.toIntArray().also { storageUses[Key(storage, released)] = StorageUse(copy.input, copy.version, it) }
+        return ids.toIntArray().also { storageUses[Key(storage, releasedStorageUses)] = StorageUse(copy.input, copy.version, it) }
     }
 
     private fun rawValue(entries: Palette<*>, id: Int): Any? {

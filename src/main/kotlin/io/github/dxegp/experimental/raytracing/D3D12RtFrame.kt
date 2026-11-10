@@ -17,6 +17,7 @@ import io.github.dxegp.experimental.framegen.FrameGeneration
 import io.github.dxegp.misc.IllusionLogger
 import io.github.dxegp.misc.settings.D3D12Settings
 import net.minecraft.client.Minecraft
+import net.minecraft.client.gui.screens.LevelLoadingScreen
 import org.joml.Matrix4f
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -100,6 +101,8 @@ object D3D12RtFrame {
         val cameraMode: Any? = null,
         val fovSetting: Int? = null,
         val domain: D3D12RtFullDomainProfile.Request? = null,
+        val skyEnabled: Boolean = true,
+        val rain: Float = 0f,
         )
 
     private class Radiance(
@@ -295,7 +298,8 @@ object D3D12RtFrame {
     /** 光追关掉后把 GPU 资源还回去；与材质表共用同一个 tick。 */
     fun tick() {
         D3D12RenderScale.reconcileRayTracing()
-        observeWorld(Minecraft.getInstance().level)
+        val world = Minecraft.getInstance().level
+        if (world == null) onLevelChanged(null) else observeWorld(world)
         // 老配置里 mode 可能停在 OFF（只有 backend 被写过）：包是这两个键的来源，进入世界时对一次账。
         if (!reconciled) {
             reconciled = true
@@ -307,7 +311,7 @@ object D3D12RtFrame {
             D3D12RtGeometryRecovery.clear()
             D3D12RtTrace.reportDisabled()
             D3D12RtStats.release()
-            if (radiance != null || mirrors != null || output != null) {
+            if (radiance != null || mirrors != null || output != null || D3D12RtNativeFrame.hasContext()) {
                 release()
             }
             return
@@ -320,6 +324,15 @@ object D3D12RtFrame {
             starvedReported = true
             IllusionLogger.warnMessage(
                 "rt: no geometry after ${STARVED_TICKS / 20}s, gbuffer replay never ran")
+        }
+    }
+
+    fun onLevelChanged(worldIdentity: Any?) = synchronized(frameLock) {
+        val previousEpoch = observedGeometryEpoch
+        val epoch = observeWorld(worldIdentity)
+        if (previousEpoch != epoch || worldIdentity == null && D3D12RtNativeFrame.hasContext()) {
+            release()
+            D3D12RtStats.release()
         }
     }
 
@@ -339,6 +352,7 @@ object D3D12RtFrame {
         hotMirrors.clear()
         output = null
         frameValid = false
+        fullDomainProfile = null
         previousPlan = null
         previousValid = false
         pendingPreviousReady = false
@@ -397,6 +411,7 @@ object D3D12RtFrame {
         capturedCamera = null
         capturedCameraStamp = D3D12Temporal.frameTimestampNanos
         if (data.remaining() != 64) return
+        if (client.gui.screen() is LevelLoadingScreen) return
         val world = client.level ?: return
         val level = client.gameRenderer.gameRenderState().levelRenderState
         val state = level.cameraRenderState
@@ -419,6 +434,8 @@ object D3D12RtFrame {
             aspect = state.projectionMatrix.m11() / state.projectionMatrix.m00(),
             sunDir = D3D12RtCamera.sunDirection(level.skyRenderState.sunAngle),
             sunColor = SUN_COLOR,
+            skyEnabled = world.dimensionType().hasSkyLight(),
+            rain = world.rainLevel,
             transform = transform,
             farPlane = state.depthFar,
             worldIdentity = world,
@@ -472,7 +489,7 @@ object D3D12RtFrame {
                 transform.offset, transform.right, transform.up, transform.forward,
                 transform.view.copyOf(), transform.projection.copyOf()), camera.farPlane,
             camera.worldIdentity, camera.worldTime, camera.frameNanos,
-            camera.cameraIdentity, camera.cameraMode, camera.fovSetting, camera.domain)
+            camera.cameraIdentity, camera.cameraMode, camera.fovSetting, camera.domain, camera.skyEnabled, camera.rain)
         preparedFrame = PreparedFrame(device, encoder.recordingIdentity, frozenCamera, plan, replay.revision)
     }
 
@@ -1183,7 +1200,8 @@ object D3D12RtFrame {
                 height = traceHeight,
                 sunDir = camera.sunDir,
                 sunRadiance = camera.sunColor,
-                sunStrength = SUN_STRENGTH,
+                sunStrength = if (camera.skyEnabled) SUN_STRENGTH else 0f,
+                rain = camera.rain,
                 frameIndex = frameCounter.toInt(),
                 radius = D3D12RtFullDomainProfile.compositeRadius(
                     camera.domain?.takeIf { it.worldIdentity === camera.worldIdentity }),

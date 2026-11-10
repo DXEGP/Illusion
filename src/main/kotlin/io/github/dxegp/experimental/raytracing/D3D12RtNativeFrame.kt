@@ -18,6 +18,8 @@ internal object D3D12RtNativeFrame {
 
     const val DENOISING_RANGE = 500000f
 
+    fun hasContext(): Boolean = context != 0L
+
     fun prepare(): Boolean {
         if (!MCDR_ABI.D3D12SetRtManagedMemoryBudget(D3D12Settings.rtManagedMemoryMiB.toLong() shl 20)) return false
         val workGraph = D3D12Settings.rtBackend == RtBackend.WG.ordinal
@@ -45,17 +47,19 @@ internal object D3D12RtNativeFrame {
         val remodulateDxil = MCDR_ABI.D3D12CompileShaderDxc(remodulateSource, "RtNrdRemodulate", "cs_6_8")
         val compositeDxil = MCDR_ABI.D3D12CompileShaderDxc(D3D12RtCompositeShader.build(),
             D3D12RtCompositeShader.ENTRY, "cs_6_8")
+        val environmentSource = D3D12RtShaderSources.load(D3D12ShaderPacks.sourcePath("rt_environment.hlsl"))
+        val environmentDxil = MCDR_ABI.D3D12CompileShaderDxc(environmentSource, "RtEnvironment", "cs_6_8")
         if (rayDxil != null && guideDxil != null && exposureDxil != null && motionDxil != null &&
-            packDxil != null && signalDxil != null && remodulateDxil != null && compositeDxil != null) {
+            packDxil != null && signalDxil != null && remodulateDxil != null && compositeDxil != null && environmentDxil != null) {
             if (graphDxil != null) {
                 context = MCDR_ABI.D3D12CreateRtFrame(graphDxil, guideDxil, exposureDxil,
-                    motionDxil, packDxil, signalDxil, remodulateDxil, compositeDxil, workGraph = true)
+                    motionDxil, packDxil, signalDxil, remodulateDxil, compositeDxil, environmentDxil, workGraph = true)
             }
             backend = if (context != 0L) RtBackend.WG else RtBackend.DXR
             if (context == 0L) {
                 if (workGraph) IllusionLogger.warnMessage("rt WG: unavailable, using DXR")
                 context = MCDR_ABI.D3D12CreateRtFrame(rayDxil, guideDxil, exposureDxil,
-                    motionDxil, packDxil, signalDxil, remodulateDxil, compositeDxil)
+                    motionDxil, packDxil, signalDxil, remodulateDxil, compositeDxil, environmentDxil)
             }
         }
         if (context == 0L) {

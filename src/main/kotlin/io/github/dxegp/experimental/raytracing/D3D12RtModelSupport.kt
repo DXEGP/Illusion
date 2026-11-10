@@ -78,6 +78,13 @@ object D3D12RtModelSupport {
                 name == "getMaxVerticalOffset" && owner == SmallDripleafBlock::class.java
         } == true
 
+    private fun offsetLimit(name: String) = object : ClassValue<Boolean>() {
+        override fun computeValue(type: Class<*>): Boolean = hasSupportedOffsetLimit(type, name)
+    }
+
+    private val horizontalOffsetLimit = offsetLimit("getMaxHorizontalOffset")
+    private val verticalOffsetLimit = offsetLimit("getMaxVerticalOffset")
+
     private fun hasSupportedOffset(state: BlockState): Boolean {
         if (!state.hasOffsetFunction()) return true
         val offset = stateOffset?.get(state) ?: return false
@@ -87,8 +94,7 @@ object D3D12RtModelSupport {
             else -> return false
         }
         val type = state.block.javaClass
-        return hasSupportedOffsetLimit(type, "getMaxHorizontalOffset") &&
-            (!vertical || hasSupportedOffsetLimit(type, "getMaxVerticalOffset"))
+        return horizontalOffsetLimit.get(type) && (!vertical || verticalOffsetLimit.get(type))
     }
 
     private fun D3D12RtGeometryPool.OutputBounds.union(other: D3D12RtGeometryPool.OutputBounds) =
@@ -96,15 +102,40 @@ object D3D12RtModelSupport {
             minOf(minimumZ, other.minimumZ), maxOf(maximumX, other.maximumX), maxOf(maximumY, other.maximumY),
             maxOf(maximumZ, other.maximumZ))
 
-    private fun D3D12RtGeometryPool.OutputBounds.translated(originX: Float, originY: Float, originZ: Float) =
-        D3D12RtGeometryPool.OutputBounds(minimumX + originX, minimumY + originY, minimumZ + originZ,
-            maximumX + originX, maximumY + originY, maximumZ + originZ)
-
     private fun D3D12RtGeometryPool.OutputBounds.isFinite(): Boolean =
         minimumX.isFinite() && minimumY.isFinite() && minimumZ.isFinite() &&
             maximumX.isFinite() && maximumY.isFinite() && maximumZ.isFinite()
 
     private val sectionBounds = D3D12RtGeometryPool.OutputBounds(0f, 0f, 0f, 16f, 16f, 16f)
+
+    private class BoundsAccumulator {
+        private var minimumX = 0f
+        private var minimumY = 0f
+        private var minimumZ = 0f
+        private var maximumX = 16f
+        private var maximumY = 16f
+        private var maximumZ = 16f
+
+        fun include(bounds: D3D12RtGeometryPool.OutputBounds, originX: Float, originY: Float, originZ: Float): Boolean {
+            val placedMinimumX = bounds.minimumX + originX
+            val placedMinimumY = bounds.minimumY + originY
+            val placedMinimumZ = bounds.minimumZ + originZ
+            val placedMaximumX = bounds.maximumX + originX
+            val placedMaximumY = bounds.maximumY + originY
+            val placedMaximumZ = bounds.maximumZ + originZ
+            if (!placedMinimumX.isFinite() || !placedMinimumY.isFinite() || !placedMinimumZ.isFinite() ||
+                !placedMaximumX.isFinite() || !placedMaximumY.isFinite() || !placedMaximumZ.isFinite()) return false
+            minimumX = minOf(minimumX, placedMinimumX)
+            minimumY = minOf(minimumY, placedMinimumY)
+            minimumZ = minOf(minimumZ, placedMinimumZ)
+            maximumX = maxOf(maximumX, placedMaximumX)
+            maximumY = maxOf(maximumY, placedMaximumY)
+            maximumZ = maxOf(maximumZ, placedMaximumZ)
+            return true
+        }
+
+        fun freeze() = D3D12RtGeometryPool.OutputBounds(minimumX, minimumY, minimumZ, maximumX, maximumY, maximumZ)
+    }
 
     internal fun universeBounds(state: BlockState, models: BlockStateModelSet,
                                 cache: Cache): D3D12RtGeometryPool.OutputBounds? {
@@ -252,6 +283,26 @@ object D3D12RtModelSupport {
                                               internal val fluidSupport: D3D12RtFluidSupport.Proof? = null)
 
     @JvmStatic
+    fun emptySupport(scope: D3D12SectionGeometry.CompileScope, position: SectionPos,
+                              region: RenderSectionRegion, trusted: Boolean,
+                              additionalRenderers: Boolean): Manifest? {
+        if (!trusted || additionalRenderers || position.asLong() != scope.sectionNode ||
+            region.javaClass != RenderSectionRegion::class.java) return null
+        return try {
+            if (regionMinimumX?.getInt(region) != position.x() - 1 ||
+                regionMinimumY?.getInt(region) != position.y() - 1 ||
+                regionMinimumZ?.getInt(region) != position.z() - 1) return null
+            val copies = regionSections?.get(region) as? Array<*> ?: return null
+            val copy = copies.getOrNull(13) as? SectionCopy ?: return null
+            if (copies.size != 27 || copy.javaClass != SectionCopy::class.java ||
+                copiedDebug?.getBoolean(copy) != false || copiedStates == null || copiedStates.get(copy) != null) return null
+            Manifest(scope, true, emptyMap())
+        } catch (failure: Exception) {
+            null
+        }
+    }
+
+    @JvmStatic
     fun sourceSupport(scope: D3D12SectionGeometry.CompileScope, position: SectionPos,
                       region: RenderSectionRegion, trusted: Boolean, additionalRenderers: Boolean): SourceManifest {
         fun unknown() = SourceManifest(scope, null)
@@ -272,7 +323,7 @@ object D3D12RtModelSupport {
                 copiedStates?.get(copy)?.javaClass != PalettedContainer::class.java) return unknown()
             val candidates = IdentityHashMap<BlockState, Candidates>()
             var fluidSupport: D3D12RtFluidSupport.Proof? = null
-            var bounds = sectionBounds
+            val bounds = BoundsAccumulator()
             val origin = position.origin()
             val cursor = BlockPos.MutableBlockPos()
             for (localY in 0 until 16) {
@@ -297,14 +348,12 @@ object D3D12RtModelSupport {
                         val offsetY = localY.toFloat() + offset.y.toFloat()
                         val offsetZ = localZ.toFloat() + offset.z.toFloat()
                         for ([_, incoming] in candidate.entries()) {
-                            val translated = incoming.translated(offsetX, offsetY, offsetZ)
-                            if (!translated.isFinite()) return unknown()
-                            bounds = bounds.union(translated)
+                            if (!bounds.include(incoming, offsetX, offsetY, offsetZ)) return unknown()
                         }
                     }
                 }
             }
-            SourceManifest(scope, bounds, fluidSupport)
+            SourceManifest(scope, bounds.freeze(), fluidSupport)
         } catch (failure: Exception) {
             unknown()
         }
@@ -316,7 +365,7 @@ object D3D12RtModelSupport {
         private var complete = trusted && scope != null
         private var closed = false
         private var finished = false
-        private val layers = mutableMapOf<Int, D3D12RtGeometryPool.OutputBounds>()
+        private val layers = mutableMapOf<Int, BoundsAccumulator>()
         private val tintReads = IdentityHashMap<BlockTintCache, MutableSet<Long>>()
         private val biomeReads = IdentityHashMap<LevelChunkSection, Boolean>()
         private val biomeInfoReads = IdentityHashMap<ModifiableBiomeInfo, Boolean>()
@@ -337,7 +386,7 @@ object D3D12RtModelSupport {
         fun finish(): Manifest? {
             check(!closed && !finished && active.get() === this && placement == null)
             finished = true
-            return scope?.let { Manifest(it, complete, layers.toMap()) }
+            return scope?.let { Manifest(it, complete, layers.mapValues { [_, bounds] -> bounds.freeze() }) }
         }
 
         internal fun tint(cache: BlockTintCache, position: BlockPos) {
@@ -390,7 +439,16 @@ object D3D12RtModelSupport {
                 invalidate()
                 return
             }
-            layers[layer] = layers[layer]?.union(sectionBounds) ?: sectionBounds
+            if (layer !in layers) layers[layer] = BoundsAccumulator()
+        }
+
+        internal fun includeModel(candidates: Candidates, originX: Float, originY: Float, originZ: Float,
+                                  forceOpaque: Boolean): Boolean {
+            for ([candidateLayer, bounds] in candidates.entries()) {
+                val layer = if (forceOpaque) D3D12SectionGeometry.Layer.SOLID.ordinal else candidateLayer
+                if (!layers.getOrPut(layer, ::BoundsAccumulator).include(bounds, originX, originY, originZ)) return false
+            }
+            return true
         }
 
         internal fun finishModel(current: Placement) {
@@ -399,9 +457,6 @@ object D3D12RtModelSupport {
             if (!current.complete()) {
                 invalidate()
                 return
-            }
-            for ([layer, incoming] in current.layers) {
-                layers[layer] = layers[layer]?.union(incoming) ?: incoming
             }
         }
 
@@ -416,7 +471,6 @@ object D3D12RtModelSupport {
                                          private val originX: Float, private val originY: Float, private val originZ: Float,
                                          private val forceOpaque: Boolean, zeroOffset: Boolean,
                                          internal val previous: Placement?) : AutoCloseable {
-        internal val layers = mutableMapOf<Int, D3D12RtGeometryPool.OutputBounds>()
         private var observed = false
         private var valid = originX.isFinite() && originY.isFinite() && originZ.isFinite()
         private var closed = false
@@ -431,12 +485,7 @@ object D3D12RtModelSupport {
             val offsetY = originY + offset.y.toFloat()
             val offsetZ = originZ + offset.z.toFloat()
             if (candidates?.complete != true) return
-            for ([candidateLayer, bounds] in candidates.entries()) {
-                val layer = if (forceOpaque) D3D12SectionGeometry.Layer.SOLID.ordinal else candidateLayer
-                val incoming = bounds.translated(offsetX, offsetY, offsetZ)
-                if (!incoming.isFinite()) valid = false
-                layers[layer] = layers[layer]?.union(incoming) ?: incoming.union(sectionBounds)
-            }
+            if (!session.includeModel(candidates, offsetX, offsetY, offsetZ, forceOpaque)) valid = false
         }
 
         internal fun complete(): Boolean = valid && candidates?.complete == true &&

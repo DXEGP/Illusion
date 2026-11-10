@@ -7,6 +7,8 @@ import kotlin.math.ceil
 import kotlin.math.floor
 
 object D3D12RtSpatialSources {
+    const val PROXY_COVERED = 6
+
     data class Layer(val layer: Int, val version: Int?, val captured: Boolean)
 
     class Source internal constructor(
@@ -77,6 +79,10 @@ object D3D12RtSpatialSources {
                                                       val universe: D3D12RtSourceUniverse.Snapshot =
                                                           D3D12RtSourceUniverse.unavailable) {
         val sources: List<Source> by lazy { java.util.List.copyOf(sourceFactory()) }
+        internal val orderedSources: List<Source> by lazy {
+            if ((1 until sources.size).all { sources[it - 1].sectionNode < sources[it].sectionNode }) sources
+            else sources.sortedBy { it.sectionNode }
+        }
         private val observed by lazy {
             LongOpenHashSet(sources.size).apply { for (source in sources) add(source.sectionNode) }
         }
@@ -181,6 +187,7 @@ object D3D12RtSpatialSources {
             val padded = side + 1
             val possible = IntArray(padded * padded * padded)
             val unavailable = IntArray(possible.size)
+            val unresolved = IntArray(possible.size)
             val nonempty = IntArray(possible.size)
             fun range(origin: Int, minimum: Float, maximum: Float, grid: Int): IntRange {
                 val relative = origin.toLong() - grid
@@ -207,10 +214,13 @@ object D3D12RtSpatialSources {
                     source.layers.all { it.captured && it.version != null } &&
                     (source.layers.isEmpty() || source.sectionNode in targets)
                 val bounds = source.bounds ?: universeBounds
-                if (!complete) add(unavailable, source, bounds)
+                if (!complete) {
+                    add(unresolved, source, bounds)
+                    if (source.sectionNode !in targets) add(unavailable, source, bounds)
+                }
                 else if (source.layers.isNotEmpty()) add(nonempty, source, bounds)
             }
-            for (values in listOf(possible, unavailable, nonempty)) {
+            for (values in listOf(possible, unavailable, unresolved, nonempty)) {
                 for (slice in 0 until padded) for (row in 0 until padded) for (column in 1 until padded) {
                     val index = (slice * padded + row) * padded + column
                     values[index] += values[index - 1]
@@ -224,13 +234,37 @@ object D3D12RtSpatialSources {
                     values[index] += values[index - padded * padded]
                 }
             }
+            val horizontalCounts = IntArray(side) { offset ->
+                checkNotNull(unobservedRangeAt(SectionPos.asLong(minimumX + offset, minimumY, minimumZ))).let {
+                    it.maximumX - it.minimumX + 1
+                }
+            }
+            val verticalCounts = IntArray(side) { offset ->
+                checkNotNull(unobservedRangeAt(SectionPos.asLong(minimumX, minimumY + offset, minimumZ))).let {
+                    it.maximumY - it.minimumY + 1
+                }
+            }
+            val depthCounts = IntArray(side) { offset ->
+                checkNotNull(unobservedRangeAt(SectionPos.asLong(minimumX, minimumY, minimumZ + offset))).let {
+                    it.maximumZ - it.minimumZ + 1
+                }
+            }
+            val limit = candidates.size.toLong()
             for (slice in 0 until side) for (row in 0 until side) for (column in 0 until side) {
                 val index = (slice * padded + row) * padded + column
                 if (unavailable[index] != 0) continue
-                val node = SectionPos.asLong(minimumX + column, minimumY + row, minimumZ + slice)
-                val required = unobservedRangeAt(node)?.countAtMost(candidates.size) ?: continue
-                if (possible[index] == required) states[(slice * side + row) * side + column] =
-                    if (nonempty[index] == 0) 1 else 2
+                val width = horizontalCounts[column].toLong()
+                val height = verticalCounts[row].toLong()
+                val depth = depthCounts[slice].toLong()
+                val required = if (width <= 0 || height <= 0 || depth <= 0) 0L else {
+                    if (width > limit || height > limit / width || depth > limit / (width * height)) continue
+                    width * height * depth
+                }
+                if (possible[index].toLong() == required) states[(slice * side + row) * side + column] = when {
+                    unresolved[index] != 0 -> PROXY_COVERED
+                    nonempty[index] == 0 -> 1
+                    else -> 2
+                }
             }
             return states
         }

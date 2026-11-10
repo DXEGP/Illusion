@@ -62,6 +62,7 @@ class D3D12SectionCaptureState {
 
     @Synchronized
     fun captureCompilerResources(blockModels: Any?, fluidModels: Any?) {
+        if (cancelled || installed) return
         compilerInvocation++
         revokeSourceSupport()
         result = null
@@ -74,6 +75,7 @@ class D3D12SectionCaptureState {
 
     @Synchronized
     fun captureCompiler(compiler: SectionCompiler) {
+        if (cancelled || installed) return
         val inputs = D3D12RtCompilerInputs.describe(compiler)
         captureCompilerResources(inputs?.blockModels, inputs?.fluidModels)
         compilerIdentity = compiler
@@ -117,9 +119,9 @@ class D3D12SectionCaptureState {
     @Synchronized
     fun cancelSourceSupport() {
         cancelled = true
-        sourceRegion = null
         compilerInvocation++
         revokeSourceSupport()
+        clearInputs()
     }
 
     @Synchronized
@@ -129,7 +131,7 @@ class D3D12SectionCaptureState {
 
     @Synchronized
     fun capture(mesh: SectionMesh) {
-        result = mesh
+        result = mesh.takeIf { !cancelled && !installed }
     }
 
     @Synchronized
@@ -145,8 +147,20 @@ class D3D12SectionCaptureState {
     fun observeInstall(mesh: SectionMesh, sectionNode: Long, worldIdentity: Any?, epoch: Int): Boolean {
         if (!canInstallRenderMesh(mesh, sectionNode, worldIdentity, epoch)) return false
         installed = true
-        sourceRegion = null
         revokeSourceSupport()
+        clearInputs()
         return true
+    }
+
+    private fun clearInputs() {
+        worldIdentity = null
+        sourceRegion = null
+        compileScope = null
+        producerManifest = null
+        result = null
+        compilerResourcesRecorded = false
+        compilerBlockModels = null
+        compilerFluidModels = null
+        compilerIdentity = null
     }
 }

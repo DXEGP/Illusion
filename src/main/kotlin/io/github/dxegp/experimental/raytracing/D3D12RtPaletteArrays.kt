@@ -13,7 +13,7 @@ object D3D12RtPaletteArrays {
     internal enum class Use { ALLOCATED, RETAINED, ESCAPED }
     private val arrays = WeakHashMap<LongArray, Ownership>()
     private val streamArrays = WeakHashMap<LongArray, Boolean>()
-    private val access = ThreadLocal<Access>()
+    private val access = ThreadLocal<Access?>()
     private var publisher: ((LongArray, Use) -> Unit)? = null
 
     class Access internal constructor(internal val storage: BitStorage, internal val previous: Access?) : AutoCloseable {
@@ -23,7 +23,7 @@ object D3D12RtPaletteArrays {
         override fun close() {
             if (closed) return
             check(Thread.currentThread() === thread && access.get() === this)
-            if (previous == null) access.remove() else access.set(previous)
+            access.set(previous)
             closed = true
         }
     }

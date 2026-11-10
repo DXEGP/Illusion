@@ -24,11 +24,13 @@ object D3D12RtPaletteEntries {
 
     private val released = ReferenceQueue<Any>()
     private val inputs = hashMapOf<Key, Input>()
+    private val trackedEntries = hashSetOf<Key>()
     private val failedPacked = hashSetOf<Key>()
     private val supportedTypes = setOf(SingleValuePalette::class.java, LinearPalette::class.java,
         HashMapPalette::class.java, GlobalPalette::class.java)
     internal class Input(var version: Long = 0L, var active: Int = 0, var failureRevision: Long = 0L,
                          var failed: Boolean = false) {
+        var tracked = false
         val available: Boolean get() = active == 0 && !failed
     }
 
@@ -71,7 +73,52 @@ object D3D12RtPaletteEntries {
     internal fun dataEntries(data: Any): Palette<*>? =
         if (data.javaClass == dataField.type) entriesField.get(data) as? Palette<*> else null
 
+    @Synchronized
     internal fun available(entries: Palette<*>?): Boolean = entries != null && supported(entries) && input(entries).available
+
+    @Synchronized
+    internal fun track(entries: Palette<*>) {
+        if (canonical(entries) && trackedEntries.add(Key(entries, released))) input(entries).tracked = true
+    }
+
+    @Synchronized
+    internal fun untrack(entries: Palette<*>) {
+        if (trackedEntries.remove(Key(entries))) input(entries).tracked = false
+    }
+
+    @Synchronized
+    internal fun clearTracking() {
+        for (key in trackedEntries) inputs[key]?.tracked = false
+        trackedEntries.clear()
+    }
+
+    @Synchronized
+    internal fun hasSources(mutation: Mutation): Boolean = mutation.input.tracked
+
+    @Synchronized
+    internal fun finishUntracked(mutation: Mutation, completed: Boolean): Boolean {
+        if (hasSources(mutation)) return false
+        finish(mutation, completed)
+        return true
+    }
+
+    @Synchronized
+    internal fun publishUntrackedSingle(entries: SingleValuePalette<*>, value: Any?, operation: Runnable): Boolean {
+        reap()
+        if (inputs[Key(entries)]?.tracked == true) return false
+        if (sameSingleValue(entries, value)) operation.run()
+        else {
+            val mutation = begin(entries, false)
+            var completed = false
+            try {
+                operation.run()
+                completed = true
+            } finally {
+                finish(mutation, completed)
+            }
+        }
+        return true
+    }
 
     internal fun canonical(entries: Palette<*>): Boolean = entries.javaClass in supportedTypes
 
@@ -86,6 +133,7 @@ object D3D12RtPaletteEntries {
         return inputs.getOrPut(Key(entries, released), ::Input)
     }
 
+    @Synchronized
     internal fun begin(entries: Palette<*>, recover: Boolean): Mutation {
         val input = input(entries)
         val canRecover = recover && input.active == 0
@@ -94,6 +142,7 @@ object D3D12RtPaletteEntries {
         return Mutation(entries, input, input.version, input.failureRevision, canRecover)
     }
 
+    @Synchronized
     internal fun finish(mutation: Mutation, completed: Boolean) {
         val input = mutation.input
         check(input.active > 0)
@@ -108,6 +157,7 @@ object D3D12RtPaletteEntries {
         input.version++
     }
 
+    @Synchronized
     private fun fail(entries: Palette<*>) {
         val input = input(entries)
         input.version++
@@ -116,9 +166,11 @@ object D3D12RtPaletteEntries {
     }
 
     internal fun beginCopy(entries: Palette<*>): Copy {
-        val input = input(entries)
-        return Copy(entries, input, input.version, available(entries),
-            D3D12RtIdMaps.registry(entries)?.let(D3D12RtIdMaps::beginCopy))
+        val registry = D3D12RtIdMaps.registry(entries)?.let(D3D12RtIdMaps::beginCopy)
+        return synchronized(this) {
+            val input = input(entries)
+            Copy(entries, input, input.version, available(entries), registry)
+        }
     }
 
     internal fun finishCopy(copy: Copy, result: Palette<*>) {
@@ -126,17 +178,24 @@ object D3D12RtPaletteEntries {
         if (!supported(result) || !matches(copy)) fail(result)
     }
 
-    internal fun matches(copy: Copy): Boolean = copy.available && input(copy.entries) === copy.input &&
-        available(copy.entries) && copy.input.version == copy.version && copy.registry?.let(D3D12RtIdMaps::matches) != false
+    internal fun matches(copy: Copy): Boolean = synchronized(this) {
+        copy.available && input(copy.entries) === copy.input && available(copy.entries) && copy.input.version == copy.version
+    } && copy.registry?.let(D3D12RtIdMaps::matches) != false
 
     internal fun finishPack(copy: Copy?, sameData: Boolean, result: PalettedContainerRO.PackedData<*>) {
-        reap()
-        if (copy == null || !sameData || !matches(copy)) failedPacked.add(Key(result, released))
+        val failed = copy == null || !sameData || !matches(copy)
+        synchronized(this) {
+            reap()
+            if (failed) failedPacked.add(Key(result, released))
+        }
     }
 
     internal fun finishUnpack(packed: PalettedContainerRO.PackedData<*>, palette: PalettedContainer<*>) {
-        reap()
-        if (Key(packed) in failedPacked) current(palette)?.let { entries ->
+        val failed = synchronized(this) {
+            reap()
+            Key(packed) in failedPacked
+        }
+        if (failed) current(palette)?.let { entries ->
             if (entries.javaClass == GlobalPalette::class.java) D3D12RtPaletteStorage.current(palette)?.let(D3D12RtPaletteStorage::fail)
             else fail(entries)
         }
@@ -146,6 +205,7 @@ object D3D12RtPaletteEntries {
         while (true) {
             val key = released.poll() ?: return
             inputs.remove(key)
+            trackedEntries.remove(key)
             failedPacked.remove(key)
         }
     }

@@ -267,7 +267,8 @@ object D3D12RtStats {
             append("\"copies_total\":").append(recovery.copies).append(',')
             append("\"copy_ms_total\":").append(recovery.copyNanos / 1_000_000.0).append(',')
             append("\"copy_ms_max\":").append(recovery.maxCopyNanos / 1_000_000.0).append(',')
-            append("\"over_slice_copies_total\":").append(recovery.overSliceCopies).append('}')
+            append("\"over_slice_copies_total\":").append(recovery.overSliceCopies).append(',')
+            append("\"empty_certified_total\":").append(recovery.emptyCertified).append('}')
         }
     }
 

@@ -106,6 +106,7 @@ object D3D12RtFrameConstants {
         jitterY: Float = 0f,
         previousJitterX: Float = 0f,
         previousJitterY: Float = 0f,
+        rain: Float = 0f,
     ) {
         val view = viewMatrix?.let { Matrix4f().set(it) } ?: Matrix4f().lookAt(
             Vector3f(position.x, position.y, position.z),
@@ -179,7 +180,7 @@ object D3D12RtFrameConstants {
         target.putFloatsAt(SUN_DIR, sunDir.x, sunDir.y, sunDir.z, SUN_ANGULAR_RADIUS)
         target.putFloatsAt(SUN_RADIANCE, sunRadiance.x, sunRadiance.y, sunRadiance.z, sunStrength)
         target.putFloatsAt(MOON_RADIANCE, 0f, 0f, 0f, 0.0273f)
-        target.putFloatsAt(TIME, 0f, 0f, 0f, 0f)
+        target.putFloatsAt(TIME, 0f, 0f, 0f, rain.coerceIn(0f, 1f))
         target.putFloatsAt(EXPOSURE, exposure, 1f, 2f, 1f)
         target.putFloatsAt(INDIRECT, 1f, 2f, 8f, 1e-4f)
         target.putFloatsAt(WATER, 0.05f, 0.12f, 0.16f, 0.22f)

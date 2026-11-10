@@ -4,6 +4,8 @@ import io.github.dxegp.d3d12.render.advanced.mesh.D3D12MeshletBuilder
 import io.github.dxegp.d3d12.render.advanced.mesh.D3D12SectionGeometry
 import io.github.dxegp.misc.IllusionLogger
 import io.github.dxegp.misc.settings.D3D12Settings
+import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap
+import it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet
 import net.minecraft.core.SectionPos
@@ -30,7 +32,6 @@ object D3D12RtGeometryPool {
     private const val RETAINED_SOURCE_SECTION_LIMIT = 1024
     private const val RETAINED_SOURCE_BYTE_LIMIT = 128L * 1024 * 1024
     private const val CAPTURE_DEMAND_LIMIT = 256
-    private const val CAPTURE_DEMAND_NANOS = 250_000_000L
     private const val RESIDENCY_DEMAND_LIMIT = 256
     private const val RESIDENCY_DEMAND_NANOS = 250_000_000L
 
@@ -38,6 +39,7 @@ object D3D12RtGeometryPool {
     private const val QUAD_VERTICES = 4
     private const val QUAD_INDICES = 6
     private const val SECTION_CAPTURE_LAYER = -1
+    private const val OUTPUT_BYTES = 48
 
     /** 逐 quad 材质索引的字节数（u16，指向 [D3D12RtMaterialTable] 的记录）。 */
     private const val MATERIAL_BYTES = 2
@@ -185,17 +187,31 @@ object D3D12RtGeometryPool {
 
     private val records = ConcurrentHashMap<RecordKey, Record>()
     private val missingVersions = linkedMapOf<RecordKey, MissingCapture>()
-    private val missingSections = linkedMapOf<Long, MissingCapture>()
+    private val missingSections = Long2ObjectLinkedOpenHashMap<MissingCapture>()
+    private var pendingOutputSlots = Long2IntOpenHashMap().apply { defaultReturnValue(-1) }
+    private var pendingOutputRows = ByteBuffer.allocate(0).order(ByteOrder.LITTLE_ENDIAN)
+    private var pendingOutputUniverse: D3D12RtSourceUniverse.Snapshot? = null
     private data class ProducerManifest(val support: D3D12RtModelSupport.Manifest, val versions: Map<Int, Int>,
                                         val requiredLayers: Set<Int>)
-    private val producerManifests = mutableMapOf<Long, ProducerManifest>()
+    private val producerManifests = Long2ObjectLinkedOpenHashMap<ProducerManifest>()
     private data class SectionPublication(val node: Long, val epoch: Int, val layers: Set<Int>)
     private var sectionPublication: SectionPublication? = null
     private data class SourceRequirement(val support: D3D12RtModelSupport.SourceManifest, val version: Int)
-    private val sourceRequirements = mutableMapOf<Long, SourceRequirement>()
+    private val sourceRequirements = Long2ObjectLinkedOpenHashMap<SourceRequirement>()
+    private data class UnprovenOutput(val version: Int, val bounds: OutputBounds?)
+    private val unprovenOutputs = Long2ObjectLinkedOpenHashMap<UnprovenOutput>()
     private var nextSectionCaptureVersion = 0
     private var captureAgeDirty = true
     private var oldestCaptureNanos: Long? = null
+
+    private fun observeCaptureAge(previous: Long?, current: Long?) {
+        if (previous == current) return
+        val oldest = oldestCaptureNanos
+        if (previous != null && previous == oldest) captureAgeDirty = true
+        if (current != null && (oldest == null || current < oldest))
+            oldestCaptureNanos = current
+    }
+
     private val captureOrder = linkedSetOf<RecordKey>()
     private data class CaptureDemand(val target: CaptureTarget, val receivedNanos: Long)
     private val captureDemands = linkedMapOf<RecordKey, CaptureDemand>()
@@ -213,19 +229,29 @@ object D3D12RtGeometryPool {
     private val lightingChanges = D3D12RtLightingChanges()
     private var cachedVersions: Versions? = null
     private var cachedSpatialSources: D3D12RtSpatialSources.Snapshot? = null
+    private val spatialSources = TreeMap<Long, D3D12RtSpatialSources.Source>()
+    private val dirtySpatialSources = LongOpenHashSet()
     private var sourceUniverse = D3D12RtSourceUniverse.unknown
     private var currentSourceUniverse = D3D12RtSourceUniverse.unavailable
     private var cachedCoverage: Coverage? = null
+    private data class TargetSelection(val centerX: Float, val centerY: Float, val centerZ: Float, val radius: Float,
+                                       val primary: D3D12RtSpatialDirectory.Region?,
+                                       val query: D3D12RtSpatialDirectory.Region,
+                                       val universe: D3D12RtSourceUniverse.Snapshot)
+    private data class TargetSnapshot(val members: D3D12RtSpatialDirectory.Targets, val bytes: ByteBuffer)
+    private var targetSelection: TargetSelection? = null
+    private var targetMembers = LongOpenHashSet()
+    private var targetSnapshot: TargetSnapshot? = null
     private data class SpatialGrid(val sources: D3D12RtSpatialSources.Snapshot,
                                    val region: D3D12RtSpatialDirectory.Region,
-                                   val targets: Set<Long>, val build: D3D12RtSpatialDirectory.Build)
+                                   val targets: D3D12RtSpatialDirectory.Targets, val build: D3D12RtSpatialDirectory.Build)
     private var cachedSpatialGrid: SpatialGrid? = null
     private val spatialDirectory = D3D12RtSpatialDirectory.Cache()
-    private val invalidSections = mutableSetOf<Long>()
+    private val invalidSections = LongOpenHashSet()
     private enum class SpatialState(val code: Int) {
         UNLOADED(3), DIRTY(4), LOADED_UNPROVEN(5),
     }
-    private val spatialStates = mutableMapOf<Long, SpatialState>()
+    private val spatialStates = Long2ObjectLinkedOpenHashMap<SpatialState>()
     private var vertices = GeometryArena(VERTEX_CAP.toInt())
     private var indices = GeometryArena(INDEX_CAP.toInt())
     private var materials = GeometryArena(MATERIAL_CAP.toInt())
@@ -246,6 +272,7 @@ object D3D12RtGeometryPool {
     @JvmStatic
     fun publish(sectionNode: Long, layer: String, geometryVersion: Int,
                 vertex: ByteBuffer, index: ByteBuffer?, indexCount: Int): Boolean {
+        dirtySpatialSources.add(sectionNode)
         val kind = D3D12SectionGeometry.Layer.of(layer)
         val key = RecordKey(sectionNode, kind.ordinal)
         if (!D3D12Settings.rtEnabled) {
@@ -296,10 +323,10 @@ object D3D12RtGeometryPool {
         if (previous == null && dormant != null &&
             matchesGeometry(dormant, vertex, index, effectiveIndexCount, indexStride)) {
             val materialIds = D3D12RtMaterialTable.quadMaterials(vertex, vertex.position(), dormant.quadCount)
-            remapMaterials(dormant, materialIds)
+            val materialChanged = remapMaterials(dormant, materialIds)
             records[key] = dormant
             removeDormant(key)
-            mirroredSlice = null
+            if (materialChanged && dormant in mirroredRecords) mirroredSlice = null
             full = false
             published.incrementAndGet()
             revision.incrementAndGet()
@@ -316,7 +343,6 @@ object D3D12RtGeometryPool {
         if (previous != null) {
             records.remove(key)
             releaseRecord(previous)
-            mirroredSlice = null
             revision.incrementAndGet()
         }
         val materialIds = D3D12RtMaterialTable.quadMaterials(vertex, vertex.position(), quadCount)
@@ -387,16 +413,17 @@ object D3D12RtGeometryPool {
     }
 
     private fun markMissing(key: RecordKey, geometryVersion: Int) {
+        dirtySpatialSources.add(key.sectionNode)
         residencyDemands.remove(key.sectionNode)
         val previous = records.remove(key)
         previous?.let(::releaseRecord)
         val previousMissing = missingVersions[key]
-        missingVersions[key] = MissingCapture(geometryVersion, previousMissing?.sinceNanos ?: System.nanoTime())
-        if (previousMissing == null) captureAgeDirty = true
+        val missing = MissingCapture(geometryVersion, previousMissing?.sinceNanos ?: System.nanoTime())
+        missingVersions[key] = missing
+        observeCaptureAge(previousMissing?.sinceNanos, missing.sinceNanos)
         captureOrder += key
         val changed = previousMissing?.version != geometryVersion
         if (changed) captureDemands.remove(key)
-        if (previous != null) mirroredSlice = null
         if (changed || previous != null) {
             revision.incrementAndGet()
         }
@@ -405,7 +432,13 @@ object D3D12RtGeometryPool {
     private fun removeMissing(key: RecordKey): Boolean {
         captureOrder.remove(key)
         captureDemands.remove(key)
-        return (missingVersions.remove(key) != null).also { if (it) captureAgeDirty = true }
+        val previous = missingVersions.remove(key)
+        observeCaptureAge(previous?.sinceNanos, null)
+        return (previous != null).also {
+            if (it) {
+                dirtySpatialSources.add(key.sectionNode)
+            }
+        }
     }
 
     private fun missingCapture(key: RecordKey): MissingCapture? =
@@ -423,7 +456,64 @@ object D3D12RtGeometryPool {
     private fun removeSectionCapture(sectionNode: Long): Boolean {
         captureOrder.remove(RecordKey(sectionNode, SECTION_CAPTURE_LAYER))
         captureDemands.remove(RecordKey(sectionNode, SECTION_CAPTURE_LAYER))
-        return (missingSections.remove(sectionNode) != null).also { if (it) captureAgeDirty = true }
+        val previous = missingSections.remove(sectionNode) ?: return false
+        removeSectionOutput(sectionNode)
+        observeCaptureAge(previous.sinceNanos, null)
+        return true
+    }
+
+    private fun writeSectionOutput(node: Long, missing: MissingCapture) {
+        var slot = pendingOutputSlots.get(node)
+        if (slot == -1) {
+            slot = pendingOutputSlots.size
+            val requiredBytes = (slot + 1) * OUTPUT_BYTES
+            if (pendingOutputRows.capacity() < requiredBytes) {
+                val capacity = maxOf(requiredBytes, pendingOutputRows.capacity().coerceAtMost(Int.MAX_VALUE / 2) * 2)
+                pendingOutputRows = ByteBuffer.allocate(capacity).order(ByteOrder.LITTLE_ENDIAN).apply {
+                    put(pendingOutputRows.array(), 0, slot * OUTPUT_BYTES)
+                }
+            }
+            pendingOutputSlots.put(node, slot)
+        }
+        val support = sourceRequirements[node]?.takeIf { it.version == missing.version }
+        val bounds = support?.support?.bounds ?: currentSourceUniverse.bounds
+        pendingOutputRows.position(slot * OUTPUT_BYTES)
+        pendingOutputRows.putLong(node).putInt(SECTION_CAPTURE_LAYER).putInt(missing.version)
+            .putInt(if (bounds == null) 0 else 1).putInt(0)
+        pendingOutputRows.putFloat(bounds?.minimumX ?: 0f).putFloat(bounds?.minimumY ?: 0f)
+            .putFloat(bounds?.minimumZ ?: 0f).putFloat(bounds?.maximumX ?: 0f)
+            .putFloat(bounds?.maximumY ?: 0f).putFloat(bounds?.maximumZ ?: 0f)
+    }
+
+    private fun updateSectionOutput(node: Long) {
+        if (pendingOutputUniverse !== currentSourceUniverse) return
+        missingSections[node]?.let { writeSectionOutput(node, it) }
+    }
+
+    private fun removeSectionOutput(node: Long) {
+        if (pendingOutputUniverse !== currentSourceUniverse) return
+        val slot = pendingOutputSlots.remove(node)
+        if (slot == -1 || slot == pendingOutputSlots.size) return
+        val lastOffset = pendingOutputSlots.size * OUTPUT_BYTES
+        val movedNode = pendingOutputRows.getLong(lastOffset)
+        pendingOutputRows.put(slot * OUTPUT_BYTES, pendingOutputRows, lastOffset, OUTPUT_BYTES)
+        pendingOutputSlots.put(movedNode, slot)
+    }
+
+    private fun appendSectionOutputs(outputs: ByteBuffer) {
+        if (pendingOutputUniverse !== currentSourceUniverse) {
+            pendingOutputUniverse = null
+            pendingOutputSlots.clear()
+            for ([node, missing] in missingSections) writeSectionOutput(node, missing)
+            pendingOutputUniverse = currentSourceUniverse
+        }
+        outputs.put(pendingOutputRows.array(), 0, missingSections.size * OUTPUT_BYTES)
+    }
+
+    private fun clearSectionOutputs() {
+        pendingOutputSlots = Long2IntOpenHashMap().apply { defaultReturnValue(-1) }
+        pendingOutputRows = ByteBuffer.allocate(0).order(ByteOrder.LITTLE_ENDIAN)
+        pendingOutputUniverse = null
     }
 
     @JvmStatic
@@ -446,7 +536,7 @@ object D3D12RtGeometryPool {
             val current = missingCapture(key)
             demand.target.epoch != geometryEpoch || current?.version != demand.target.version ||
                 current.sinceNanos != demand.target.sinceNanos ||
-                nowNanos - demand.receivedNanos !in 0L until CAPTURE_DEMAND_NANOS
+                nowNanos - demand.receivedNanos < 0L
         }
     }
 
@@ -457,7 +547,7 @@ object D3D12RtGeometryPool {
                         nowNanos: Long = System.nanoTime()): Int {
         require(nodes.size <= 64)
         pruneCaptureDemands(nowNanos)
-        if (epoch != geometryEpoch.toLong() || expectedRevision != revision.get()) return 0
+        if (epoch != geometryEpoch.toLong() || expectedRevision !in 0L..revision.get()) return 0
         var accepted = 0
         for (node in nodes) {
             for (target in missingCaptures(node)) {
@@ -468,6 +558,21 @@ object D3D12RtGeometryPool {
             }
         }
         return accepted
+    }
+
+    @JvmStatic
+    @Synchronized
+    @JvmOverloads
+    fun requestCameraCaptures(epoch: Long, sectionNode: Long, nowNanos: Long = System.nanoTime()): Int {
+        val nodes = LongArray(27)
+        var count = 0
+        for (distance in 0..3) {
+            for (deltaZ in -1..1) for (deltaY in -1..1) for (deltaX in -1..1) {
+                if (abs(deltaX) + abs(deltaY) + abs(deltaZ) != distance) continue
+                nodes[count++] = SectionPos.offset(sectionNode, deltaX, deltaY, deltaZ)
+            }
+        }
+        return requestCaptures(epoch, revision.get(), nodes, nowNanos)
     }
 
     @JvmStatic
@@ -614,6 +719,7 @@ object D3D12RtGeometryPool {
         retainedSourceBytes = 0L
         missingVersions.clear()
         missingSections.clear()
+        clearSectionOutputs()
         producerManifests.clear()
         sourceRequirements.clear()
         invalidSections.clear()
@@ -626,7 +732,12 @@ object D3D12RtGeometryPool {
         mirroredSlice = null
         full = false
         cachedSpatialSources = null
+        spatialSources.clear()
+        unprovenOutputs.clear()
+        dirtySpatialSources.clear()
+        dirtySpatialSources.addAll(spatialStates.keys)
         cachedCoverage = null
+        clearCoverageTargets()
         cachedSpatialGrid = null
         spatialDirectory.clear()
         try {
@@ -644,26 +755,33 @@ object D3D12RtGeometryPool {
     @JvmOverloads
     fun invalidateSections(nodes: LongArray, reason: D3D12RtLightingChanges.Reason = D3D12RtLightingChanges.Reason.INPUT,
                            publish: () -> Unit) {
-        val active = nodes.filterTo(linkedSetOf()) { spatialStates[it] != SpatialState.UNLOADED }
+        val active = LongOpenHashSet(nodes)
+        active.removeIf(java.util.function.LongPredicate { spatialStates[it] == SpatialState.UNLOADED })
         recordLightingChanges(active, reason)
-        val previous = active.associateWith(::oldestCapture)
-        val retired = retireSections(active)
         try {
-            for (node in active) queueSectionCapture(node, SpatialState.DIRTY, previous[node])
+            val iterator = active.iterator()
+            while (iterator.hasNext()) {
+                val node = iterator.nextLong()
+                val previous = oldestCapture(node)
+                retireSection(node, preserveCapture = true)
+                queueSectionCapture(node, SpatialState.DIRTY, previous)
+            }
             publish()
         } finally {
-            if (retired || active.isNotEmpty()) revision.incrementAndGet()
+            if (active.isNotEmpty()) revision.incrementAndGet()
         }
     }
 
     private fun queueSectionCapture(sectionNode: Long, state: SpatialState, previous: MissingCapture?) {
+        dirtySpatialSources.add(sectionNode)
         captureDemands.remove(RecordKey(sectionNode, SECTION_CAPTURE_LAYER))
         residencyDemands.remove(sectionNode)
         invalidSections += sectionNode
         spatialStates[sectionNode] = state
-        missingSections[sectionNode] = MissingCapture(++nextSectionCaptureVersion,
-            previous?.sinceNanos ?: System.nanoTime())
-        captureAgeDirty = true
+        val missing = MissingCapture(++nextSectionCaptureVersion, previous?.sinceNanos ?: System.nanoTime())
+        val replaced = missingSections.put(sectionNode, missing)
+        updateSectionOutput(sectionNode)
+        observeCaptureAge(replaced?.sinceNanos, missing.sinceNanos)
         captureOrder += RecordKey(sectionNode, SECTION_CAPTURE_LAYER)
     }
 
@@ -676,22 +794,31 @@ object D3D12RtGeometryPool {
     fun replaceChunk(nodes: LongArray, loaded: Boolean, dependent: LongArray = longArrayOf(),
                      retired: LongArray = longArrayOf(), publish: () -> Unit) {
         val state = if (loaded) SpatialState.LOADED_UNPROVEN else SpatialState.UNLOADED
-        val changedNodes = nodes.toSet()
-        val affected = changedNodes + retired.asList() + dependent.asList()
+        val changedNodes = LongOpenHashSet(nodes)
+        val retiredNodes = LongOpenHashSet(retired)
+        val affected = LongOpenHashSet(changedNodes).apply {
+            addAll(retiredNodes)
+            addAll(LongOpenHashSet(dependent))
+        }
         recordLightingChanges(affected, D3D12RtLightingChanges.Reason.SOURCE)
-        val previous = affected.associateWith(::oldestCapture)
-        var changed = retireSections(affected)
+        val required = LongOpenHashSet(dependent).apply { if (loaded) addAll(changedNodes) }
+        var changed = false
         try {
-            for (node in retired) {
-                if (spatialStates.put(node, SpatialState.UNLOADED) != SpatialState.UNLOADED) changed = true
-            }
-            for (node in nodes) {
-                if (spatialStates.put(node, state) != state) changed = true
-            }
-            val required = if (loaded) changedNodes + dependent.asList() else dependent.asList().toSet()
-            for (node in required) {
-                if (spatialStates[node] != SpatialState.UNLOADED) {
-                    queueSectionCapture(node, if (node in changedNodes) state else SpatialState.DIRTY, previous[node])
+            val iterator = affected.iterator()
+            while (iterator.hasNext()) {
+                val node = iterator.nextLong()
+                val previous = oldestCapture(node)
+                val nextState = when (node) {
+                    in changedNodes -> state
+                    in retiredNodes -> SpatialState.UNLOADED
+                    else -> spatialStates[node]
+                }
+                val capture = node in required && nextState != SpatialState.UNLOADED
+                if (retireSection(node, preserveCapture = capture)) changed = true
+                if (node in retiredNodes && spatialStates.put(node, SpatialState.UNLOADED) != SpatialState.UNLOADED) changed = true
+                if (node in changedNodes && spatialStates.put(node, state) != state) changed = true
+                if (capture) {
+                    queueSectionCapture(node, if (node in changedNodes) state else SpatialState.DIRTY, previous)
                     changed = true
                 }
             }
@@ -744,6 +871,7 @@ object D3D12RtGeometryPool {
     @JvmOverloads
     @Synchronized
     fun observeCompiledSection(sectionNode: Long, manifest: D3D12RtModelSupport.Manifest? = null) {
+        dirtySpatialSources.add(sectionNode)
         val keys = D3D12SectionGeometry.Layer.entries.map { RecordKey(sectionNode, it.ordinal) }
         val current = keys.mapNotNull { records[it] }
         val missing = keys.mapNotNull { key -> missingVersions[key]?.let { key to it } }.toMap()
@@ -781,7 +909,11 @@ object D3D12RtGeometryPool {
         }?.let { SourceRequirement(manifest, target.version) }
         val previous = sourceRequirements.remove(target.sectionNode)
         if (accepted != null) sourceRequirements[target.sectionNode] = accepted
-        if (previous != accepted) revision.incrementAndGet()
+        if (previous != accepted) {
+            updateSectionOutput(target.sectionNode)
+            dirtySpatialSources.add(target.sectionNode)
+            revision.incrementAndGet()
+        }
         return accepted != null
     }
 
@@ -791,6 +923,8 @@ object D3D12RtGeometryPool {
         val node = manifest.scope.sectionNode
         if (sourceRequirements[node]?.support !== manifest) return
         sourceRequirements.remove(node)
+        updateSectionOutput(node)
+        dirtySpatialSources.add(node)
         revision.incrementAndGet()
     }
 
@@ -817,7 +951,7 @@ object D3D12RtGeometryPool {
                         val missing = missingVersions[key] ?: continue
                         if (missing.sinceNanos > previous.sinceNanos) {
                             missingVersions[key] = missing.copy(sinceNanos = previous.sinceNanos)
-                            captureAgeDirty = true
+                            observeCaptureAge(missing.sinceNanos, previous.sinceNanos)
                         }
                     }
                 }
@@ -828,21 +962,30 @@ object D3D12RtGeometryPool {
 
     private fun retireSections(nodes: Set<Long>, retained: Set<Int> = emptySet()): Boolean {
         var changed = false
-        for (node in nodes) {
-            residencyDemands.remove(node)
-            retainedSources.remove(node)?.let { retainedSourceBytes -= it }
-            if (producerManifests.remove(node) != null) changed = true
-            if (sourceRequirements.remove(node) != null) changed = true
+        for (node in nodes) if (retireSection(node, retained)) changed = true
+        return changed
+    }
+
+    private fun retireSection(node: Long, retained: Set<Int> = emptySet(), preserveCapture: Boolean = false): Boolean {
+        dirtySpatialSources.add(node)
+        residencyDemands.remove(node)
+        retainedSources.remove(node)?.let { retainedSourceBytes -= it }
+        var changed = producerManifests.remove(node) != null
+        if (sourceRequirements.remove(node) != null) {
+            changed = true
+            updateSectionOutput(node)
+        }
+        if (!preserveCapture) {
             if (invalidSections.remove(node)) changed = true
             if (removeSectionCapture(node)) changed = true
-            for (layer in D3D12SectionGeometry.Layer.entries) {
-                if (layer.ordinal in retained) continue
-                val key = RecordKey(node, layer.ordinal)
-                if (removeMissing(key)) changed = true
-                records.remove(key)?.let { record ->
-                    retainDormant(key, record)
-                    changed = true
-                }
+        }
+        for (layer in D3D12SectionGeometry.Layer.entries) {
+            if (layer.ordinal in retained) continue
+            val key = RecordKey(node, layer.ordinal)
+            if (removeMissing(key)) changed = true
+            records.remove(key)?.let { record ->
+                retainDormant(key, record)
+                changed = true
             }
         }
         return changed
@@ -968,7 +1111,6 @@ object D3D12RtGeometryPool {
     private fun recordLightingChanges(nodes: Set<Long>, reason: D3D12RtLightingChanges.Reason,
                                       incoming: D3D12RtLightingChanges.Region? = null) {
         if (nodes.isEmpty()) return
-        refreshSourceUniverse()
         lightingChanges.record(reason, nodes.asSequence().map { node ->
             val universe = currentSourceUniverse.bounds
             val bounds = universe?.let { initial ->
@@ -999,9 +1141,10 @@ object D3D12RtGeometryPool {
         val currentRevision = revision.get()
         cachedVersions?.takeIf { it.epoch == geometryEpoch && it.revision == currentRevision &&
             it.lightingRevision == lightingChanges.revision }?.let { return it }
+        refreshSpatialSources()
         val universe = currentSourceUniverse
         val data = ByteBuffer.allocate((records.size + missingVersions.size) * 16).order(ByteOrder.LITTLE_ENDIAN)
-        val outputs = ByteBuffer.allocate((records.size + missingVersions.size + missingSections.size) * 48)
+        val outputs = ByteBuffer.allocate((records.size + missingVersions.size + missingSections.size + unprovenOutputs.size) * OUTPUT_BYTES)
             .order(ByteOrder.LITTLE_ENDIAN)
         fun output(node: Long, layer: Int, version: Int, bounds: OutputBounds?) {
             outputs.putLong(node).putInt(layer).putInt(version).putInt(if (bounds == null) 0 else 1).putInt(0)
@@ -1018,10 +1161,9 @@ object D3D12RtGeometryPool {
             val support = producerManifests[key.sectionNode]?.takeIf { it.versions[key.layer] == missing.version }
             output(key.sectionNode, key.layer, missing.version, support?.support?.bounds(key.layer) ?: universe.bounds)
         }
-        for ([node, missing] in missingSections) {
-            val support = sourceRequirements[node]?.takeIf { it.version == missing.version }
-            output(node, SECTION_CAPTURE_LAYER, missing.version, support?.support?.bounds ?: universe.bounds)
-        }
+        appendSectionOutputs(outputs)
+        for ([node, proof] in unprovenOutputs)
+            output(node, SECTION_CAPTURE_LAYER, proof.version, proof.bounds ?: universe.bounds)
         data.flip()
         outputs.flip()
         return Versions(geometryEpoch, currentRevision, data.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN),
@@ -1033,6 +1175,7 @@ object D3D12RtGeometryPool {
         val universe = sourceUniverse.snapshot()
         if (universe !== currentSourceUniverse) {
             currentSourceUniverse = universe
+            lightingChanges.recordFullDomain(D3D12RtLightingChanges.Reason.RESOURCES.mask)
             revision.incrementAndGet()
         }
     }
@@ -1044,58 +1187,66 @@ object D3D12RtGeometryPool {
         return sourceInventory(versions)
     }
 
+    private fun refreshSpatialSources() {
+        for (node in dirtySpatialSources.toLongArray()) {
+            val currentLayers = buildList {
+                for (layer in D3D12SectionGeometry.Layer.entries) {
+                    val key = RecordKey(node, layer.ordinal)
+                    records[key]?.let { add(D3D12RtSpatialSources.Layer(it.layer, it.geometryVersion, true)) }
+                    missingVersions[key]?.let { add(D3D12RtSpatialSources.Layer(layer.ordinal, it.version, false)) }
+                }
+            }
+            if (node !in spatialStates && currentLayers.isEmpty() && node !in missingSections && node !in producerManifests) {
+                spatialSources.remove(node)
+                unprovenOutputs.remove(node)
+                updateCoverageTarget(node)
+                continue
+            }
+            val producer = producerManifests[node]?.takeIf { candidate ->
+                candidate.versions.size == currentLayers.size &&
+                    currentLayers.all { it.version != null && candidate.versions[it.layer] == it.version }
+            }
+            val source = sourceRequirements[node]?.takeIf { it.version == missingSections[node]?.version }
+            val support = (source?.support?.bounds ?: producer?.support?.sourceBounds)?.takeIf { bounds ->
+                currentLayers.all { layer ->
+                    if (!layer.captured) true else records[RecordKey(node, layer.layer)]?.outputBounds?.let { output ->
+                        output.minimumX >= bounds.minimumX && output.minimumY >= bounds.minimumY &&
+                            output.minimumZ >= bounds.minimumZ && output.maximumX <= bounds.maximumX &&
+                            output.maximumY <= bounds.maximumY && output.maximumZ <= bounds.maximumZ
+                    } == true
+                }
+            }
+            val requiredLayers = if (producer == null || producer.requiredLayers.all { required ->
+                currentLayers.any { it.layer == required }
+            }) currentLayers else (currentLayers + producer.requiredLayers.filter { required ->
+                currentLayers.none { it.layer == required }
+            }.map { D3D12RtSpatialSources.Layer(it, null, false) }).sortedBy { it.layer }
+            val state = spatialStates[node]?.code ?: 0
+            val scope = source?.support?.scope ?: producer?.support?.scope
+            val captureVersion = missingSections[node]?.version
+            val previous = spatialSources[node]
+            if (previous == null || previous.let {
+                it.state != state || it.bounds != support || it.scope !== scope ||
+                    it.captureVersion != captureVersion || it.layers != requiredLayers || it.layerSetKnown != (producer != null)
+            }) spatialSources[node] = D3D12RtSpatialSources.Source(
+                node, state, support, scope, captureVersion, requiredLayers, producer != null)
+            val unproven = state == SpatialState.LOADED_UNPROVEN.code && captureVersion == null &&
+                (producer == null || support == null || scope?.epoch != geometryEpoch || requiredLayers.any { it.version == null })
+            if (unproven) {
+                val old = unprovenOutputs[node]
+                unprovenOutputs[node] = UnprovenOutput(old?.version ?: ++nextSectionCaptureVersion, support)
+            } else unprovenOutputs.remove(node)
+            updateCoverageTarget(node)
+        }
+        dirtySpatialSources.clear()
+    }
+
     private fun sourceInventory(versions: Versions): D3D12RtSpatialSources.Snapshot {
         cachedSpatialSources?.takeIf { it.epoch == versions.epoch && it.revision == versions.revision }?.let { return it }
-        val frozenRecords = records.toMap()
-        val frozenMissingLayers = missingVersions.toMap()
-        val frozenMissingSections = Long2ObjectOpenHashMap(missingSections)
-        val frozenProducers = Long2ObjectOpenHashMap(producerManifests)
-        val frozenSupports = Long2ObjectOpenHashMap(sourceRequirements)
-        val frozenStates = Long2ObjectOpenHashMap(spatialStates)
-        return D3D12RtSpatialSources.Snapshot(versions.epoch, versions.revision, {
-            val layers = Long2ObjectOpenHashMap<MutableList<D3D12RtSpatialSources.Layer>>()
-            for (record in frozenRecords.values) {
-                layers.getOrPut(record.sectionNode) { mutableListOf() } +=
-                    D3D12RtSpatialSources.Layer(record.layer, record.geometryVersion, true)
-            }
-            for ([key, missing] in frozenMissingLayers) {
-                layers.getOrPut(key.sectionNode) { mutableListOf() } +=
-                    D3D12RtSpatialSources.Layer(key.layer, missing.version, false)
-            }
-            val nodes = LongOpenHashSet().apply {
-                addAll(frozenStates.keys)
-                addAll(layers.keys)
-                addAll(frozenMissingSections.keys)
-                addAll(frozenProducers.keys)
-            }
-            nodes.toLongArray().apply { sort() }.map { node ->
-                val currentLayers = layers[node].orEmpty().sortedBy { it.layer }
-                val producer = frozenProducers[node]?.takeIf { candidate ->
-                    candidate.versions == currentLayers.associate { it.layer to it.version }
-                }
-                val source = frozenSupports[node]?.takeIf { it.version == frozenMissingSections[node]?.version }
-                val support = (source?.support?.bounds ?: producer?.support?.sourceBounds)?.takeIf { bounds ->
-                    currentLayers.all { layer ->
-                        if (!layer.captured) true else frozenRecords[RecordKey(node, layer.layer)]?.outputBounds?.let { output ->
-                            output.minimumX >= bounds.minimumX && output.minimumY >= bounds.minimumY &&
-                                output.minimumZ >= bounds.minimumZ && output.maximumX <= bounds.maximumX &&
-                                output.maximumY <= bounds.maximumY && output.maximumZ <= bounds.maximumZ
-                        } == true
-                    }
-                }
-                val requiredLayers = currentLayers.toMutableList()
-                if (producer != null) {
-                    for (layer in producer.requiredLayers) {
-                        if (currentLayers.none { it.layer == layer }) {
-                            requiredLayers += D3D12RtSpatialSources.Layer(layer, null, false)
-                        }
-                    }
-                }
-                D3D12RtSpatialSources.Source(node, frozenStates[node]?.code ?: 0, support,
-                    source?.support?.scope ?: producer?.support?.scope, frozenMissingSections[node]?.version,
-                    requiredLayers.sortedBy { it.layer }, producer != null)
-            }
-        }, currentSourceUniverse).also { cachedSpatialSources = it }
+        refreshSpatialSources()
+        val sources = java.util.List.copyOf(spatialSources.values)
+        return D3D12RtSpatialSources.Snapshot(versions.epoch, versions.revision, { sources }, currentSourceUniverse)
+            .also { cachedSpatialSources = it }
     }
 
     data class Coverage(val versions: Versions, val nodes: ByteBuffer, val spatial: ByteBuffer,
@@ -1104,13 +1255,66 @@ object D3D12RtGeometryPool {
                         val region: D3D12RtSpatialDirectory.Region, val request: D3D12RtFullDomainProfile.Request? = null)
 
     private fun spatialGrid(region: D3D12RtSpatialDirectory.Region,
-                            sources: D3D12RtSpatialSources.Snapshot, targets: Set<Long>): D3D12RtSpatialDirectory.Build {
+                            sources: D3D12RtSpatialSources.Snapshot,
+                            targets: D3D12RtSpatialDirectory.Targets): D3D12RtSpatialDirectory.Build {
         cachedSpatialGrid?.takeIf { it.sources === sources && it.region == region && it.targets == targets }?.let {
             return it.build
         }
         val frozen = spatialDirectory.build(region, sources, targets)
-        cachedSpatialGrid = SpatialGrid(sources, region, LongOpenHashSet(targets), frozen)
+        cachedSpatialGrid = SpatialGrid(sources, region, targets, frozen)
         return frozen
+    }
+
+    private fun selectsTarget(record: Record, selection: TargetSelection): Boolean =
+        if (selection.primary == null)
+            outputDistanceSquared(record, selection.centerX, selection.centerY, selection.centerZ) <=
+                selection.radius.toDouble() * selection.radius
+        else outputIntersects(record, selection.primary)
+
+    private fun selectsObligation(node: Long, selection: TargetSelection): Boolean {
+        val bounds = spatialSources[node]?.bounds ?: selection.universe.bounds ?: return true
+        return outputIntersects(node, bounds, selection.query)
+    }
+
+    private fun updateCoverageTarget(node: Long) {
+        val selection = targetSelection ?: return
+        val obligation = node in invalidSections || node in unprovenOutputs || D3D12SectionGeometry.Layer.entries.any { layer ->
+            RecordKey(node, layer.ordinal) in missingVersions
+        }
+        val required = obligation && selectsObligation(node, selection) || D3D12SectionGeometry.Layer.entries.any { layer ->
+            val key = RecordKey(node, layer.ordinal)
+            records[key]?.let { selectsTarget(it, selection) } == true
+        }
+        val changed = if (required) targetMembers.add(node) else targetMembers.remove(node)
+        if (changed) targetSnapshot = null
+    }
+
+    private fun coverageTargets(selection: TargetSelection): TargetSnapshot {
+        if (targetSelection != selection) {
+            val members = LongOpenHashSet()
+            for (record in records.values) if (selectsTarget(record, selection)) members.add(record.sectionNode)
+            for (node in invalidSections) if (selectsObligation(node, selection)) members.add(node)
+            for (node in unprovenOutputs.keys) if (selectsObligation(node, selection)) members.add(node)
+            for (key in missingVersions.keys) if (selectsObligation(key.sectionNode, selection)) members.add(key.sectionNode)
+            if (members != targetMembers) {
+                targetMembers = members
+                targetSnapshot = null
+            }
+            targetSelection = selection
+        }
+        return targetSnapshot ?: run {
+            val bytes = ByteBuffer.allocate(targetMembers.size * 8).order(ByteOrder.LITTLE_ENDIAN)
+            for (node in targetMembers.toLongArray().apply { sort() }) bytes.putLong(node)
+            bytes.flip()
+            TargetSnapshot(D3D12RtSpatialDirectory.Targets.freeze(targetMembers),
+                bytes.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)).also { targetSnapshot = it }
+        }
+    }
+
+    private fun clearCoverageTargets() {
+        targetSelection = null
+        targetMembers = LongOpenHashSet()
+        targetSnapshot = null
     }
 
     private fun outputBounds(vertex: ByteBuffer): OutputBounds? {
@@ -1150,12 +1354,16 @@ object D3D12RtGeometryPool {
 
     private fun outputIntersects(record: Record, region: D3D12RtSpatialDirectory.Region): Boolean {
         val bounds = record.outputBounds ?: return true
+        return outputIntersects(record.sectionNode, bounds, region)
+    }
+
+    private fun outputIntersects(node: Long, bounds: OutputBounds, region: D3D12RtSpatialDirectory.Region): Boolean {
         fun overlaps(origin: Int, lower: Float, upper: Float, minimum: Int, size: Int): Boolean =
             origin.toDouble() + lower <= (minimum.toLong() + size) * 16.0 &&
                 origin.toDouble() + upper >= minimum.toLong() * 16.0
-        return overlaps(record.originX, bounds.minimumX, bounds.maximumX, region.minimumX, region.sizeX) &&
-            overlaps(record.originY, bounds.minimumY, bounds.maximumY, region.minimumY, region.sizeY) &&
-            overlaps(record.originZ, bounds.minimumZ, bounds.maximumZ, region.minimumZ, region.sizeZ)
+        return overlaps(SectionPos.x(node) * 16, bounds.minimumX, bounds.maximumX, region.minimumX, region.sizeX) &&
+            overlaps(SectionPos.y(node) * 16, bounds.minimumY, bounds.maximumY, region.minimumY, region.sizeY) &&
+            overlaps(SectionPos.z(node) * 16, bounds.minimumZ, bounds.maximumZ, region.minimumZ, region.sizeZ)
     }
 
     @JvmStatic
@@ -1179,19 +1387,11 @@ object D3D12RtGeometryPool {
             it.versions === versions && it.centerX == centerX && it.centerY == centerY &&
                 it.centerZ == centerZ && it.radius == radius && it.region == region && it.request == request
         }?.let { return it }
-        val nodes = LongOpenHashSet()
-        val limit = radius.toDouble() * radius
-        for (record in records.values) {
-            if (if (request == null) outputDistanceSquared(record, centerX, centerY, centerZ) <= limit
-                else outputIntersects(record, request.primary)) nodes += record.sectionNode
-        }
-        nodes += invalidSections
-        for (key in missingVersions.keys) nodes.add(key.sectionNode)
-        val targets = ByteBuffer.allocate(nodes.size * 8).order(ByteOrder.LITTLE_ENDIAN)
-        for (node in nodes.toLongArray().apply { sort() }) targets.putLong(node)
-        targets.flip()
-        val directory = spatialGrid(region, sources, nodes)
-        return Coverage(versions, targets.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN),
+        val selection = if (request == null) TargetSelection(centerX, centerY, centerZ, radius, null, region, sources.universe)
+            else TargetSelection(0f, 0f, 0f, 0f, request.primary, region, sources.universe)
+        val targets = coverageTargets(selection)
+        val directory = spatialGrid(region, sources, targets.members)
+        return Coverage(versions, targets.bytes.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN),
             directory.bytes.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN),
             centerX, centerY, centerZ, radius, sources, directory.update, region, request)
             .also { cachedCoverage = it }
@@ -1454,6 +1654,12 @@ object D3D12RtGeometryPool {
                                        val required: Boolean, val cachedRecords: List<Record>,
                                        val cachedSlice: MirrorSlice?, val demands: Map<Long, ResidencyDemand>)
 
+    private data class MirrorGroup(val node: Long, val records: List<Record>, val demandOrder: Int,
+                                   val preferredOrder: Int, val distanceSquared: Double,
+                                   val vertexBytes: Long, val indexBytes: Long, val quadBytes: Long) {
+        val byteCount: Long = vertexBytes + indexBytes + quadBytes + records.size * RECORD_BYTES.toLong()
+    }
+
     private fun mirrorSelection(): MirrorSelection = synchronized(D3D12RtGeometryPool::class.java) {
         refreshSourceUniverse()
         pruneResidencyDemands(System.nanoTime())
@@ -1483,12 +1689,20 @@ object D3D12RtGeometryPool {
                              preferredNodes: Set<Long>): Residency {
         val demandOrder = selection.demands.keys.withIndex().associate { [index, node] -> node to index }
         val intersecting = selection.records.filter { outputIntersects(it, request.primary) }
-            .mapTo(hashSetOf()) { it.sectionNode }
-        val groups = selection.records.filter { it.sectionNode in intersecting }.groupBy { it.sectionNode }
-            .values.sortedWith(compareBy<List<Record>> { demandOrder[it.first().sectionNode] ?: Int.MAX_VALUE }
-                .thenBy { if (it.first().sectionNode in preferredNodes) 0 else 1 }.thenBy { group ->
-                group.minOf { outputDistanceSquared(it, x, y, z) }
-            }.thenBy { it.first().sectionNode })
+            .mapTo(LongOpenHashSet()) { it.sectionNode }
+        val grouped = Long2ObjectOpenHashMap<MutableList<Record>>()
+        for (record in selection.records) {
+            if (record.sectionNode in intersecting) grouped.getOrPut(record.sectionNode) { mutableListOf() }.add(record)
+        }
+        val groups = grouped.values.map { records ->
+            val node = records.first().sectionNode
+            MirrorGroup(node, records, demandOrder[node] ?: Int.MAX_VALUE, if (node in preferredNodes) 0 else 1,
+                records.minOf { outputDistanceSquared(it, x, y, z) },
+                records.sumOf { pad4(it.vertexCount.toLong() * STRIDE).toLong() },
+                records.sumOf { pad4(it.indexCount.toLong() * it.indexStride).toLong() },
+                records.sumOf { pad4(it.quadCount.toLong() * MATERIAL_BYTES).toLong() })
+        }.sortedWith(compareBy<MirrorGroup> { it.demandOrder }.thenBy { it.preferredOrder }
+            .thenBy { it.distanceSquared }.thenBy { it.node })
         val admittedDemands = mutableMapOf<Long, Long>()
         val chosen = ArrayList<Record>(minOf(selection.records.size, budget.recordLimit))
         val limits = mutableMapOf<ResidencyLimit, Int>()
@@ -1499,32 +1713,28 @@ object D3D12RtGeometryPool {
         var requestedRecords = 0
         var selectedGroups = 0
         for (group in groups) {
-            val groupVertices = group.sumOf { pad4(it.vertexCount.toLong() * STRIDE).toLong() }
-            val groupIndices = group.sumOf { pad4(it.indexCount.toLong() * it.indexStride).toLong() }
-            val groupQuads = group.sumOf { pad4(it.quadCount.toLong() * MATERIAL_BYTES).toLong() }
-            val groupBytes = groupVertices + groupIndices + groupQuads + group.size * RECORD_BYTES.toLong()
-            requestedBytes += groupBytes
-            requestedRecords += group.size
+            requestedBytes += group.byteCount
+            requestedRecords += group.records.size
             val exceeded = buildSet {
-                if (group.size > budget.recordLimit - chosen.size) add(ResidencyLimit.RECORDS)
-                if (vertexBytes + indexBytes + quadBytes + chosen.size * RECORD_BYTES.toLong() + groupBytes > budget.byteLimit)
+                if (group.records.size > budget.recordLimit - chosen.size) add(ResidencyLimit.RECORDS)
+                if (vertexBytes + indexBytes + quadBytes + chosen.size * RECORD_BYTES.toLong() + group.byteCount > budget.byteLimit)
                     add(ResidencyLimit.PAYLOAD_BYTES)
-                if (vertexBytes + groupVertices > budget.vertexCapacity) add(ResidencyLimit.VERTEX_ARENA)
-                if (indexBytes + groupIndices > budget.indexCapacity) add(ResidencyLimit.INDEX_ARENA)
-                if (quadBytes + groupQuads > budget.quadCapacity) add(ResidencyLimit.QUAD_ARENA)
+                if (vertexBytes + group.vertexBytes > budget.vertexCapacity) add(ResidencyLimit.VERTEX_ARENA)
+                if (indexBytes + group.indexBytes > budget.indexCapacity) add(ResidencyLimit.INDEX_ARENA)
+                if (quadBytes + group.quadBytes > budget.quadCapacity) add(ResidencyLimit.QUAD_ARENA)
             }
             if (exceeded.isNotEmpty()) {
                 for (reason in exceeded) limits[reason] = (limits[reason] ?: 0) + 1
                 continue
             }
-            chosen.addAll(group)
-            selection.demands[group.first().sectionNode]?.let { demand ->
-                admittedDemands[group.first().sectionNode] = demand.identity
+            chosen.addAll(group.records)
+            selection.demands[group.node]?.let { demand ->
+                admittedDemands[group.node] = demand.identity
             }
             selectedGroups++
-            vertexBytes += groupVertices
-            indexBytes += groupIndices
-            quadBytes += groupQuads
+            vertexBytes += group.vertexBytes
+            indexBytes += group.indexBytes
+            quadBytes += group.quadBytes
         }
         val required = intersecting.isNotEmpty() || selection.required
         val slice = if (required) mirrorSlice(selection, chosen) else null
@@ -1691,7 +1901,11 @@ object D3D12RtGeometryPool {
         lightingChanges.reset(epoch)
         cachedVersions = null
         cachedSpatialSources = null
+        spatialSources.clear()
+        unprovenOutputs.clear()
+        dirtySpatialSources.clear()
         cachedCoverage = null
+        clearCoverageTargets()
         cachedSpatialGrid = null
         spatialDirectory.clear()
         sectionPublication = null
@@ -1705,6 +1919,7 @@ object D3D12RtGeometryPool {
         records.clear()
         missingVersions.clear()
         missingSections.clear()
+        clearSectionOutputs()
         producerManifests.clear()
         sourceRequirements.clear()
         captureAgeDirty = true

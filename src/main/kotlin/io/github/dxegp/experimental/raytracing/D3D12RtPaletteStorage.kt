@@ -15,6 +15,7 @@ object D3D12RtPaletteStorage {
     private val storageField = dataField.type.getDeclaredField("storage").apply { isAccessible = true }
     private val inputs = WeakHashMap<BitStorage, Input>()
     private val arrayInputs = WeakHashMap<LongArray, Input>()
+    private val trackedStorage = WeakHashMap<BitStorage, Input>()
     private class PackedKey(packed: PalettedContainerRO.PackedData<*>, queue: ReferenceQueue<PalettedContainerRO.PackedData<*>>? = null) :
         WeakReference<PalettedContainerRO.PackedData<*>>(packed, queue) {
         private val identityHash = System.identityHashCode(packed)
@@ -27,6 +28,7 @@ object D3D12RtPaletteStorage {
 
     internal class Input(var version: Long = 0L, var active: Int = 0, var failureRevision: Long = 0L,
                          var failed: Boolean = false) {
+        var sources = 0
         val available: Boolean get() = active == 0 && !failed
     }
 
@@ -52,17 +54,62 @@ object D3D12RtPaletteStorage {
     private fun supported(storage: BitStorage): Boolean = storage.javaClass == SimpleBitStorage::class.java ||
         storage.javaClass == ZeroBitStorage::class.java
 
+    @JvmStatic
+    @Synchronized
     internal fun available(storage: BitStorage?): Boolean = storage != null && supported(storage) &&
         D3D12RtPaletteArrays.available(storage) && input(storage).available
+
+    @JvmStatic
+    @Synchronized
+    internal fun track(storage: BitStorage) {
+        if (!supported(storage) || storage in trackedStorage) return
+        val input = input(storage)
+        trackedStorage[storage] = input
+        input.sources++
+    }
+
+    @JvmStatic
+    @Synchronized
+    internal fun untrack(storage: BitStorage) {
+        val input = trackedStorage.remove(storage) ?: return
+        check(input.sources > 0)
+        input.sources--
+    }
+
+    @JvmStatic
+    @Synchronized
+    internal fun clearTracking() {
+        for (input in trackedStorage.values) {
+            check(input.sources > 0)
+            input.sources--
+        }
+        trackedStorage.clear()
+    }
+
+    @JvmStatic
+    @Synchronized
+    internal fun hasSources(mutation: Mutation): Boolean = mutation.input.sources != 0
+
+    @JvmStatic
+    @Synchronized
+    internal fun finishUntracked(mutation: Mutation, completed: Boolean): Boolean {
+        if (hasSources(mutation)) return false
+        finish(mutation, completed)
+        return true
+    }
 
     private fun input(storage: BitStorage): Input = D3D12RtPaletteArrays.current(storage)?.let {
         arrayInputs.getOrPut(it, ::Input)
     } ?: inputs.getOrPut(storage, ::Input)
 
+    @JvmStatic
+    @Synchronized
     internal fun begin(storage: BitStorage, recover: Boolean): Mutation {
         return begin(storage, D3D12RtPaletteArrays.current(storage), input(storage), recover)
     }
 
+    @JvmStatic
+    @Synchronized
     internal fun beginArray(array: LongArray, recover: Boolean): Mutation =
         begin(null, array, arrayInputs.getOrPut(array, ::Input), recover)
 
@@ -73,6 +120,8 @@ object D3D12RtPaletteStorage {
         return Mutation(storage, array, input, input.version, input.failureRevision, canRecover)
     }
 
+    @JvmStatic
+    @Synchronized
     internal fun finish(mutation: Mutation, completed: Boolean) {
         val input = mutation.input
         check(input.active > 0)
@@ -87,6 +136,8 @@ object D3D12RtPaletteStorage {
         input.version++
     }
 
+    @JvmStatic
+    @Synchronized
     internal fun fail(storage: BitStorage) {
         val input = input(storage)
         input.failureRevision++
@@ -94,16 +145,22 @@ object D3D12RtPaletteStorage {
         input.failed = true
     }
 
+    @JvmStatic
+    @Synchronized
     internal fun beginCopy(storage: BitStorage): Copy {
         val input = input(storage)
         return Copy(storage, input, input.version, available(storage))
     }
 
+    @JvmStatic
+    @Synchronized
     internal fun finishCopy(copy: Copy, result: BitStorage) {
         D3D12RtPaletteArrays.ownCopy(copy.storage, result)
         finishCopyInto(copy, result)
     }
 
+    @JvmStatic
+    @Synchronized
     internal fun finishCopyInto(copy: Copy, result: BitStorage) {
         if (!supported(result) || !matches(copy)) fail(result)
     }
@@ -111,12 +168,16 @@ object D3D12RtPaletteStorage {
     private fun matches(copy: Copy): Boolean = copy.available && input(copy.storage) === copy.input &&
         available(copy.storage) && copy.input.version == copy.version
 
+    @JvmStatic
+    @Synchronized
     internal fun beginPack(palette: PalettedContainer<*>, strategy: Strategy<*>? = null): Pack? = current(palette)?.let {
         Pack(palette, dataField.get(palette), beginCopy(it),
             D3D12RtPaletteEntries.current(palette)?.let(D3D12RtPaletteEntries::beginCopy),
             strategy?.let { source -> D3D12RtIdMaps.beginCopy(D3D12RtIdMaps.strategyRegistry(source)) })
     }
 
+    @JvmStatic
+    @Synchronized
     internal fun finishPack(pack: Pack?, result: PalettedContainerRO.PackedData<*>) {
         reapPacked()
         val sameData = pack != null && dataField.get(pack.palette) === pack.data
@@ -125,6 +186,8 @@ object D3D12RtPaletteStorage {
             sameData && pack.registry?.let(D3D12RtIdMaps::matches) != false, result)
     }
 
+    @JvmStatic
+    @Synchronized
     internal fun finishUnpack(packed: PalettedContainerRO.PackedData<*>, palette: PalettedContainer<*>) {
         reapPacked()
         if (PackedKey(packed) in failedPacked) current(palette)?.let(::fail)

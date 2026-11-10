@@ -121,7 +121,7 @@ object D3D12RtMaterialTable {
     fun isReady(): Boolean = snapshot != null
 
     private fun tick() {
-        if (!D3D12Settings.rtEnabled) {
+        if (!D3D12Settings.rtEnabled || Minecraft.getInstance().level == null) {
             return
         }
         val atlas = blocksAtlas() ?: return
@@ -512,6 +512,7 @@ object D3D12RtMaterialTable {
     @JvmStatic
     fun clear() {
         snapshot = null
+        D3D12RtMaterialMaps.clear()
         synchronized(entryLock) {
             materialIds.clear()
             entries.clear()

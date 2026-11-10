@@ -6,12 +6,16 @@ import io.github.dxegp.experimental.raytracing.D3D12RtMaterialTable
 import io.github.dxegp.experimental.raytracing.D3D12RtModelSupport
 import io.github.dxegp.experimental.raytracing.D3D12RtSourceUniverse
 import io.github.dxegp.experimental.raytracing.D3D12RtCompilerInputs
+import io.github.dxegp.experimental.raytracing.D3D12SectionRegionState
 import io.github.dxegp.experimental.raytracing.D3D12RtBlockExtensions
 import io.github.dxegp.experimental.raytracing.D3D12RtBlockTintInputs
 import io.github.dxegp.experimental.raytracing.D3D12RtLightInputs
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap
+import it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet
+import it.unimi.dsi.fastutil.longs.LongArrayList
 import net.minecraft.world.level.lighting.SkyLightSectionStorage
 import io.github.dxegp.experimental.raytracing.D3D12RtLightArrays
 import io.github.dxegp.experimental.raytracing.D3D12RtSectionArrays
@@ -36,6 +40,7 @@ import net.minecraft.core.BlockPos
 import net.minecraft.client.multiplayer.ClientChunkCache
 import net.minecraft.client.multiplayer.ClientLevel
 import net.minecraft.client.renderer.chunk.SectionCompiler
+import net.minecraft.client.renderer.chunk.RenderSectionRegion
 import net.minecraft.client.renderer.block.BlockAndTintGetter
 import net.minecraft.client.renderer.chunk.SectionRenderDispatcher
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer
@@ -163,6 +168,27 @@ object D3D12SectionGeometry {
     )
 
     private val pendingUploads = IdentityHashMap<Any, PendingUpload>()
+    private val pendingSections = Long2ObjectOpenHashMap<IdentityHashMap<Any, PendingUpload>>()
+
+    private fun removePendingUpload(meshIdentity: Any): PendingUpload? {
+        val pending = pendingUploads.remove(meshIdentity) ?: return null
+        pendingSections[pending.sectionNode]?.let { uploads ->
+            uploads.remove(meshIdentity)
+            if (uploads.isEmpty()) pendingSections.remove(pending.sectionNode)
+        }
+        return pending
+    }
+
+    private fun removePendingSection(sectionNode: Long) {
+        val uploads = pendingSections.remove(sectionNode) ?: return
+        for (meshIdentity in uploads.keys) pendingUploads.remove(meshIdentity)
+    }
+
+    private fun clearPendingUploads() {
+        pendingUploads.clear()
+        pendingSections.clear()
+    }
+
     private class MeshKey(mesh: Any, queue: ReferenceQueue<Any>? = null) : WeakReference<Any>(mesh, queue) {
         private val identityHash = System.identityHashCode(mesh)
         override fun hashCode(): Int = identityHash
@@ -179,6 +205,7 @@ object D3D12SectionGeometry {
     @Volatile
     private var epoch: Int = 0
     private var generation: Long = 0
+    @Volatile
     private var levelIdentity: Any? = null
     private class BlockSource(val node: Long, val chunk: LevelChunk, val section: LevelChunkSection, val index: Int) {
         val palette = section.states
@@ -194,7 +221,7 @@ object D3D12SectionGeometry {
     }
     private data class LoadedChunk(val identity: Any, val nodes: LongArray, val blockSources: List<BlockSource>,
                                    val biomeSources: List<BiomeSource>)
-    private val loadedChunks = mutableMapOf<Long, LoadedChunk>()
+    private val loadedChunks = Long2ObjectLinkedOpenHashMap<LoadedChunk>()
     private val blockPaletteSources = IdentityHashMap<PalettedContainer<*>, MutableSet<BlockSource>>()
     private val blockSectionSources = IdentityHashMap<LevelChunkSection, MutableSet<BlockSource>>()
     private val biomePaletteSources = IdentityHashMap<PalettedContainer<*>, MutableSet<BiomeSource>>()
@@ -226,14 +253,15 @@ object D3D12SectionGeometry {
         internal fun matchesInputs(versions: Map<Long, Long>): Boolean =
             inputs.all { [node, version] -> (versions[node] ?: 0L) == version }
     }
-    private val compileScopes = mutableMapOf<Long, CompileScope>()
-    private val lightReaders = mutableMapOf<Long, MutableSet<Long>>()
+    private val compileScopes = Long2ObjectLinkedOpenHashMap<CompileScope>()
+    private val lightReaders = Long2ObjectLinkedOpenHashMap<MutableSet<Long>>()
+    private val skyLightReaders = IdentityHashMap<LayerLightSectionStorage<*>, LongOpenHashSet>()
     private val lightLayerReaders = IdentityHashMap<DataLayer, MutableSet<Long>>()
     private val lightQueueReaders = IdentityHashMap<LayerLightSectionStorage<*>, MutableMap<Long, MutableSet<Long>>>()
     private val lightArrayReaders = IdentityHashMap<ByteArray, MutableSet<DataLayer>>()
     private val lightLayerArrays = IdentityHashMap<DataLayer, ByteArray>()
     private val tintReaders = IdentityHashMap<BlockTintCache, MutableMap<Long, MutableSet<CompileScope>>>()
-    private val biomeReaders = mutableMapOf<Long, MutableSet<CompileScope>>()
+    private val biomeReaders = Long2ObjectLinkedOpenHashMap<MutableSet<CompileScope>>()
     private val biomeInfoReaders = IdentityHashMap<ModifiableBiomeInfo, MutableSet<CompileScope>>()
     private val colorTableReaders = Array(D3D12RtColorTables.COUNT) { linkedSetOf<CompileScope>() }
     private val blockExtensionReaders = IdentityHashMap<Block, MutableSet<CompileScope>>()
@@ -256,7 +284,7 @@ object D3D12SectionGeometry {
     private val chunkRadius = chunkStorage.type.getDeclaredField("chunkRadius").apply { isAccessible = true }
     private val chunkCenterX = chunkStorage.type.getDeclaredField("viewCenterX").apply { isAccessible = true }
     private val chunkCenterZ = chunkStorage.type.getDeclaredField("viewCenterZ").apply { isAccessible = true }
-    private val inputVersions = mutableMapOf<Long, Long>()
+    private val inputVersions = Long2ObjectLinkedOpenHashMap<Long>()
     private var modelResources = ModelResources(null, null)
     private var compilerIdentity: SectionCompiler? = null
     private var compilerRevision = 0L
@@ -342,7 +370,7 @@ object D3D12SectionGeometry {
             for (chunk in loadedChunks.values) addAll(chunk.nodes.asList())
             addAll(compileScopes.keys)
             addAll(sections.keys)
-            addAll(pendingUploads.values.map { it.sectionNode })
+            addAll(pendingSections.keys)
         }.toLongArray()
         val resources = ModelResources(blockModels, fluidModels)
         D3D12RtGeometryPool.invalidateModelResources(nodes, resources.sourceUniverse) {
@@ -351,6 +379,7 @@ object D3D12SectionGeometry {
             contentRevision++
             compileScopes.clear()
             lightReaders.clear()
+            skyLightReaders.clear()
             lightLayerReaders.clear()
             lightQueueReaders.clear()
             lightArrayReaders.clear()
@@ -360,7 +389,7 @@ object D3D12SectionGeometry {
             biomeInfoReaders.clear()
             colorTableReaders.forEach { it.clear() }
             blockExtensionReaders.clear()
-            pendingUploads.clear()
+            clearPendingUploads()
             sections.clear()
             D3D12RtMaterialTable.clear()
         }
@@ -371,9 +400,12 @@ object D3D12SectionGeometry {
     @Synchronized
     fun observeLevel(level: Any?): Boolean {
         if (levelIdentity === level) return false
+        D3D12RtPaletteStorage.clearTracking()
+        D3D12RtPaletteEntries.clearTracking()
         sections.clear()
         compileScopes.clear()
         lightReaders.clear()
+        skyLightReaders.clear()
         lightLayerReaders.clear()
         lightQueueReaders.clear()
         lightArrayReaders.clear()
@@ -407,7 +439,7 @@ object D3D12SectionGeometry {
         inputVersions.clear()
         loadedChunks.clear()
         contentRevision++
-        pendingUploads.clear()
+        clearPendingUploads()
         meshUploads.clear()
         reapMeshUploads()
         levelIdentity = level
@@ -438,6 +470,7 @@ object D3D12SectionGeometry {
         val lightInputs = D3D12RtLightInputs.capture(levelIdentity, nodes)
         if (lightInputs?.matches(levelIdentity) == false) return null
         for (node in nodes) lightReaders.getOrPut(SectionPos.getZeroNode(node), ::linkedSetOf).add(sectionNode)
+        lightInputs?.skyStorage?.let { skyLightReaders.getOrPut(it, ::LongOpenHashSet).add(sectionNode) }
         for (layer in lightInputs?.layers.orEmpty()) {
             lightLayerReaders.getOrPut(layer, ::linkedSetOf).add(sectionNode)
             D3D12RtLightArrays.current(layer)?.let { linkLightArray(layer, it) }
@@ -599,7 +632,7 @@ object D3D12SectionGeometry {
     @JvmStatic
     @Synchronized
     fun recordTintRead(scope: CompileScope, cache: BlockTintCache, column: Long) {
-        if (!isCurrent(scope)) return
+        if (!isTrackingScope(scope)) return
         if (!D3D12RtTintInputs.sourceCurrent(cache, levelIdentity) || column in biomePublications ||
             hasUnavailablePublicationInput(biomeInputs, column) || hasUnavailableChunkInput(column) ||
             hasUnavailableBlockTintInput(column) || hasUnavailableBiomeContentInput(column)) {
@@ -613,7 +646,7 @@ object D3D12SectionGeometry {
     @JvmStatic
     @Synchronized
     fun recordBiomeRead(scope: CompileScope, section: LevelChunkSection) {
-        if (!isCurrent(scope)) return
+        if (!isTrackingScope(scope)) return
         val sources = biomeSectionSources[section]?.filter(::isCurrentBiomeSource).orEmpty()
         if (sources.isEmpty() || sources.any { source ->
                 val column = ChunkPos.pack(SectionPos.x(source.node), SectionPos.z(source.node))
@@ -633,7 +666,7 @@ object D3D12SectionGeometry {
     @JvmStatic
     @Synchronized
     fun recordBiomeInfoRead(scope: CompileScope, owner: ModifiableBiomeInfo) {
-        if (!isCurrent(scope)) return
+        if (!isTrackingScope(scope)) return
         if (!D3D12RtBiomeInputs.available(owner)) {
             revokeCompiledInputs(longArrayOf(scope.sectionNode), Runnable {})
             return
@@ -676,7 +709,7 @@ object D3D12SectionGeometry {
     @JvmStatic
     @Synchronized
     fun recordLightRead(scope: CompileScope, storage: LayerLightSectionStorage<*>, node: Long, updating: Boolean) {
-        if (!isCurrent(scope)) return
+        if (!isTrackingScope(scope)) return
         val read = scope.lightInputs?.record(storage, node, updating)
         if (read?.available != true) {
             revokeCompiledInputs(longArrayOf(scope.sectionNode), Runnable {})
@@ -693,10 +726,7 @@ object D3D12SectionGeometry {
     @JvmStatic
     @Synchronized
     fun recordLightLayerRead(scope: CompileScope, storage: LayerLightSectionStorage<*>, node: Long) {
-        if (!isCurrent(scope)) {
-            if (compileScopes[scope.sectionNode] === scope) revokeCompiledInputs(longArrayOf(scope.sectionNode), Runnable {})
-            return
-        }
+        if (!isTrackingScope(scope)) return
         val read = scope.lightInputs?.recordLayer(storage, node)
         if (read?.available != true) {
             revokeCompiledInputs(longArrayOf(scope.sectionNode), Runnable {})
@@ -965,7 +995,7 @@ object D3D12SectionGeometry {
         val failureRevision = beginPublicationInput(chunkInputs, column)
         val blockInputs = nodes.map { BlockInputRevision(it, beginPublicationInput(blockStateInputs, it),
             beginPublicationInput(blockSectionInputs, it)) }
-        val publication = ChunkPublication(biome, (nodes.asList() + retired.asList()).distinct().toLongArray(),
+        val publication = ChunkPublication(biome, LongOpenHashSet(nodes).apply { addAll(LongOpenHashSet(retired)) }.toLongArray(),
             column, failureRevision, blockInputs)
         try {
             invalidateChunkInputs(publication)
@@ -1026,7 +1056,7 @@ object D3D12SectionGeometry {
 
     private fun invalidateChunkInputs(publication: ChunkPublication) {
         val dependent = dependentSections(publication.inputs)
-        val affected = (publication.inputs.asList() + dependent.asList()).distinct().toLongArray()
+        val affected = LongOpenHashSet(publication.inputs).apply { addAll(LongOpenHashSet(dependent)) }.toLongArray()
         D3D12RtGeometryPool.invalidateSections(affected) { revokeSections(publication.inputs, dependent) }
     }
 
@@ -1244,63 +1274,72 @@ object D3D12SectionGeometry {
     }
 
     @JvmStatic
-    @Synchronized
     fun publishSinglePaletteEntry(entries: SingleValuePalette<*>, value: Any?, operation: Runnable) {
-        if (D3D12RtPaletteEntries.sameSingleValue(entries, value)) operation.run()
-        else beginPaletteEntryMutation(entries, false).use { publication ->
-            operation.run()
-            publication.complete()
+        if (D3D12RtPaletteEntries.publishUntrackedSingle(entries, value, operation)) return
+        synchronized(D3D12SectionGeometry::class.java) {
+            if (D3D12RtPaletteEntries.sameSingleValue(entries, value)) operation.run()
+            else beginPaletteEntryMutation(D3D12RtPaletteEntries.begin(entries, false)).use { publication ->
+                operation.run()
+                publication.complete()
+            }
         }
     }
 
     @JvmStatic
-    @Synchronized
-    fun beginPaletteEntryAppend(entries: Palette<*>): PaletteEntryPublication = beginPaletteEntryMutation(entries, false)
+    fun beginPaletteEntryAppend(entries: Palette<*>): PaletteEntryPublication =
+        beginPaletteEntryMutation(D3D12RtPaletteEntries.begin(entries, false))
 
     @JvmStatic
-    @Synchronized
-    fun beginPaletteEntryRead(entries: Palette<*>): PaletteEntryPublication = beginPaletteEntryMutation(entries, true)
+    fun beginPaletteEntryRead(entries: Palette<*>): PaletteEntryPublication =
+        beginPaletteEntryMutation(D3D12RtPaletteEntries.begin(entries, true))
 
     @JvmStatic
-    @Synchronized
     fun beginPaletteEntryDecode(entries: Palette<*>, registry: net.minecraft.core.IdMap<*>): PaletteEntryPublication =
-        beginPaletteEntryMutation(entries, true, D3D12RtIdMaps.beginCopy(registry))
+        beginPaletteEntryMutation(D3D12RtPaletteEntries.begin(entries, true), D3D12RtIdMaps.beginCopy(registry))
 
-    private fun beginPaletteEntryMutation(entries: Palette<*>, recover: Boolean,
+    private fun beginPaletteEntryMutation(mutation: D3D12RtPaletteEntries.Mutation,
                                           registry: D3D12RtIdMaps.Copy? = null): PaletteEntryPublication {
-        val publication = PaletteEntryPublication(D3D12RtPaletteEntries.begin(entries, recover), registry)
-        updateEntryAvailability(entries)
-        try {
-            invalidatePaletteEntries(entries)
-        } catch (problem: Throwable) {
-            D3D12RtPaletteEntries.finish(publication.mutation, false)
+        val publication = PaletteEntryPublication(mutation, registry)
+        if (!D3D12RtPaletteEntries.hasSources(mutation)) return publication
+        synchronized(D3D12SectionGeometry::class.java) {
+            val entries = mutation.entries
             updateEntryAvailability(entries)
-            publication.closed = true
-            throw problem
+            try {
+                invalidatePaletteEntries(entries)
+            } catch (problem: Throwable) {
+                D3D12RtPaletteEntries.finish(mutation, false)
+                updateEntryAvailability(entries)
+                publication.closed = true
+                throw problem
+            }
         }
         return publication
     }
 
     @JvmStatic
-    @Synchronized
-    private fun completePaletteEntryPublication(publication: PaletteEntryPublication) {
+    private fun completePaletteEntryPublication(publication: PaletteEntryPublication) = synchronized(publication) {
         check(!publication.closed)
         publication.completed = publication.registry?.let(D3D12RtIdMaps::matches) != false
     }
 
     @JvmStatic
-    @Synchronized
-    private fun finishPaletteEntryPublication(publication: PaletteEntryPublication) {
-        if (publication.closed) return
-        var invalidated = false
-        val entries = publication.mutation.entries
-        try {
-            invalidatePaletteEntries(entries)
-            invalidated = true
-        } finally {
-            D3D12RtPaletteEntries.finish(publication.mutation, publication.completed && invalidated)
-            updateEntryAvailability(entries)
+    private fun finishPaletteEntryPublication(publication: PaletteEntryPublication) = synchronized(publication) {
+        if (publication.closed) return@synchronized
+        if (D3D12RtPaletteEntries.finishUntracked(publication.mutation, publication.completed)) {
             publication.closed = true
+            return@synchronized
+        }
+        synchronized(D3D12SectionGeometry::class.java) {
+            var invalidated = false
+            val entries = publication.mutation.entries
+            try {
+                invalidatePaletteEntries(entries)
+                invalidated = true
+            } finally {
+                D3D12RtPaletteEntries.finish(publication.mutation, publication.completed && invalidated)
+                updateEntryAvailability(entries)
+                publication.closed = true
+            }
         }
     }
 
@@ -1317,13 +1356,11 @@ object D3D12SectionGeometry {
     }
 
     @JvmStatic
-    @Synchronized
     fun beginPaletteStorageWrite(storage: BitStorage, recoverInput: Boolean): PaletteStoragePublication {
         return beginPaletteStorageMutation(D3D12RtPaletteStorage.begin(storage, recoverInput))
     }
 
     @JvmStatic
-    @Synchronized
     fun beginPaletteArrayWrite(array: LongArray, recoverInput: Boolean): PaletteStoragePublication =
         beginPaletteStorageMutation(D3D12RtPaletteStorage.beginArray(array, recoverInput))
 
@@ -1332,37 +1369,44 @@ object D3D12SectionGeometry {
 
     private fun beginPaletteStorageMutation(mutation: D3D12RtPaletteStorage.Mutation): PaletteStoragePublication {
         val publication = PaletteStoragePublication(mutation)
-        for (storage in mutationStorages(mutation)) updateStorageAvailability(storage)
-        try {
-            for (storage in mutationStorages(mutation)) invalidatePaletteStorage(storage)
-        } catch (problem: Throwable) {
-            D3D12RtPaletteStorage.finish(publication.mutation, false)
-            for (storage in mutationStorages(mutation)) updateStorageAvailability(storage)
-            publication.closed = true
-            throw problem
+        if (!D3D12RtPaletteStorage.hasSources(mutation)) return publication
+        synchronized(D3D12SectionGeometry::class.java) {
+            try {
+                for (storage in mutationStorages(mutation)) updateStorageAvailability(storage)
+                for (storage in mutationStorages(mutation)) invalidatePaletteStorage(storage)
+            } catch (problem: Throwable) {
+                D3D12RtPaletteStorage.finish(publication.mutation, false)
+                for (storage in mutationStorages(mutation)) updateStorageAvailability(storage)
+                publication.closed = true
+                throw problem
+            }
         }
         return publication
     }
 
     @JvmStatic
-    @Synchronized
-    private fun completePaletteStoragePublication(publication: PaletteStoragePublication) {
+    private fun completePaletteStoragePublication(publication: PaletteStoragePublication) = synchronized(publication) {
         check(!publication.closed)
         publication.completed = true
     }
 
     @JvmStatic
-    @Synchronized
-    private fun finishPaletteStoragePublication(publication: PaletteStoragePublication) {
-        if (publication.closed) return
-        var invalidated = false
-        try {
-            for (storage in mutationStorages(publication.mutation)) invalidatePaletteStorage(storage)
-            invalidated = true
-        } finally {
-            D3D12RtPaletteStorage.finish(publication.mutation, publication.completed && invalidated)
-            for (storage in mutationStorages(publication.mutation)) updateStorageAvailability(storage)
+    private fun finishPaletteStoragePublication(publication: PaletteStoragePublication) = synchronized(publication) {
+        if (publication.closed) return@synchronized
+        if (D3D12RtPaletteStorage.finishUntracked(publication.mutation, publication.completed)) {
             publication.closed = true
+            return@synchronized
+        }
+        synchronized(D3D12SectionGeometry::class.java) {
+            var invalidated = false
+            try {
+                for (storage in mutationStorages(publication.mutation)) invalidatePaletteStorage(storage)
+                invalidated = true
+            } finally {
+                D3D12RtPaletteStorage.finish(publication.mutation, publication.completed && invalidated)
+                for (storage in mutationStorages(publication.mutation)) updateStorageAvailability(storage)
+                publication.closed = true
+            }
         }
     }
 
@@ -1516,6 +1560,11 @@ object D3D12SectionGeometry {
         biomeEntrySources[entries]?.forEach(::updateBiomeDataAvailability)
     }
 
+    private fun unlinkPaletteEntries(entries: Palette<*>) {
+        if (blockEntrySources[entries].isNullOrEmpty() && biomeEntrySources[entries].isNullOrEmpty())
+            D3D12RtPaletteEntries.untrack(entries)
+    }
+
     private fun updateBlockDataAvailability(source: BlockSource) {
         refreshBlockMappingSources(source)
         if (D3D12RtPaletteStorage.available(source.storage) && D3D12RtPaletteEntries.available(source.entries) &&
@@ -1561,11 +1610,13 @@ object D3D12SectionGeometry {
     }
 
     private fun linkPaletteArray(storage: BitStorage) {
+        D3D12RtPaletteStorage.track(storage)
         D3D12RtPaletteArrays.current(storage)?.let { paletteArraySources.getOrPut(it, ::linkedSetOf).add(storage) }
     }
 
     private fun unlinkPaletteArray(storage: BitStorage) {
         if (!blockStorageSources[storage].isNullOrEmpty() || !biomeStorageSources[storage].isNullOrEmpty()) return
+        D3D12RtPaletteStorage.untrack(storage)
         D3D12RtPaletteArrays.current(storage)?.let { array ->
             paletteArraySources[array]?.let { sources ->
                 sources.remove(storage)
@@ -1814,6 +1865,8 @@ object D3D12SectionGeometry {
     @JvmStatic
     fun recordBiomeManagerRead(manager: BiomeManager, source: BiomeResolver?) {
         if (D3D12RtModelSupport.currentScope() == null && !D3D12RtTintInputs.hasRead()) return
+        if (manager.javaClass == BiomeManager::class.java && source === levelIdentity &&
+            source?.javaClass == ClientLevel::class.java) return
         synchronized(D3D12SectionGeometry::class.java) {
             if (manager.javaClass != BiomeManager::class.java || source !== levelIdentity ||
                 source?.javaClass != ClientLevel::class.java) rejectBiomeInput()
@@ -1823,6 +1876,8 @@ object D3D12SectionGeometry {
     @JvmStatic
     fun recordTintCalculatorRead(level: ClientLevel, resolver: ColorResolver?) {
         if (D3D12RtModelSupport.currentScope() == null && !D3D12RtTintInputs.hasRead()) return
+        if (level === levelIdentity && level.javaClass == ClientLevel::class.java &&
+            D3D12RtTintInputs.fixedResolver(resolver)) return
         synchronized(D3D12SectionGeometry::class.java) {
             if (level !== levelIdentity || level.javaClass != ClientLevel::class.java ||
                 !D3D12RtTintInputs.fixedResolver(resolver))
@@ -1926,6 +1981,12 @@ object D3D12SectionGeometry {
 
     private fun removeCompileScope(sectionNode: Long) {
         val scope = compileScopes.remove(sectionNode) ?: return
+        scope.lightInputs?.skyStorage?.let { storage ->
+            skyLightReaders[storage]?.let { readers ->
+                readers.remove(sectionNode)
+                if (readers.isEmpty()) skyLightReaders.remove(storage)
+            }
+        }
         for (block in scope.blockExtensions.keys) blockExtensionReaders[block]?.let { readers ->
             readers.remove(scope)
             if (readers.isEmpty()) blockExtensionReaders.remove(block)
@@ -1988,9 +2049,8 @@ object D3D12SectionGeometry {
             for (node in affected) {
                 removeCompileScope(node)
                 sections.remove(node)
+                removePendingSection(node)
             }
-            val retired = affected.toSet()
-            pendingUploads.entries.removeAll { it.value.sectionNode in retired }
             publish.run()
         }
     }
@@ -2089,8 +2149,18 @@ object D3D12SectionGeometry {
     private fun beginLightMapMutation(mutation: D3D12RtLightInputs.MapMutation, recoverInput: Boolean): LightMapMutation {
         val publication = LightMapMutation(mutation, recoverInput)
         try {
-            val candidates = if (mutation.metadata) compileScopes.keys else lightReaders[SectionPos.getZeroNode(mutation.node)].orEmpty()
-            val affected = candidates.filter { owner ->
+            val affected = if (mutation.metadata) {
+                val owners = LongArrayList()
+                for ([storage, readers] in skyLightReaders) {
+                    if (!D3D12RtLightInputs.isVisibleMap(storage, mutation.map)) continue
+                    val iterator = readers.iterator()
+                    while (iterator.hasNext()) {
+                        val owner = iterator.nextLong()
+                        if (compileScopes[owner]?.lightInputs?.affected(mutation) == true) owners.add(owner)
+                    }
+                }
+                owners.toLongArray()
+            } else lightReaders[SectionPos.getZeroNode(mutation.node)].orEmpty().filter { owner ->
                 compileScopes[owner]?.lightInputs?.affected(mutation) == true
             }.toLongArray()
             revokeCompiledInputs(affected) {}
@@ -2236,7 +2306,7 @@ object D3D12SectionGeometry {
             for (chunk in loadedChunks.values) addAll(chunk.nodes.asList())
             addAll(compileScopes.keys)
             addAll(sections.keys)
-            addAll(pendingUploads.values.map { it.sectionNode })
+            addAll(pendingSections.keys)
         }.toLongArray()
         D3D12RtGeometryPool.invalidateModelResources(nodes, modelResources.sourceUniverse) {
             compilerIdentity = compiler
@@ -2244,6 +2314,7 @@ object D3D12SectionGeometry {
             contentRevision++
             compileScopes.clear()
             lightReaders.clear()
+            skyLightReaders.clear()
             lightLayerReaders.clear()
             lightQueueReaders.clear()
             lightArrayReaders.clear()
@@ -2253,7 +2324,7 @@ object D3D12SectionGeometry {
             biomeInfoReaders.clear()
             colorTableReaders.forEach { it.clear() }
             blockExtensionReaders.clear()
-            pendingUploads.clear()
+            clearPendingUploads()
             sections.clear()
             D3D12RtMaterialTable.clear()
             publish()
@@ -2269,21 +2340,25 @@ object D3D12SectionGeometry {
     }
 
     private fun dependentSections(nodes: LongArray): LongArray {
-        val pending = pendingUploads.values.mapTo(hashSetOf()) { it.sectionNode }
-        return buildSet {
-            for (node in nodes) {
-                addAll(biomeReaders[node].orEmpty().map { it.sectionNode })
-                for (owner in regionInputs(node)) {
-                    if (isLoadedSection(owner) || owner in compileScopes || sections.containsKey(owner) || owner in pending ||
-                        D3D12RtGeometryPool.hasSectionCapture(owner)) add(owner)
-                }
+        val dependent = LongOpenHashSet()
+        val visited = LongOpenHashSet()
+        for (node in nodes) {
+            for (scope in biomeReaders[node].orEmpty()) dependent.add(scope.sectionNode)
+            for (deltaZ in -1..1) for (deltaY in -1..1) for (deltaX in -1..1) {
+                val owner = SectionPos.offset(node, deltaX, deltaY, deltaZ)
+                if (!visited.add(owner)) continue
+                if (isLoadedSection(owner) || owner in compileScopes || sections.containsKey(owner) ||
+                    pendingSections.containsKey(owner) ||
+                    D3D12RtGeometryPool.hasSectionCapture(owner)) dependent.add(owner)
             }
-        }.toLongArray()
+        }
+        return dependent.toLongArray()
     }
 
-    private fun isLoadedSection(sectionNode: Long): Boolean =
-        loadedChunks[SectionPos.asLong(SectionPos.x(sectionNode), 0, SectionPos.z(sectionNode))]
-            ?.nodes?.contains(sectionNode) == true
+    private fun isLoadedSection(sectionNode: Long): Boolean {
+        val loaded = loadedChunks[SectionPos.getZeroNode(sectionNode)] ?: return false
+        return SectionPos.y(sectionNode) - SectionPos.y(loaded.nodes.first()) in loaded.nodes.indices
+    }
 
     @JvmStatic
     @Synchronized
@@ -2294,9 +2369,9 @@ object D3D12SectionGeometry {
         val key = SectionPos.asLong(chunkX, 0, chunkZ)
         val nodes = LongArray(sectionCount) { SectionPos.asLong(chunkX, minSectionY + it, chunkZ) }
         val retired = loadedChunks[key]?.nodes ?: longArrayOf()
-        val changed = (retired.asList() + nodes.asList()).distinct().toLongArray()
+        val changed = LongOpenHashSet(retired).apply { addAll(LongOpenHashSet(nodes)) }.toLongArray()
         val dependent = dependentSections(changed)
-        val retained = nodes.toSet()
+        val retained = LongOpenHashSet(nodes)
         val chunk = (chunkIdentity as? LevelChunk)?.takeIf { it.javaClass == LevelChunk::class.java && it.level === levelIdentity }
         val sources = chunk?.let { nodes.withIndex().mapNotNull { [index, node] ->
                 D3D12RtSectionArrays.section(chunk, index)?.takeIf { it.javaClass == LevelChunkSection::class.java &&
@@ -2379,7 +2454,10 @@ object D3D12SectionGeometry {
         removeBlockStorageSource(source)
         source.storage = D3D12RtPaletteStorage.current(source.palette)
         source.entries = D3D12RtPaletteEntries.current(source.palette)
-        source.entries?.let { blockEntrySources.getOrPut(it, ::linkedSetOf).add(source) }
+        source.entries?.let {
+            blockEntrySources.getOrPut(it, ::linkedSetOf).add(source)
+            D3D12RtPaletteEntries.track(it)
+        }
         source.storage?.let {
             blockStorageSources.getOrPut(it, ::linkedSetOf).add(source)
             linkPaletteArray(it)
@@ -2398,6 +2476,7 @@ object D3D12SectionGeometry {
                 sources.remove(source)
                 if (sources.isEmpty()) blockEntrySources.remove(entries)
             }
+            unlinkPaletteEntries(entries)
         }
         source.entries = null
         source.storage?.let { storage ->
@@ -2415,7 +2494,10 @@ object D3D12SectionGeometry {
         removeBiomeStorageSource(source)
         source.storage = source.palette?.let(D3D12RtPaletteStorage::current)
         source.entries = source.palette?.let(D3D12RtPaletteEntries::current)
-        source.entries?.let { biomeEntrySources.getOrPut(it, ::linkedSetOf).add(source) }
+        source.entries?.let {
+            biomeEntrySources.getOrPut(it, ::linkedSetOf).add(source)
+            D3D12RtPaletteEntries.track(it)
+        }
         source.storage?.let {
             biomeStorageSources.getOrPut(it, ::linkedSetOf).add(source)
             linkPaletteArray(it)
@@ -2434,6 +2516,7 @@ object D3D12SectionGeometry {
                 sources.remove(source)
                 if (sources.isEmpty()) biomeEntrySources.remove(entries)
             }
+            unlinkPaletteEntries(entries)
         }
         source.entries = null
         source.storage?.let { storage ->
@@ -2456,26 +2539,30 @@ object D3D12SectionGeometry {
     }
 
     private fun revokeSections(inputs: LongArray, dependent: LongArray) {
-        val changed = (inputs.asList() + dependent.asList()).toSet()
+        val changed = LongOpenHashSet(inputs).apply { addAll(LongOpenHashSet(dependent)) }
         contentRevision++
         for (node in inputs) inputVersions[node] = contentRevision
-        for (node in changed) {
+        val iterator = changed.iterator()
+        while (iterator.hasNext()) {
+            val node = iterator.nextLong()
             removeCompileScope(node)
             sections.remove(node)
+            removePendingSection(node)
         }
-        pendingUploads.entries.removeAll { it.value.sectionNode in changed }
     }
+
+    private fun isTrackingScope(scope: CompileScope): Boolean =
+        scope.worldIdentity === levelIdentity && scope.epoch == epoch && compileScopes[scope.sectionNode] === scope
 
     @JvmStatic
     @Synchronized
-    fun isCurrent(scope: CompileScope?): Boolean = scope != null &&
-        scope.worldIdentity === levelIdentity && scope.epoch == epoch &&
+    fun isCurrent(scope: CompileScope?): Boolean = scope != null && isTrackingScope(scope) &&
         !hasUnavailableBlockInput(scope.sectionNode) &&
         !hasUnavailableChunkInput(ChunkPos.pack(SectionPos.x(scope.sectionNode), SectionPos.z(scope.sectionNode))) &&
         scope.modelRevision == modelRevision &&
         scope.compilerRevision == compilerRevision && scope.compilerIdentity === compilerIdentity &&
         scope.compilerIdentity === D3D12RtCompilerInputs.current()?.compiler &&
-        compileScopes[scope.sectionNode] === scope && scope.matchesInputs(inputVersions) &&
+        scope.matchesInputs(inputVersions) &&
         scope.tintInputs.keys.all { D3D12RtTintInputs.sourceCurrent(it, levelIdentity) } &&
         scope.blockExtensions.all { [block, input] -> D3D12RtBlockExtensions.current(input, block) } &&
         scope.lightInputs?.matches(scope.worldIdentity) != false
@@ -2500,11 +2587,48 @@ object D3D12SectionGeometry {
     @JvmStatic
     @Synchronized
     fun invalidateSection(sectionNode: Long, levelIdentity: Any?) {
+        invalidateSections(longArrayOf(sectionNode), levelIdentity)
+    }
+
+    @JvmStatic
+    @Synchronized
+    fun invalidateSections(sectionNodes: LongArray, levelIdentity: Any?) {
+        invalidateSections(sectionNodes, levelIdentity, false)
+    }
+
+    @JvmStatic
+    @Synchronized
+    fun invalidateCompileNotifications(sectionNodes: LongArray, levelIdentity: Any?) {
+        invalidateSections(sectionNodes, levelIdentity, true)
+    }
+
+    private fun hasCompileInputs(sectionNode: Long): Boolean =
+        sectionNode in compileScopes || sections.containsKey(sectionNode) || pendingSections.containsKey(sectionNode)
+
+    private fun canCoalesceCompileNotifications(sectionNodes: LongArray): Boolean {
+        for (node in sectionNodes) {
+            if (hasCompileInputs(node) || !D3D12RtGeometryPool.hasSectionCapture(node) ||
+                biomeReaders[node]?.isNotEmpty() == true) return false
+            for (deltaZ in -1..1) for (deltaY in -1..1) for (deltaX in -1..1) {
+                val owner = SectionPos.offset(node, deltaX, deltaY, deltaZ)
+                if (hasCompileInputs(owner) || isLoadedSection(owner) && !D3D12RtGeometryPool.hasSectionCapture(owner)) return false
+            }
+        }
+        return true
+    }
+
+    private fun invalidateSections(sectionNodes: LongArray, levelIdentity: Any?, coalescePending: Boolean) {
         if (levelIdentity == null || this.levelIdentity !== levelIdentity) return
-        val inputs = longArrayOf(sectionNode)
+        if (sectionNodes.isEmpty() || coalescePending && canCoalesceCompileNotifications(sectionNodes)) return
+        val inputs = LongOpenHashSet(sectionNodes).toLongArray()
+        if (inputs.isEmpty()) return
         val dependent = dependentSections(inputs)
-        val affected = (inputs.asList() + dependent.asList()).distinct().toLongArray()
-        D3D12RtGeometryPool.invalidateSections(affected,
+        val affected = LongOpenHashSet(inputs).apply { addAll(LongOpenHashSet(dependent)) }
+        if (coalescePending && affected.all {
+            it !in compileScopes && !sections.containsKey(it) && !pendingSections.containsKey(it) &&
+                D3D12RtGeometryPool.hasSectionCapture(it)
+        }) return
+        D3D12RtGeometryPool.invalidateSections(affected.toLongArray(),
             D3D12RtLightingChanges.Reason.COMPILE_NOTIFICATION) { revokeSections(inputs, dependent) }
     }
 
@@ -2531,7 +2655,11 @@ object D3D12SectionGeometry {
                     indexStrideBytes: Int, index: ByteBuffer?) {
         observeLevel(levelIdentity)
         if (levelIdentity == null || D3D12RtGeometryPool.isSectionUnloaded(sectionNode)) return
-        val pending = pendingUploads.getOrPut(meshIdentity) { PendingUpload(sectionNode, epoch) }
+        val pending = pendingUploads.getOrPut(meshIdentity) {
+            PendingUpload(sectionNode, epoch).also {
+                pendingSections.getOrPut(sectionNode) { IdentityHashMap() }[meshIdentity] = it
+            }
+        }
         if (pending.sectionNode != sectionNode || pending.epoch != epoch || pending.layers[layer]?.hasPayload == true) return
         fun copy(bytes: ByteBuffer): ByteBuffer = ByteBuffer.allocate(bytes.remaining())
             .order(bytes.order()).apply { put(bytes.duplicate()); flip() }
@@ -2551,6 +2679,17 @@ object D3D12SectionGeometry {
         reapMeshUploads()
         meshUploads.getOrPut(MeshKey(meshIdentity, releasedMeshes)) { linkedMapOf() }[layer] = captured.upload
         Reference.reachabilityFence(meshIdentity)
+    }
+
+    @JvmStatic
+    @Synchronized
+    fun publishEmptyRegion(region: RenderSectionRegion, additionalRenderers: Boolean): Boolean {
+        val scope = (region as? D3D12SectionRegionState)?.compileScope ?: return false
+        if (scope.compilerIdentity?.javaClass != SectionCompiler::class.java || !isCurrent(scope)) return false
+        val manifest = D3D12RtModelSupport.emptySupport(scope, SectionPos.of(scope.sectionNode), region,
+            true, additionalRenderers) ?: return false
+        return commitCurrentUpload(scope.sectionNode, CompiledSectionMesh.EMPTY, scope.worldIdentity, scope.epoch,
+            scope, manifest)
     }
 
     @JvmStatic
@@ -2581,7 +2720,7 @@ object D3D12SectionGeometry {
         }
         val accepted = pendingUploads[meshIdentity]?.takeIf { it.epoch == epoch && it.sectionNode == sectionNode }
         val support = manifest?.takeIf { it.scope.sectionNode == sectionNode && isCurrent(it.scope) }
-        if (accepted != null) pendingUploads.remove(meshIdentity)
+        if (accepted != null) removePendingUpload(meshIdentity)
         D3D12RtGeometryPool.replaceSection(sectionNode, layers.keys) {
             sections.remove(sectionNode)
             for ([layer, draw] in layers) {
@@ -2601,14 +2740,14 @@ object D3D12SectionGeometry {
     @JvmStatic
     @Synchronized
     fun discardUpload(meshIdentity: Any) {
-        pendingUploads.remove(meshIdentity)
+        removePendingUpload(meshIdentity)
         reapMeshUploads()
     }
 
     @JvmStatic
     @Synchronized
     fun removeSection(sectionNode: Long) {
-        pendingUploads.entries.removeAll { it.value.sectionNode == sectionNode }
+        removePendingSection(sectionNode)
         val scope = compileScopes[sectionNode]?.takeIf { isLoadedSection(sectionNode) && isCurrent(it) }
         if (scope != null) {
             D3D12RtGeometryPool.retainSection(sectionNode, scope)?.let { evicted ->
@@ -2616,7 +2755,7 @@ object D3D12SectionGeometry {
                 for (node in evicted) {
                     removeCompileScope(node)
                     sections.remove(node)
-                    pendingUploads.entries.removeAll { it.value.sectionNode == node }
+                    removePendingSection(node)
                 }
                 return
             }

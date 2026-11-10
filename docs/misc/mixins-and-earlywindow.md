@@ -29,6 +29,9 @@ mixin 处理的是接口拿到**之前**、以及接口给不了的东西：
   对 D3D12 纹理将写入行改成 `image.height - 1 - row`，取消原版固定的垂直翻转。
   两处分别覆盖原尺寸与缩小截图，其他后端保持原行序；GPU 完成等待由编码器负责。
 - 私有类型（`ShaderManager$PendingResults` 是私有 record，写不进方法描述符，只能包它的构造）。
+- `LevelLoadingGridMixin` 在 `LevelLoadingScreen.extractChunksForRendering` 入口把区块状态网格冻结为单个
+  `GuiElementRenderState`，保留原版颜色、格距、中心标记、pose 和 scissor；避免每格进入 GUI 层次的全表相交检查。
+  状态快照只保存颜色值，不能持有 `ChunkLoadStatusView` 或世界引用。
 
 体量：`src/main/kotlin/io/github/dxegp/mixin/` 下 82 个 Kotlin 文件，
 `src/main/java/io/github/dxegp/mixin/` 下 25 个 Java 文件，共 107 个注册项。
