@@ -9,7 +9,7 @@ import java.io.IOException
 /**
  * 回退着色器源：`ShaderManager` 缓存在首次 `apply()` 之前恒空，首个 `LoadingOverlay` 管线会因此拿不到源；
  * 这里用 `preloadUiShader` 捕获的 vanilla `ResourceProvider` 顶上，首次资源重载后主源恢复、不再触发。
- * 见 docs/shaders/README.md §4
+ * 见 docs/shaders/README.md §3
  */
 object D3D12FallbackShaderSource {
     private val LOGGER = LoggerFactory.getLogger("dxrmc")

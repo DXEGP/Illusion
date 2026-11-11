@@ -6,7 +6,7 @@ import com.mojang.renderpearl.api.textures.GpuSampler
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
 import java.util.OptionalDouble
 
-/** D3D12 `GpuSampler`：address 0=REPEAT/1=CLAMP_TO_EDGE、filter 0=NEAREST/1=LINEAR。见 docs/shaders/README.md §10.4 */
+/** D3D12 `GpuSampler`：address 0=REPEAT/1=CLAMP_TO_EDGE、filter 0=NEAREST/1=LINEAR。 */
 class D3D12GpuSampler(
     private val addressModeU: AddressMode,
     private val addressModeV: AddressMode,

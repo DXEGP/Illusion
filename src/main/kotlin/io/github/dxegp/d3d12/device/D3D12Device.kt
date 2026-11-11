@@ -45,6 +45,7 @@ import io.github.dxegp.config.D3D12Settings
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
 import io.github.dxegp.d3d12.shader.D3D12GpuSampler
 import io.github.dxegp.d3d12.shader.D3D12IntermediaryShaderModule
+import io.github.dxegp.d3d12.shader.D3D12ShaderIo
 import io.github.dxegp.d3d12.shader.D3D12ShaderCompiler
 import io.github.dxegp.d3d12.shader.injectShaderDefines
 import net.minecraft.client.Minecraft
@@ -352,12 +353,12 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
         if (vertexShader === D3D12IntermediaryShaderModule.INVALID) {
             LOGGER.error("{} COMPILE FAILED (vertex): shader {} invalid",
                 pipeName, vertexId)
-            return D3D12CompiledRenderPipeline(pipeline, 0L, vertexShader, fragmentShader, "", "")
+            return D3D12CompiledRenderPipeline(pipeline, 0L)
         }
         if (fragmentShader === D3D12IntermediaryShaderModule.INVALID) {
             LOGGER.error("{} COMPILE FAILED (fragment): shader {} invalid",
                 pipeName, fragmentId)
-            return D3D12CompiledRenderPipeline(pipeline, 0L, vertexShader, fragmentShader, "", "")
+            return D3D12CompiledRenderPipeline(pipeline, 0L)
         }
         try {
             val compiled = this.getOrCreateCompiler()
@@ -367,12 +368,12 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
             if (handle == 0L) {
                 LOGGER.error("{} COMPILE FAILED (native): dx12CreateGraphicsPipeline returned 0",
                     pipeName)
-                return D3D12CompiledRenderPipeline(pipeline, 0L, vertexShader, fragmentShader, "", "")
+                return D3D12CompiledRenderPipeline(pipeline, 0L)
             }
             LOGGER.info("{} COMPILE OK (handle={})", pipeName, handle)
             val result = D3D12CompiledRenderPipeline(
                 pipeline, handle,
-                vertexShader, fragmentShader, compiled.vertexHlsl, compiled.fragmentHlsl
+                compiled.entries
             )
             // D3D12 没有宽线：LINELIST 恒 1px，而 rendertype_lines.vsh 只把端点横移 LineWidth/2 →
             // 这里会画成「1px 长边 + 两端小横杠」。为线管线另建 TRIANGLES 拓扑 PSO，6 索引正好摊成两个三角形。
@@ -408,7 +409,7 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
             return result
         } catch (e: ShaderCompileException) {
             LOGGER.error("{} COMPILE FAILED (compile): {}", pipeName, e.message)
-            return D3D12CompiledRenderPipeline(pipeline, 0L, vertexShader, fragmentShader, "", "")
+            return D3D12CompiledRenderPipeline(pipeline, 0L)
         }
     }
 
@@ -426,7 +427,7 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
             !pipeline.location.toString().contains("animate_sprite")
 
         // 26.3 的地形 PS 自己按段读 chunkVisibility（VS 输出插值量），直接编译原版即可。
-        val psDxil = MCDR_ABI.D3D12CompileShaderDxc(compiled.fragmentHlsl, "main", "ps_6_0")
+        val psDxil = MCDR_ABI.D3D12CompileShaderDxc(compiled.fragmentHlsl, "main", "ps_6_9")
             ?: run {
                 LOGGER.warn("terrain PS failed to compile ({}): {}", pipeline.location, MCDR_ABI.D3D12LastError())
                 return MeshVariantResult(0L, false)
@@ -464,12 +465,12 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
         var meshletAs = false
         try {
             val wantAs = D3D12Settings.meshTerrainCull
-            var hlsl = D3D12MeshletShader.build(compiled.vertexHlsl, format, cull = wantAs)
+            var hlsl = D3D12MeshletShader.build(compiled, format, cull = wantAs)
             var asActive = wantAs
             if (hlsl == null && wantAs) {
                 // uniform 解析不到时退回不剔除的 meshlet（剔除判据不全会成片剔掉地形）。
                 LOGGER.warn("AS build failed ({}), falling back to meshlets without culling", pipeline.location)
-                hlsl = D3D12MeshletShader.build(compiled.vertexHlsl, format, cull = false)
+                hlsl = D3D12MeshletShader.build(compiled, format, cull = false)
                 asActive = false
             }
             var meshletMs = hlsl?.let { MCDR_ABI.D3D12CompileShaderDxc(it, "ms_main", "ms_6_9") }
@@ -481,7 +482,7 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
             if (meshletMs == null || (asActive && meshletAsBytes == null)) {
                 LOGGER.warn("meshlet MS/AS failed to compile ({}): {}, falling back to the non-culling variant",
                     pipeline.location, MCDR_ABI.D3D12LastError())
-                hlsl = D3D12MeshletShader.build(compiled.vertexHlsl, format, cull = false)
+                hlsl = D3D12MeshletShader.build(compiled, format, cull = false)
                 meshletMs = hlsl?.let { MCDR_ABI.D3D12CompileShaderDxc(it, "ms_main", "ms_6_9") }
                 meshletAsBytes = null
                 asActive = false
@@ -590,14 +591,10 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
         }
         return compiler
     }
-    /**
-     * 生成 D3D12 输入布局元素：只含顶点着色器实际声明的输入，attribLocation 分配必须与
-     * [D3D12IntermediaryShaderModule.rebind] 完全一致。
-     */
     private fun buildVertexInputElements(pipeline: RenderPipeline,
-        vertexShaderInputs: List<String>): MutableList<IntArray> {
+        vertexShaderInputs: List<D3D12ShaderIo>): MutableList<IntArray> {
         val elements = ArrayList<IntArray>()
-        var attribLocation = 0
+        val inputsByName = vertexShaderInputs.associateBy { it.name }
         val bindings = pipeline.vertexFormatBindings
         if (bindings.isEmpty()) {
             LOGGER.warn("{}: formatBindings is empty, inputs={}", pipeline.location, vertexShaderInputs)
@@ -607,13 +604,12 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
             val stride = format.vertexSize
             val stepRate = format.stepRate
             for (element in format.elements) {
-                if (!vertexShaderInputs.contains(element.name())) continue
+                val input = inputsByName[element.name()] ?: continue
                 val fmtOrd = element.format().ordinal
                 elements.add(intArrayOf(
-                    attribLocation, i, fmtOrd,
+                    input.location, i, fmtOrd,
                     element.offset(), stride, stepRate
                 ))
-                attribLocation++
             }
         }
         // 地形 slot/stepRate 诊断：26.3 把 ChunkPosition/ChunkVisibility 挪成逐实例属性（slot 1, stepRate=1）。
@@ -637,13 +633,7 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
         val colorTargets = pipeline.colorTargetStates
         val colorCount = colorTargets.size
         val hasDepth = pipeline.depthStencilState != null
-        val inputElements = buildVertexInputElements(pipeline, compiled.vertexShaderInputs)
-        val semanticNames = compiled.semanticNames
-        // semanticNames 可能少于 inputElements（gui 管线 HLSL 只有 1 个输入但格式有 2 个）：补 TEXCOORDn。
-        while (semanticNames.size < inputElements.size) {
-            semanticNames.add("TEXCOORD${semanticNames.size}")
-        }
-        // 语义名必须与 inputElements 逐项对齐（native 启动自检兜底）。
+        val inputElements = buildVertexInputElements(pipeline, compiled.vertexInputs)
         val entries = compiled.entries
 
         val desc = MCDRPipelineDesc()
@@ -691,7 +681,7 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
                 element[3],
                 element[4],
                 element[5],
-                semanticNames[i]))
+                "LOC${element[0]}"))
         }
 
         // type：0=CBV 1=SRV+sampler 2=SRV(texel)；reg = 条目序号，与 HLSL shader register 一一对应

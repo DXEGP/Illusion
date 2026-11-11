@@ -416,6 +416,35 @@ sourceSets.named("main") {
     resources.srcDir(copyNative)
 }
 
+val shaderProcessorRoot = file(providers.gradleProperty("shaderProcessorRoot").getOrElse(
+    if (file("../Illusion-shaders-extension").isDirectory) "../Illusion-shaders-extension"
+    else "../../Illusion-shaders-extension"))
+val nagaRoot = File(shaderProcessorRoot.parentFile, "naga-for-hlsl")
+val buildShaderProcessor = tasks.register<Exec>("buildShaderProcessor") {
+    group = "build"
+    description = "Builds the required naga shader compiler library."
+    workingDir(shaderProcessorRoot)
+    commandLine("cargo", "build", "--release", "--locked", "--lib")
+    inputs.files(fileTree(shaderProcessorRoot) {
+        include("Cargo.toml", "Cargo.lock", "src/**", ".cargo/**", "cli/Cargo.toml")
+    }, fileTree(nagaRoot) {
+        include("Cargo.toml", "Cargo.lock", "naga/**", "naga-types/**")
+        exclude("**/target/**")
+    })
+    outputs.file(File(shaderProcessorRoot, "target/release/illusion_shader.dll"))
+}
+val stageShaderProcessor = tasks.register<Sync>("stageShaderProcessor") {
+    dependsOn(buildShaderProcessor)
+    into(layout.buildDirectory.dir("generated/shader-processor"))
+    from(File(shaderProcessorRoot, "target/release/illusion_shader.dll"))
+    from(File(shaderProcessorRoot, "LICENSE")) { rename { "LICENSE-illusion-shader.txt" } }
+    from(File(nagaRoot, "LICENSE.MIT")) { rename { "LICENSE-naga-MIT.txt" } }
+    from(File(nagaRoot, "LICENSE.APACHE")) { rename { "LICENSE-naga-APACHE.txt" } }
+}
+sourceSets.named("main") {
+    resources.srcDir(stageShaderProcessor)
+}
+
 // ---------------------------------------------------------------------------
 // Third-party SDK runtimes: what ships inside the JAR, and what does not
 // ---------------------------------------------------------------------------

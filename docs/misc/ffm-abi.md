@@ -2,6 +2,10 @@
 
 本文只讲一件事：**JVM 侧怎么安全地调用 MCDR 这个 C++ DLL**，以及调用时必须遵守的用法与边界约束。
 
+编译器另外使用 `illusion_shader.dll` 的三函数 C ABI，由 `MCDR_ABI.D3D12ConvertShader` 经内部 `NagaLibrary` 调用；
+JSON/manifest 归 shader 业务适配层所有，FFM 只传输数据。必需资源解包、版本和内存所有权见 [着色器接口](../shaders/README.md#4-资源绑定)。
+该库不属于 MCDR 导出计数，也不修改 `MCDR_Layout` 的结构体布局；`mcdr_binding_slot.texelFormat=-1` 表示 RAW SRV。
+
 三个参与者：
 
 | 层 | 文件 | 角色 |

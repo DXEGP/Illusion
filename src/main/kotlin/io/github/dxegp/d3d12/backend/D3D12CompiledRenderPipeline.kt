@@ -1,11 +1,8 @@
 package io.github.dxegp.d3d12.backend
 
-import com.mojang.renderpearl.api.pipeline.BindGroupLayout
-import com.mojang.renderpearl.api.pipeline.UniformType
 import com.mojang.renderpearl.backend.api.BackendRenderPipeline
 import com.mojang.renderpearl.api.pipeline.RenderPipeline
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
-import io.github.dxegp.d3d12.shader.D3D12IntermediaryShaderModule
 
 /**
  * 编译后的渲染管线：持有 native 的 `Dx12Pipeline*`（D3DCompile 字节码 + root signature + PSO）。
@@ -14,14 +11,8 @@ import io.github.dxegp.d3d12.shader.D3D12IntermediaryShaderModule
 class D3D12CompiledRenderPipeline(
     private val info: RenderPipeline,
     private var handle: Long,
-    private val vertexShader: D3D12IntermediaryShaderModule,
-    private val fragmentShader: D3D12IntermediaryShaderModule,
-    private val vertexHlsl: String,
-    private val fragmentHlsl: String,
+    private val bindings: List<D3D12BindGroupEntry> = emptyList(),
 ) : BackendRenderPipeline {
-    /** 管线生命周期内恒定，缓存以避免每帧重复构建（含 stream/集合分配）。 */
-    @Volatile
-    private var cachedBindings: List<D3D12BindGroupEntry>? = null
 
     /** meshlet 版地形的 PSO（`D3D12MeshletShader` 的 MS + 同一条 PS）：每线程组 16 quad。 */
     var meshletPso: Long = 0L
@@ -71,44 +62,7 @@ class D3D12CompiledRenderPipeline(
         return this.handle
     }
 
-    /** 从 BindGroupLayout + shader modules 推导绑定条目，逻辑镜像 D3D12ShaderCompiler.addToBindGroup。 */
-    fun buildBindings(): List<D3D12BindGroupEntry> {
-        val cached = this.cachedBindings
-        if (cached != null) {
-            return cached
-        }
-        val allUniforms =
-            BindGroupLayout.flattenUniforms(this.info.bindGroupLayouts)
-        val allNames = mutableSetOf<String>()
-        allUniforms.forEach { u -> allNames.add(u.name()) }
-
-        val entries = mutableListOf<D3D12BindGroupEntry>()
-        val seen = mutableSetOf<String>()
-        for (shader in listOf(vertexShader, fragmentShader)) {
-            for (buf in shader.uniformBuffers()) {
-                val name = buf.name()
-                if (!allNames.contains(name) || !seen.add(name)) continue
-                entries.add(D3D12BindGroupEntry(D3D12BindGroupEntry.Type.UNIFORM_BUFFER, name, null))
-            }
-            for (sampler in shader.samplers()) {
-                val name = sampler.name()
-                if (!allNames.contains(name) || !seen.add(name)) continue
-                val utbDesc = allUniforms.stream()
-                    .filter { d -> d.name() == name }.findFirst().orElse(null)
-                // 26.3 起 BindGroupLayout 为每个纹理 uniform 都报一条描述，「名字在 allUniforms 里」
-                // 不再等于「texel buffer」：必须按 UniformType 判定（26.2 是靠 getSamplers() 的存在性）。
-                if (utbDesc != null && utbDesc.type() == UniformType.TEXEL_BUFFER) {
-                    entries.add(D3D12BindGroupEntry(D3D12BindGroupEntry.Type.TEXEL_BUFFER, name,
-                        utbDesc.gpuFormat()))
-                } else {
-                    entries.add(D3D12BindGroupEntry(D3D12BindGroupEntry.Type.SAMPLED_IMAGE, name, null))
-                }
-            }
-        }
-        val result = java.util.List.copyOf(entries)
-        this.cachedBindings = result
-        return result
-    }
+    fun buildBindings(): List<D3D12BindGroupEntry> = bindings
 
     /** 26.3 的 `CompiledRenderPipeline` 只剩 [isClosed]/[close]；这是本实现自己的有效性判据。 */
     fun isValid(): Boolean {

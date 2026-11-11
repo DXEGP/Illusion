@@ -40,6 +40,7 @@ Illusion（幻光影现）是 Minecraft NeoForge 模组，把渲染后端换成�
 独立 early-service JAR 仅收 `bootstrap/earlywindow/service/**` 与服务声明。
 Kotlin 的 `EarlyWindowSurface`、`EarlyWindowJarInstaller` 留在主模组 JAR，避免早期 classloader 加载 Kotlin runtime。
 构建可用 `-PmcdrDependencyRoot=<MCDR 绝对路径>` 只读复用 SDK/runtime；`copyNative` 仍取相邻 MCDR 的构建产物。
+原版 GLSL 使用随 JAR 打包的 naga 转换库，再由 DXC 生成 DXIL；`-PshaderProcessorRoot` 仅指定构建源码位置，详见着色器文档。
 
 ## 文档地图
 
@@ -51,7 +52,7 @@ Kotlin 的 `EarlyWindowSurface`、`EarlyWindowJarInstaller` 留在主模组 JAR�
 | [`framegen/README.md`](framegen/README.md) | 帧生成与 Reflex：hudless 捕获、UI 合成、限帧 | 改插帧、改呈现时序 |
 | [`antialiasing/README.md`](antialiasing/README.md) | TAA / SMAA / 后期锐化：历史缓冲、速度缓冲 | 残影、抖动、GUI 拆分问题 |
 | [`mesh&vrs/README.md`](mesh&vrs/README.md) | mesh shader（meshlet）与 VRS / 渲染比例 | 地形管线、性能取舍 |
-| [`shaders/README.md`](shaders/README.md) | 着色器管线：原版管线 → HLSL → DXC → PSO | 编译失败、绑定错位 |
+| [`shaders/README.md`](shaders/README.md) | naga 编译链、manifest 绑定、阶段链接、RAW buffer 与 mesh 入口 | 构建编译器、编译失败、绑定错位 |
 | [`misc/backend-and-device.md`](misc/backend-and-device.md) | D3D12 后端、设备、资源与内存管理 | 加资源类型、改每帧流程 |
 | [`misc/ffm-abi.md`](misc/ffm-abi.md) | JVM ↔ native 的 FFM ABI | 新增或修改 native 导出 |
 | [`misc/debug-and-crash.md`](misc/debug-and-crash.md) | 崩溃处理、诊断与日志体系 | 崩溃、黑屏、日志看不懂 |

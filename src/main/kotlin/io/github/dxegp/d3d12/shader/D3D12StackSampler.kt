@@ -7,7 +7,7 @@ import java.util.concurrent.atomic.LongAdder
 
 /**
  * 渲染线程 CPU 调用栈采样器（不是纹理采样器）：每 [INTERVAL_MS] 抓一次栈顶，把后端开销与 MC/Blaze3D 分开归因。
- * `Thread.getStackTrace()` 会强制目标线程进安全点、开销约 1~2%，只在性能剖析开关打开时启用。见 docs/shaders/README.md §15
+ * `Thread.getStackTrace()` 会强制目标线程进安全点，只在性能剖析开关打开时启用。
  */
 object D3D12StackSampler {
     private const val INTERVAL_MS = 2L

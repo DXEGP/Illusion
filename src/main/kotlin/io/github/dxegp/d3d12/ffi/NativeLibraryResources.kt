@@ -8,6 +8,18 @@ internal object NativeLibraryResources {
     private const val LIB_NAME = "MCDR.dll"
     private const val EXTRACT_DIR = "dxrmc"
     private const val VENDOR_MANIFEST = "/vendor/manifest.txt"
+
+    fun extractRequiredLibrary(name: String): Path {
+        val bytes = javaClass.getResourceAsStream("/$name")?.use { it.readAllBytes() }
+            ?: error("Required compiler library is not packaged: $name")
+        val directory = Path.of(System.getProperty("user.dir"), EXTRACT_DIR)
+        Files.createDirectories(directory)
+        val target = directory.resolve(name)
+        if (!Files.exists(target) || !Files.readAllBytes(target).contentEquals(bytes)) {
+            Files.write(target, bytes)
+        }
+        return target.toAbsolutePath()
+    }
     /** Copy MCDR.dll to `<user.dir>/dxrmc/` and return the path; refreshed on a byte difference, not on timestamps (JAR entries are pinned to 1980 and two DLLs can share a size). */
     fun extractLibrary(): Path {
         val dir = Path.of(System.getProperty("user.dir"), EXTRACT_DIR)

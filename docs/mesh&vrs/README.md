@@ -95,9 +95,9 @@
 
 ### 2.4 顶点解码代码生成（`D3D12MeshVertexDecode`）
 
-MS 的顶点属性不是从 IA 阶段来的，得把 spvc（SPIRV-Cross）翻译出来的 VS 输入结构自己填。
+MS 的顶点属性来自最终 naga manifest，由 `NagaVertexAdapter` 生成稳定的 mesh 输入结构，再从顶点流读取。
 
-- `parseInputFields()` 找 `struct SPIRV_Cross_Input`，逐行匹配 `类型 名字 : 语义;`。
+- 用 manifest 的原始属性名查找 VertexFormat；生成字段 `input<location>`，参数顺序由编译器适配层处理。
 - `parseGpuFormat()` 拆 `GpuFormat` 名字：分量数、位宽、种类。
   - 分量数取「字母个数」和「`R8G8B8A8` 这类分组数」的较大者，再压到 4。
     按字母数算是为了不把 `float3` 解析成 4 分量（会直接让 DXC 编译失败）。
@@ -111,17 +111,17 @@ MS 的顶点属性不是从 IA 阶段来的，得把 spvc（SPIRV-Cross）翻译
 
 ### 2.5 MS / AS 生成（`D3D12MeshletShader`）
 
-`build(vsHlsl, format, stride = 28, cull = false): String?`：返回 null 表示「这次生成失败，
+`build(compiledShader, format, stride = 28, cull = false): String?`：返回 null 表示「这次生成失败，
 调用方回退」。常量：`THREADS = 64`、`MAX_PRIMITIVES = 32`、`VERTEX_STRIDE = 28`。
 
-前置要求：VS 里必须能找到 `SPIRV_Cross_Output main(SPIRV_Cross_Input stage_input)`
-这个入口（spvc 的产物固定叫 `main`，与 `ms_main` 冲突，所以改名 `vs_main`）。
+前置要求：编译器适配层能将 VS 的 `main(... : LOCn)` 与最终 manifest 一一对应，
+生成 `D3D12VertexInput` / `D3D12VertexOutput` 和 `vs_main`；terrain 不解析编译器私有的结构名。
 
 字段取值优先级：
 
 1. 名字能在 `VertexFormat` 里找到 → 走顶点解码（2.4）。
-2. 名字含 `ChunkPosition` → `int3(s.chunkX, s.chunkY, s.chunkZ)`（来自实例流）。
-3. 名字含 `ChunkVisibility` → `s.visibility`（float，供原版着色用）。
+2. 名字为 `ChunkPosition` → `int3(s.chunkX, s.chunkY, s.chunkZ)`（来自实例流）。
+3. 名字为 `ChunkVisibility` → `s.visibility`（float，供原版着色用）。
 4. 都不匹配 → `(type)0`，并留注释。
 
 #### 2.5.1 放大着色器（AS）
@@ -184,19 +184,19 @@ MS 的顶点属性不是从 IA 阶段来的，得把 spvc（SPIRV-Cross）翻译
 
 #### 2.5.4 矩阵与常量约定
 
-- spvc 产出的 VS 是 `row_major` + `mul(float4, M)`（行向量在左）。
+- naga 产出的 VS 是 `row_major` + `mul(float4, M)`（行向量在左）。
   MS 里必须沿用同一约定：**不要**写 `mul(M, v)`，否则几何整体错位。
 - `resolveCullUniforms()` 要求 VS 里同时有 `CameraBlockPos`、`CameraOffset`、
   `ModelViewMat`（`float4x4`）、`ProjMat`（`float4x4`）：缺任何一个就返回 null，
   调用方改为生成**不剔除**的版本。绝不生成「剔除判据全为 0」的 AS —— 那会把整个地形剔没。
-- uniform 名字用前缀正则匹配：spvc 可能给名字加前缀，精确匹配会静默漏掉。
+- `NagaVertexAdapter` 解析 cbuffer instance 与 struct 成员，输出 `instance.member`，不能把嵌套成员作为裸变量引用。
 
 ### 2.6 管线创建与三级回退（`D3D12Device.createMeshVariant`）
 
 - 顶点格式取 `pipeline.vertexFormatBindings.firstOrNull()`。
 - 剔除开关：`pipeline.isCull && !flipY && !location.contains("animate_sprite")`
   （flipY 与精灵动画的绕序特殊，不能交给背面剔除）。
-- 像素着色器仍用原版翻译好的 HLSL，编 `ps_6_0`；MS 编 `ms_6_9`、AS 编 `as_6_9`
+- 像素着色器使用原版转换后的 HLSL，编 `ps_6_9`；MS 编 `ms_6_9`、AS 编 `as_6_9`
   （mesh 阶段要求 SM 6.9）。
 - 根签名 `D3D12CreateMeshRootSignature(bindings, 1)`，1 表示带 mesh 阶段。
 - PSO 描述：`MCDRMeshPipelineDesc().shaders(ms, as, ps)`、逐 color target 描述、

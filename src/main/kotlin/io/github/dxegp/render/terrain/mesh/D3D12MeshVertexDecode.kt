@@ -1,30 +1,11 @@
 package io.github.dxegp.render.terrain.mesh
 
 /**
- * 地形顶点解码代码生成（纯函数、不碰 GPU）：mesh 无 IA 阶段，须按 `VertexFormat` 把 28 B 顶点解成 spvc 的 `SPIRV_Cross_Input` 字段（`ChunkPosition` / `ChunkVisibility` 不在此处）。见 docs/mesh&vrs/README.md §2.4。
+ * 地形顶点解码代码生成（纯函数、不碰 GPU）：按 `VertexFormat` 把 28 B 顶点解成 mesh 入口字段。见 docs/mesh&vrs/README.md §2.4。
  */
 object D3D12MeshVertexDecode {
 
-    /** `SPIRV_Cross_Input` 的一个字段：HLSL 类型 + 名字。 */
     data class Field(val type: String, val name: String)
-
-    /** 从 VS HLSL 里解析 `struct SPIRV_Cross_Input { ... };` 的字段（类型 + 名字）。 */
-    fun parseInputFields(vsHlsl: String): List<Field> {
-        val start = vsHlsl.indexOf("struct SPIRV_Cross_Input")
-        if (start < 0) return emptyList()
-        val braceOpen = vsHlsl.indexOf('{', start)
-        val braceClose = vsHlsl.indexOf("};", braceOpen)
-        if (braceOpen < 0 || braceClose < 0) return emptyList()
-        val body = vsHlsl.substring(braceOpen + 1, braceClose)
-        val fields = mutableListOf<Field>()
-        for (line in body.lines()) {
-            val cleaned = line.substringBefore("//").trim()
-            if (cleaned.isEmpty()) continue
-            val match = Regex("^(\\w+)\\s+(\\w+)\\s*:\\s*\\w+\\s*;$").find(cleaned) ?: continue
-            fields.add(Field(match.groupValues[1], match.groupValues[2]))
-        }
-        return fields
-    }
 
     /** 生成 `vin.<name> = ...;`：按 GpuFormat 的分量数 / 位宽 / 种类选择读取函数再按字段类型截断。 */
     internal fun decodeField(field: Field, gpuFormat: String, offset: Int, stride: Int): String {

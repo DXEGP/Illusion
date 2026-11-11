@@ -346,8 +346,7 @@ class D3D12RenderPassBackend(
                     buffers[i] = (buffer as D3D12GpuBuffer).handle()
                     offsets[i] = value.offset()
                     lengths[i] = value.length()
-                    // Java 里此处直接解引用 texelBufferFormat()（null 会 NPE），用 !! 保留同样语义。
-                    texelFormats[i] = entry.texelBufferFormat!!.ordinal
+                    texelFormats[i] = if (entry.rawBuffer) -1 else requireNotNull(entry.texelBufferFormat).ordinal
                 }
             }
         }

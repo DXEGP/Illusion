@@ -21,6 +21,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * descriptor that matches its native prototype exactly (see [MethodHandle.invokeExact]).
  */
 object MCDR_ABI {
+    fun D3D12ConvertShader(request: String): String = NagaLibrary.convert(request)
+
     /** [logging] logLevel gates every per-frame diagnostic print. */
     val LOG_VERBOSE: Boolean
         get() = IllusionLogger.debugEnabled()
