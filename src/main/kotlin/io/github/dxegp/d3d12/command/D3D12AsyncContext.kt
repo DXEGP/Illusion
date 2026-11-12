@@ -24,6 +24,9 @@ class D3D12AsyncContext private constructor() : AutoCloseable {
     @Volatile
     private var closed = false
 
+    @Volatile
+    private var closing = false
+
     init {
         val requested = D3D12Settings.asyncWorkers
         this.workerCount = requested
@@ -49,7 +52,7 @@ class D3D12AsyncContext private constructor() : AutoCloseable {
     }
 
     fun available(): Boolean {
-        return !this.closed && this.descriptorAlloc != 0L && this.bundlePool != 0L
+        return !this.closed && !this.closing && this.descriptorAlloc != 0L && this.bundlePool != 0L
             && this.workers != null
     }
 
@@ -59,7 +62,7 @@ class D3D12AsyncContext private constructor() : AutoCloseable {
 
     /** worker 线程池；仅在 [available] 为 true 时非 null。 */
     fun workers(): ExecutorService? {
-        return this.workers
+        return if (this.closing || this.closed) null else this.workers
     }
 
     fun descriptorAlloc(): Long {
@@ -94,30 +97,39 @@ class D3D12AsyncContext private constructor() : AutoCloseable {
         return MCDR_ABI.D3D12AsyncCurrentFrameValue(ctx)
     }
 
+    @Synchronized
     override fun close() {
         if (this.closed) {
             return
         }
-        this.closed = true
+        this.closing = true
         val pool = this.workers
         if (pool != null) {
             pool.shutdown()
             try {
                 if (!pool.awaitTermination(2L, TimeUnit.SECONDS)) {
                     pool.shutdownNow()
+                    check(pool.awaitTermination(2L, TimeUnit.SECONDS)) {
+                        "Async workers remain active; native pools are retained"
+                    }
                 }
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 pool.shutdownNow()
+                throw IllegalStateException("Async worker shutdown interrupted; native pools are retained", e)
             }
         }
-        // 先停 worker 再销毁 native 资源：销毁后 worker 再调 JNI 会拿到悬空指针。
+        check(MCDR_ABI.D3D12DestroyAsyncRenderer()) {
+            "Async renderer or GPU remains active; native pools are retained"
+        }
         if (this.bundlePool != 0L) {
             MCDR_ABI.D3D12AsyncBundlePoolDestroy(this.bundlePool)
         }
         if (this.descriptorAlloc != 0L) {
             MCDR_ABI.D3D12AsyncDescriptorDestroy(this.descriptorAlloc)
         }
+        this.workers = null
+        this.closed = true
     }
 
     companion object {
@@ -131,13 +143,14 @@ class D3D12AsyncContext private constructor() : AutoCloseable {
         private var instance: D3D12AsyncContext? = null
 
         @JvmStatic
+        @Synchronized
         fun init(): Boolean {
             if (!ENABLED) {
                 LOGGER.info("async command lists disabled by config ([renderer] asyncCommandLists = false)")
                 return false
             }
             if (instance != null) {
-                return true
+                return instance!!.available()
             }
             val created = D3D12AsyncContext()
             if (!created.available()) {
@@ -149,11 +162,12 @@ class D3D12AsyncContext private constructor() : AutoCloseable {
         }
 
         @JvmStatic
+        @Synchronized
         fun shutdown() {
             val current = instance
-            instance = null
             if (current != null) {
                 current.close()
+                instance = null
             }
         }
 

@@ -3,6 +3,7 @@ package io.github.dxegp.render.presentation.framegen
 import io.github.dxegp.d3d12.ffi.MCDRLayout
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
 import io.github.dxegp.render.temporal.D3D12Temporal
+import io.github.dxegp.render.frameprep.FrameInputCoordinates
 import java.lang.foreign.Arena
 import java.lang.foreign.ValueLayout
 import io.github.dxegp.diagnostics.IllusionLogger
@@ -32,11 +33,12 @@ internal object FrameGenerationConstants {
                     fc.set(f32, MCDRLayout.FG_CONSTANTS_VIEW + n * 4L, viewRow[n])
                     fc.set(f32, MCDRLayout.FG_CONSTANTS_PROJECTION + n * 4L, projRow[n])
                 }
-                fc.set(f32, MCDRLayout.FG_CONSTANTS_JITTER_X, jitterX)
-                fc.set(f32, MCDRLayout.FG_CONSTANTS_JITTER_Y, jitterY)
+                val sdkJitter = FrameInputCoordinates.sdkJitter(jitterX, jitterY)
+                fc.set(f32, MCDRLayout.FG_CONSTANTS_JITTER_X, sdkJitter[0])
+                fc.set(f32, MCDRLayout.FG_CONSTANTS_JITTER_Y, sdkJitter[1])
                 // MV 是渲染像素空间（见 D3D12Velocity），缩放 1.0 与 SR 侧同一约定。
-                fc.set(f32, MCDRLayout.FG_CONSTANTS_MV_SCALE_X, 1.0f)
-                fc.set(f32, MCDRLayout.FG_CONSTANTS_MV_SCALE_Y, 1.0f)
+                fc.set(f32, MCDRLayout.FG_CONSTANTS_MV_SCALE_X, FrameInputCoordinates.MOTION_SCALE)
+                fc.set(f32, MCDRLayout.FG_CONSTANTS_MV_SCALE_Y, FrameInputCoordinates.MOTION_SCALE)
                 fc.set(ValueLayout.JAVA_INT, MCDRLayout.FG_CONSTANTS_RESET_HISTORY, if (reset) 1 else 0)
                 fc.set(f32, MCDRLayout.FG_CONSTANTS_FRAME_RENDER_TIME, 0.0f)
                 MCDR_ABI.D3D12FgSetConstants(fc)

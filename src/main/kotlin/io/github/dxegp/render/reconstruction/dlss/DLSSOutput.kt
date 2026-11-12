@@ -133,22 +133,23 @@ object DLSSOutput {
     fun release() {
         val existing = this.texture
         val wasHandedOver = this.handedOverHandle != 0L
-        this.texture = null
-        this.width = 0
-        this.height = 0
-        this.handedOverHandle = 0L
         if (existing == null) {
             return
         }
         // 1) 先让 native 松手（就绪顺序：清 override -> 再销毁资源）。
         if (wasHandedOver) {
             try {
-                MCDR_ABI.D3D12SetDlssOutput(0L)
+                check(MCDR_ABI.D3D12SetDlssOutput(0L) == 0) { "Native DLSS output remains retained" }
             } catch (t: Throwable) {
                 Illusion.LOGGER.warn(
                     "clearing the native DLSS output override before release threw: {}", t)
+                throw IllegalStateException("Cannot release a DLSS output still borrowed by native", t)
             }
         }
+        this.texture = null
+        this.width = 0
+        this.height = 0
+        this.handedOverHandle = 0L
         // 2) 再销毁这张纹理。
         try {
             existing.close()

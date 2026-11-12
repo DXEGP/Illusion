@@ -39,6 +39,19 @@ object MCDRLayout {
     @JvmField
     val PTR: AddressLayout = ValueLayout.ADDRESS
 
+    @JvmField
+    val VANILLA_FRAME_INPUT: MemoryLayout = MemoryLayout.structLayout(
+        I32.withName("schemaVersion"), I32.withName("width"), I32.withName("height"), I32.withName("reserved"),
+        I64.withName("worldEpoch"), I64.withName("realFrameId"), I64.withName("configVersion"), I64.withName("resourceVersion")
+    ).withByteAlignment(8).withName("mcdr_vanilla_frame_input")
+    @JvmField val VANILLA_FRAME_SCHEMA = offset(VANILLA_FRAME_INPUT, "schemaVersion")
+    @JvmField val VANILLA_FRAME_WIDTH = offset(VANILLA_FRAME_INPUT, "width")
+    @JvmField val VANILLA_FRAME_HEIGHT = offset(VANILLA_FRAME_INPUT, "height")
+    @JvmField val VANILLA_FRAME_WORLD = offset(VANILLA_FRAME_INPUT, "worldEpoch")
+    @JvmField val VANILLA_FRAME_ID = offset(VANILLA_FRAME_INPUT, "realFrameId")
+    @JvmField val VANILLA_FRAME_CONFIG = offset(VANILLA_FRAME_INPUT, "configVersion")
+    @JvmField val VANILLA_FRAME_RESOURCE = offset(VANILLA_FRAME_INPUT, "resourceVersion")
+
     // mcdr_binding_slot: type 0 = CBV (root descriptor), 1 = SRV (texture view), 2 = SRV (texel buffer).
     @JvmField
     val BINDING_SLOT: MemoryLayout = MemoryLayout.structLayout(
@@ -425,6 +438,7 @@ object MCDRLayout {
     @JvmField val FG_DISPATCH_P_UI_COLOR: Long = offset(FG_DISPATCH, "pUiColor")
 
     private val EXPECTED_C_SIZES: Array<Array<Any>> = arrayOf(
+        arrayOf<Any>("mcdr_vanilla_frame_input", VANILLA_FRAME_INPUT, 48L),
         arrayOf<Any>("mcdr_binding_slot",         BINDING_SLOT,        40L),
         arrayOf<Any>("mcdr_partition_draw",       PARTITION_DRAW,      56L),
         arrayOf<Any>("mcdr_color_target_desc",    COLOR_TARGET,        12L),
@@ -465,6 +479,7 @@ object MCDRLayout {
     init {
         // describe() and verify() both enumerate this map, so a registered struct is always checked.
         STRUCTS["mcdr_binding_slot"] = BINDING_SLOT
+        STRUCTS["mcdr_vanilla_frame_input"] = VANILLA_FRAME_INPUT
         STRUCTS["mcdr_partition_draw"] = PARTITION_DRAW
         STRUCTS["mcdr_color_target_desc"] = COLOR_TARGET
         STRUCTS["mcdr_depth_state_desc"] = DEPTH_STATE

@@ -195,6 +195,7 @@ object IllusionConfig {
 
     /** `[mesh] terrainCull` — cull terrain meshlets in the amplification shader. */
     val MESH_TERRAIN_CULL: ModConfigSpec.BooleanValue
+    val MESH_QUADS: ModConfigSpec.ConfigValue<Int>
 
     /** `[vrs] terrainNearBlocks` — terrain closer than this always shades at 1X1. */
     val VRS_TERRAIN_NEAR_BLOCKS: ModConfigSpec.DoubleValue
@@ -496,6 +497,10 @@ object IllusionConfig {
             )
             .translation("dxr_mc.configuration.mesh.terrain_cull")
             .define("terrainCull", false)
+
+        MESH_QUADS = BUILDER
+            .comment("Maximum quads per newly uploaded terrain meshlet: 16, 32, or 64. Existing geometry keeps its captured size.")
+            .defineInList("quadsPerMeshlet", 16, listOf(16, 32, 64))
 
         BUILDER.pop()
 

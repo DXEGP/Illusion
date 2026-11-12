@@ -44,6 +44,8 @@ class D3D12ShaderCompiler : AutoCloseable {
             flipTexcoord = flipTexcoord)
         validateBindings(vertexResult, bindings)
         validateBindings(fragmentResult, bindings)
+        val rootConstants = mergeRootConstants(vertexResult.manifest.pushConstants,
+            fragmentResult.manifest.pushConstants, pipeline.pushConstantSize())
         val inputs = vertexResult.manifest.stageIo.inputs
         for (input in inputs) {
             if (input.name !in attributes) {
@@ -57,7 +59,7 @@ class D3D12ShaderCompiler : AutoCloseable {
             Files.writeString(directory.resolve("vs_$stamp.hlsl"), vertexResult.hlsl)
             Files.writeString(directory.resolve("ps_$stamp.hlsl"), fragmentResult.hlsl)
         }
-        return D3D12CompiledShader(vertexResult.hlsl, fragmentResult.hlsl, entries, inputs)
+        return D3D12CompiledShader(vertexResult.hlsl, fragmentResult.hlsl, entries, inputs, rootConstants)
     }
 
     private fun collectBindings(pipeline: RenderPipeline,
@@ -117,6 +119,39 @@ class D3D12ShaderCompiler : AutoCloseable {
                 throw ShaderCompileException("naga register mismatch: $name")
             }
         }
+        for (resource in resources.constantBuffers + resources.textures + resources.storageBuffers + resources.samplers) {
+            if (resource.space == D3D12RootConstantLayoutContract.SPACE &&
+                resource.register == D3D12RootConstantLayoutContract.REGISTER) {
+                throw ShaderCompileException("naga resource collides with reserved root constants b0,space1")
+            }
+        }
+    }
+
+    private fun mergeRootConstants(
+        vertex: D3D12RootConstantLayout?,
+        fragment: D3D12RootConstantLayout?,
+        declaredBytes: Int,
+    ): D3D12RootConstantLayout? {
+        val layout = vertex ?: fragment
+        if (vertex != null && fragment != null && vertex != fragment) {
+            throw ShaderCompileException("vertex and fragment push-constant layouts differ")
+        }
+        if (declaredBytes < 0 || declaredBytes % 4 != 0 ||
+            declaredBytes > D3D12RootConstantLayoutContract.MAX_DWORDS * 4) {
+            throw ShaderCompileException("push constant size must be 4-byte aligned and <= 128 bytes")
+        }
+        if (layout == null) {
+            if (declaredBytes != 0) throw ShaderCompileException("pipeline declares push constants but shaders have no push-constant block")
+            return null
+        }
+        if (layout.register != D3D12RootConstantLayoutContract.REGISTER ||
+            layout.space != D3D12RootConstantLayoutContract.SPACE ||
+            layout.byteSize != layout.dwordCount * 4 ||
+            layout.dwordCount <= 0 || layout.dwordCount > D3D12RootConstantLayoutContract.MAX_DWORDS ||
+            declaredBytes == 0 || layout.byteSize > declaredBytes) {
+            throw ShaderCompileException("invalid push-constant metadata or pipeline size")
+        }
+        return layout
     }
 
     override fun close() = Unit

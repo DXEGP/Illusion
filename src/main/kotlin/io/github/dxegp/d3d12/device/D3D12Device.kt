@@ -26,12 +26,9 @@ import com.mojang.renderpearl.backend.api.GpuSurfaceBackend
 import com.mojang.renderpearl.util.ShaderCompileException
 import io.github.dxegp.diagnostics.IllusionLogger
 import io.github.dxegp.d3d12.command.D3D12CommandEncoderBackend
-import io.github.dxegp.d3d12.ffi.MCDRMeshPipelineDesc
-import io.github.dxegp.render.terrain.mesh.D3D12MeshletShader
 import io.github.dxegp.render.terrain.D3D12TerrainSampler
 import io.github.dxegp.d3d12.resource.D3D12GpuQueryPool
 import io.github.dxegp.d3d12.surface.D3D12GpuSurface
-import io.github.dxegp.d3d12.command.D3D12AsyncContext
 import io.github.dxegp.d3d12.backend.D3D12BindGroupEntry
 import io.github.dxegp.d3d12.backend.D3D12CompiledRenderPipeline
 import io.github.dxegp.d3d12.backend.D3D12PipelineBridge
@@ -109,7 +106,6 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
             LOGGER.warn("async renderer disabled ([debug] asyncRenderThread = false) — diagnostic mode only")
         }
         // CPU/GPU 并行录制上下文（分区描述符堆 + bundle 池 + worker 池）；失败自动退回单线程。
-        D3D12AsyncContext.init()
         initialized = true
     }
 
@@ -165,7 +161,7 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
         data: ByteBuffer): GpuBuffer {
         // 镜像官方 VulkanDevice.createBuffer(data)：带 COPY_DST 分配后经命令编码器上传。
         val buffer = this.createBuffer(label, usage or GpuBuffer.USAGE_COPY_DST, data.remaining().toLong())
-        val encoder = D3D12CommandEncoderBackend()
+        val encoder = D3D12CommandEncoderBackend(null, io.github.dxegp.render.temporal.D3D12Temporal::interceptWrite)
         try {
             encoder.writeToBuffer(buffer.slice(), data)
             encoder.submit()
@@ -200,7 +196,7 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
         // 共享单例：全帧 blit/绘制/submit 落同一 CommandContext。
         var encoder = this.sharedCommandEncoder
         if (encoder == null) {
-            encoder = D3D12CommandEncoderBackend(this)
+            encoder = D3D12CommandEncoderBackend(this, io.github.dxegp.render.temporal.D3D12Temporal::interceptWrite)
             this.sharedCommandEncoder = encoder
         }
         sharedEncoderForFrame = encoder
@@ -319,16 +315,14 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
             compiler.close()
             this.glslCompiler = null
         }
-        // 先停 worker 池、销毁 bundle/描述符 native 资源，再销毁渲染线程。
         IllusionLogger.debugMessage("device.close: cache+compiler done")
         val asyncStarted = System.nanoTime()
-        D3D12AsyncContext.shutdown()
-        MCDR_ABI.D3D12DestroyAsyncRenderer()
+        check(MCDR_ABI.D3D12DestroyAsyncRenderer()) { "Async renderer still owns GPU work" }
         IllusionLogger.debugMessage("device.close: async renderer done")
         val asyncMs = (System.nanoTime() - asyncStarted) / 1_000_000
         // 必须趁 DXGI/D3D12 仍存活时显式释放设备：留给 DLL_PROCESS_DETACH 会让 ComPtr::Release()
         // 在 dxgi.dll 已 detach 后执行 → 原生异常，退出码变成 2170。
-        MCDR_ABI.D3D12DestroyDevice()
+        check(MCDR_ABI.D3D12DestroyDevice()) { "Device still owns pending work: ${MCDR_ABI.D3D12LastError()}" }
         // 清掉适配器信息：F3 与系统信息行按它非空决定是否显示 DX12 行。
         D3D12AdapterInfo.current = null
         IllusionLogger.debugMessage(
@@ -343,6 +337,7 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
      */
     private fun compilePipeline(pipeline: RenderPipeline,
         shaderSource: ShaderSource?, flipY: Boolean): D3D12CompiledRenderPipeline {
+        require(pipeline.pushConstantSize() in 0..128 && pipeline.pushConstantSize() % 4 == 0)
         val pipeName = pipeline.location.toString()
         val vertexId = pipeline.shaders[ShaderType.VERTEX] ?: pipeline.location
         val fragmentId = pipeline.shaders[ShaderType.FRAGMENT] ?: pipeline.location
@@ -364,7 +359,7 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
             val compiled = this.getOrCreateCompiler()
                 .compile(pipeline, vertexShader, fragmentShader, flipY)
             val desc = buildNativeDesc(compiled, pipeline, flipY)
-            val handle = MCDR_ABI.D3D12CreateGraphicsPipeline(desc)
+            val handle = MCDR_ABI.D3D12CreateGraphicsPipeline(desc, pipeline.pushConstantSize())
             if (handle == 0L) {
                 LOGGER.error("{} COMPILE FAILED (native): dx12CreateGraphicsPipeline returned 0",
                     pipeName)
@@ -373,7 +368,7 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
             LOGGER.info("{} COMPILE OK (handle={})", pipeName, handle)
             val result = D3D12CompiledRenderPipeline(
                 pipeline, handle,
-                compiled.entries
+                compiled.entries, compiled.rootConstants
             )
             // D3D12 没有宽线：LINELIST 恒 1px，而 rendertype_lines.vsh 只把端点横移 LineWidth/2 →
             // 这里会画成「1px 长边 + 两端小横杠」。为线管线另建 TRIANGLES 拓扑 PSO，6 索引正好摊成两个三角形。
@@ -385,7 +380,7 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
                 quadDesc.topology(
                     com.mojang.renderpearl.api.pipeline.PrimitiveTopology.TRIANGLES.ordinal,
                     false, pipeline.polygonMode.ordinal)
-                val quadPso = MCDR_ABI.D3D12CreateGraphicsPipeline(quadDesc)
+                val quadPso = MCDR_ABI.D3D12CreateGraphicsPipeline(quadDesc, pipeline.pushConstantSize())
                 if (quadPso != 0L) {
                     result.attachLineQuadVariant(quadPso)
                     LOGGER.info("line quad variant for {}: pso={}", pipeName, quadPso)
@@ -393,17 +388,16 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
                     LOGGER.warn("line quad variant for {} failed; lines stay 1px", pipeName)
                 }
             }
-            // 地形管线全部建 meshlet 变体（solid/cutout/OIT 半透明；经典半透明排序依赖，暂不派发），
-            // 判定靠管线名里的 "terrain"。
-            if (D3D12Settings.meshTerrain &&
-                  pipeName.contains("terrain") && !pipeName.contains("shadow")) {
-                val variant = createMeshVariant(pipeline, compiled, flipY)
-                if (variant.meshletPso != 0L) {
-                    result.attachMeshletVariant(variant.meshletPso, variant.meshletAs)
-                    LOGGER.info("meshlet variant for {}: pso={} as={}",
-                        pipeName, variant.meshletPso, variant.meshletAs)
-                } else {
-                    LOGGER.warn("meshlet variant for {} failed", pipeName)
+            if (pipeName.contains("terrain") && !pipeName.contains("shadow") &&
+                !io.github.dxegp.render.terrain.mesh.D3D12TerrainWorkGraph.requiresOrderedDraw(pipeline)) {
+                try {
+                    check((D3D12AdapterInfo.current?.workGraphsTier ?: 0) >= 10) {
+                        "Terrain requires Work Graph Tier 1.0"
+                    }
+                    result.compileTerrainWorkGraphVariants(compiled, flipY)
+                } catch (failure: Throwable) {
+                    result.close()
+                    throw failure
                 }
             }
             return result
@@ -413,106 +407,6 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
         }
     }
 
-    /** meshlet 变体产物（`meshletPso == 0` 表示建失败）。 */
-    private data class MeshVariantResult(val meshletPso: Long, val meshletAs: Boolean)
-
-    /**
-     * 为一条地形管线建 meshlet 变体：[D3D12MeshletShader] 把地形 VS 包成 `ms_main`（每线程组 = 16 quad，
-     * 索引算术展开、不读索引缓冲），PS 复用原片段着色器；`[mesh] terrainCull` 打开时再编 `as_main`。
-     */
-    private fun createMeshVariant(pipeline: RenderPipeline, compiled: D3D12CompiledShader,
-                                  flipY: Boolean): MeshVariantResult {
-        val format = pipeline.vertexFormatBindings.firstOrNull() ?: return MeshVariantResult(0L, false)
-        val cull = pipeline.isCull && !flipY &&
-            !pipeline.location.toString().contains("animate_sprite")
-
-        // 26.3 的地形 PS 自己按段读 chunkVisibility（VS 输出插值量），直接编译原版即可。
-        val psDxil = MCDR_ABI.D3D12CompileShaderDxc(compiled.fragmentHlsl, "main", "ps_6_9")
-            ?: run {
-                LOGGER.warn("terrain PS failed to compile ({}): {}", pipeline.location, MCDR_ABI.D3D12LastError())
-                return MeshVariantResult(0L, false)
-            }
-
-        fun buildMeshDesc(msBytes: ByteArray, asBytes: ByteArray?): MCDRMeshPipelineDesc {
-            val meshDesc = MCDRMeshPipelineDesc().shaders(msBytes, asBytes, psDxil)
-            val colorStates = pipeline.colorTargetStates
-            for (index in colorStates.indices) {
-                val target = colorStates[index] ?: continue
-                meshDesc.addColorTarget(toColorTarget(target))
-            }
-            val depthState = pipeline.depthStencilState
-            if (depthState != null) {
-                meshDesc.depth(GpuFormat.D32_FLOAT.ordinal, depthState.writeDepth(), depthState.depthTest().ordinal)
-            }
-            meshDesc.topology(cull, pipeline.polygonMode.ordinal)
-            return meshDesc
-        }
-
-        val bindings = compiled.entries.mapIndexed { index, entry ->
-            val type = when (entry.type) {
-                D3D12BindGroupEntry.Type.UNIFORM_BUFFER -> 0
-                D3D12BindGroupEntry.Type.SAMPLED_IMAGE -> 1
-                D3D12BindGroupEntry.Type.TEXEL_BUFFER -> 2
-            }
-            type to index
-        }
-        val signature = MCDR_ABI.D3D12CreateMeshRootSignature(bindings, 1)
-        if (signature == 0L) {
-            LOGGER.error("mesh variant for {}: createMeshRootSignature returned 0", pipeline.location)
-            return MeshVariantResult(0L, false)
-        }
-        var meshletHandle = 0L
-        var meshletAs = false
-        try {
-            val wantAs = D3D12Settings.meshTerrainCull
-            var hlsl = D3D12MeshletShader.build(compiled, format, cull = wantAs)
-            var asActive = wantAs
-            if (hlsl == null && wantAs) {
-                // uniform 解析不到时退回不剔除的 meshlet（剔除判据不全会成片剔掉地形）。
-                LOGGER.warn("AS build failed ({}), falling back to meshlets without culling", pipeline.location)
-                hlsl = D3D12MeshletShader.build(compiled, format, cull = false)
-                asActive = false
-            }
-            var meshletMs = hlsl?.let { MCDR_ABI.D3D12CompileShaderDxc(it, "ms_main", "ms_6_9") }
-            var meshletAsBytes = if (asActive && hlsl != null) {
-                MCDR_ABI.D3D12CompileShaderDxc(hlsl, "as_main", "as_6_9")
-            } else {
-                null
-            }
-            if (meshletMs == null || (asActive && meshletAsBytes == null)) {
-                LOGGER.warn("meshlet MS/AS failed to compile ({}): {}, falling back to the non-culling variant",
-                    pipeline.location, MCDR_ABI.D3D12LastError())
-                hlsl = D3D12MeshletShader.build(compiled, format, cull = false)
-                meshletMs = hlsl?.let { MCDR_ABI.D3D12CompileShaderDxc(it, "ms_main", "ms_6_9") }
-                meshletAsBytes = null
-                asActive = false
-            }
-            if (meshletMs == null) {
-                LOGGER.warn("meshlet MS failed to build ({}): {}",
-                    pipeline.location, MCDR_ABI.D3D12LastError())
-            } else {
-                val withAs = meshletAsBytes != null
-                meshletHandle = MCDR_ABI.D3D12CreateMeshPipelineWithRootSignature(
-                    buildMeshDesc(meshletMs, if (withAs) meshletAsBytes else null), signature)
-                if (meshletHandle == 0L) {
-                    LOGGER.warn("meshlet PSO creation failed ({}): {}",
-                        pipeline.location, MCDR_ABI.D3D12LastError())
-                    if (withAs) {
-                        meshletHandle = MCDR_ABI.D3D12CreateMeshPipelineWithRootSignature(
-                            buildMeshDesc(meshletMs, null), signature)
-                        if (meshletHandle != 0L) {
-                            LOGGER.warn("meshlet AS PSO failed, falling back to no culling ({})", pipeline.location)
-                        }
-                    }
-                } else {
-                    meshletAs = withAs
-                }
-            }
-        } finally {
-            MCDR_ABI.D3D12ReleaseRootSignature(signature)
-        }
-        return MeshVariantResult(meshletHandle, meshletAs)
-    }
     private fun getOrCompileShader(id: Identifier, type: ShaderType,
         defines: ShaderDefines, shaderSource: ShaderSource?): D3D12IntermediaryShaderModule {
         val key = ShaderCompilationKey(id, type, defines)
@@ -770,7 +664,7 @@ class D3D12Device(private val defaultShaderSource: ShaderSource?) : GpuDeviceBac
                 if (haveNative) nativeInfo.backendName() else "DirectX 12",
                 timestampPeriod,
                 DeviceLimits(16, 256, 16384, Long.MAX_VALUE, 4096, 8, 65536),
-                DeviceFeatures(true, true, false, true, true, true, true, true),
+                DeviceFeatures(true, true, true, true, true, true, true, true),
                 emptySet(),
                 HintsAndWorkarounds(false, false, false, false),
                 if (haveNative) nativeInfo.deviceTypeEnum() else DeviceType.DISCRETE

@@ -10,18 +10,26 @@ import java.nio.IntBuffer;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.function.Supplier;
+import java.util.concurrent.CancellationException;
 import javax.imageio.ImageIO;
 import net.neoforged.fml.ModLoadingIssue;
 import net.neoforged.fml.loading.ProgramArgs;
+import net.neoforged.fml.earlydisplay.render.backend.ELSRenderBackend;
+import net.neoforged.fml.earlydisplay.render.backend.ELSTexture;
+import net.neoforged.fml.earlydisplay.render.backend.TextureFormat;
+import net.neoforged.fml.earlydisplay.theme.ThemeColor;
 import net.neoforged.neoforgespi.earlywindow.ImmediateWindowProvider;
 import org.jspecify.annotations.Nullable;
 import org.lwjgl.sdl.SDLError;
+import org.lwjgl.sdl.SDLEvents;
+import org.lwjgl.sdl.SDL_Event;
 import org.lwjgl.sdl.SDLInit;
 import org.lwjgl.sdl.SDLPixels;
 import org.lwjgl.sdl.SDLRender;
 import org.lwjgl.sdl.SDLSurface;
 import org.lwjgl.sdl.SDLVideo;
 import org.lwjgl.system.MemoryUtil;
+import org.lwjgl.system.MemoryStack;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -48,17 +56,20 @@ public final class DxrmcEarlyWindowProvider implements ImmediateWindowProvider {
     private static final Color BACKGROUND = new Color(0x00, 0x00, 0x00);
     private static final Color CAPTION_COLOR = new Color(0xD8, 0xDC, 0xE2);
 
-    /** 窗口句柄由 mixin 用后即清；名字改动要三处同步（见 docs/misc/mixins-and-earlywindow.md §5.4）。 */
-    private static final String HANDLE_PROPERTY = "dxrmc.earlywindow.handle";
-    /** 由 mixin 在窗口真被接管后写入（仅 D3D12）。 */
-    private static final String ADOPTED_PROPERTY = "dxrmc.earlywindow.adopted";
+    private EarlyWindowLease lease;
+    private ELSRenderBackend gameBackend;
+    private ELSTexture gameTexture;
+    private boolean stopped;
+    private boolean closed;
+    private boolean handedOver;
+    private Thread gameRenderThread;
+    private Thread earlyWindowThread;
 
     private long window;
     private long renderer;
     private BufferedImage logo;
     private BufferedImage mojangles;
     private boolean textureFailureLogged;
-    private boolean handedOver;
     private int progressTicks;
 
     @Override
@@ -67,7 +78,11 @@ public final class DxrmcEarlyWindowProvider implements ImmediateWindowProvider {
     }
 
     @Override
-    public void initialize(ProgramArgs args) {
+    public synchronized void initialize(ProgramArgs args) {
+        if (lease != null || closed) {
+            throw new IllegalStateException("Early window provider is already initialized or closed");
+        }
+        earlyWindowThread = Thread.currentThread();
         if (!SDLInit.SDL_Init(SDLInit.SDL_INIT_VIDEO)) {
             LOGGER.error("SDL_Init failed: {}", SDLError.SDL_GetError());
             return;
@@ -78,20 +93,24 @@ public final class DxrmcEarlyWindowProvider implements ImmediateWindowProvider {
             LOGGER.error("SDL_CreateWindow failed: {}", SDLError.SDL_GetError());
             return;
         }
+        lease = new EarlyWindowLease(window);
+        try {
         SDLVideo.SDL_SetWindowPosition(window, SDLVideo.SDL_WINDOWPOS_CENTERED, SDLVideo.SDL_WINDOWPOS_CENTERED);
         renderer = SDLRender.SDL_CreateRenderer(window, "software");
         if (renderer == 0L) {
-            LOGGER.warn("software renderer unavailable ({}), using default renderer",
+            LOGGER.warn("software renderer unavailable ({}); loading image disabled",
                     SDLError.SDL_GetError());
-            renderer = SDLRender.SDL_CreateRenderer(window, (CharSequence) null);
         }
         SDLVideo.SDL_ShowWindow(window);
         logo = loadLogo();
         mojangles = loadImage(MOJANGLES_RESOURCE);
-        System.setProperty(HANDLE_PROPERTY, Long.toString(window));
         LOGGER.info("early window created handle={} renderer={} (single-window mode)", window, renderer);
         LOGGER.info("loading screen: logo={} bar=purple caption='{}' (Mojangles glyphs={})", logo != null ? logo.getWidth() + "x" + logo.getHeight() : "missing", CAPTION, mojangles != null ? mojangles.getWidth() + "x" + mojangles.getHeight() : "missing");
         redraw();
+        } catch (RuntimeException | Error failure) {
+            close();
+            throw failure;
+        }
     }
 
     private BufferedImage loadLogo() {
@@ -108,11 +127,12 @@ public final class DxrmcEarlyWindowProvider implements ImmediateWindowProvider {
     }
 
     private void redraw() {
-        if (renderer == 0L || handedOver) {
+        if ((renderer == 0L && gameBackend == null) || stopped) {
             return;
         }
-        int width = INITIAL_WIDTH;
-        int height = INITIAL_HEIGHT;
+        WindowState state = snapshot();
+        int width = Math.max(1, state.width());
+        int height = Math.max(1, state.height());
 
         BufferedImage frame = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
         Graphics2D g = frame.createGraphics();
@@ -227,6 +247,10 @@ public final class DxrmcEarlyWindowProvider implements ImmediateWindowProvider {
     }
     /** 必须走 surface → texture：软件 renderer 会**静默忽略**流式纹理上传（不报错、也不显示）。 */
     private void presentFrame(BufferedImage frame) {
+        if (gameBackend != null) {
+            presentGameFrame(frame);
+            return;
+        }
         int width = frame.getWidth();
         int height = frame.getHeight();
         int[] argb = frame.getRGB(0, 0, width, height, null, 0, width);
@@ -284,35 +308,66 @@ public final class DxrmcEarlyWindowProvider implements ImmediateWindowProvider {
     }
 
     @Override
-    public void stopEventPolling() {}
+    public synchronized void stopEventPolling() {
+        stopped = true;
+    }
 
-    @Override
-    public WindowState handOverToMinecraft(Supplier<Object> renderBackend) {
-        boolean adopted = "1".equals(System.getProperty(ADOPTED_PROPERTY));
-        System.clearProperty(ADOPTED_PROPERTY);
-        System.clearProperty(HANDLE_PROPERTY);
-        handedOver = true;
-        if (!adopted) {
-            // 非 D3D12：原版自己建了窗口，我们这扇不能当第二个窗口留在屏幕上。
-            LOGGER.info("graphics backend is not D3D12 - dropping the early window, vanilla creates its own");
-            close();
-            if (window != 0L) {
-                SDLVideo.SDL_HideWindow(window);
-            }
-            return new WindowState(0, 0, INITIAL_WIDTH, INITIAL_HEIGHT, false, false, false, false);
+    public synchronized long claimWindow() {
+        if (lease != null && lease.isClaimed()) {
+            throw new IllegalStateException("Early window has already been claimed by Minecraft");
         }
-        LOGGER.info("handing the early window over to Minecraft (same window, no recreate)");
-        // 故意不销毁 renderer：销毁会让窗口黑到游戏第一帧，观感上就是闪一下。改在 close() 释放。
-        return new WindowState(0, 0, INITIAL_WIDTH, INITIAL_HEIGHT, false, false, false, false);
+        if (closed || lease == null) {
+            return 0L;
+        }
+        stopped = true;
+        releaseRenderer();
+        return lease.claim();
     }
 
     @Override
-    public void periodicTick() {
-        if (handedOver) {
+    public synchronized WindowState handOverToMinecraft(Supplier<Object> renderBackend) {
+        if (closed || handedOver) {
+            throw new IllegalStateException("Early window handoff is already complete or closed");
+        }
+        WindowState state = snapshot();
+        handedOver = true;
+        if (lease == null || !lease.isClaimed()) {
+            // 非 D3D12：原版自己建了窗口，我们这扇不能当第二个窗口留在屏幕上。
+            LOGGER.info("graphics backend is not D3D12 - dropping the early window, vanilla creates its own");
+            close();
+            return state;
+        }
+        LOGGER.info("handing the early window over to Minecraft (same window, no recreate)");
+        releaseRenderer();
+        try {
+            gameBackend = (ELSRenderBackend) renderBackend.get();
+            gameRenderThread = Thread.currentThread();
+            if (gameBackend.getWindowHandle() != window) {
+                throw new IllegalStateException("Loading backend changed the adopted SDL window");
+            }
+            stopped = false;
+            redraw();
+            return state;
+        } catch (RuntimeException | Error failure) {
+            close();
+            throw failure;
+        }
+    }
+
+    @Override
+    public synchronized void periodicTick() {
+        if (stopped) {
             return;
         }
-        // NOTE: 绝不能在这里 drain SDL 事件：SDL_PollEvent(NULL) 有待处理事件就一直返回 true，
-        // 而 FML 在加载线程上调这个方法 —— 清一次队列就把加载线程卡死。
+        if (gameBackend != null && Thread.currentThread() != gameRenderThread) {
+            return;
+        }
+        if (!handedOver && window != 0L) {
+            if (Thread.currentThread() != earlyWindowThread) {
+                return;
+            }
+            pollEarlyEvents();
+        }
         progressTicks++;
         if (progressTicks % 4 == 0) {
             redraw();
@@ -325,17 +380,110 @@ public final class DxrmcEarlyWindowProvider implements ImmediateWindowProvider {
     }
 
     @Override
-    public void completeProgress() {
+    public synchronized void completeProgress() {
         progressTicks = 50;
-        redraw();
+        if (gameBackend == null ? Thread.currentThread() == earlyWindowThread
+                : Thread.currentThread() == gameRenderThread) {
+            redraw();
+        }
     }
 
     @Override
-    public void close() {
-        handedOver = true;
+    public synchronized void close() {
+        if (closed) {
+            return;
+        }
+        closed = true;
+        stopped = true;
+        if (gameBackend != null) {
+            ELSRenderBackend backend = gameBackend;
+            ELSTexture texture = gameTexture;
+            gameBackend = null;
+            gameTexture = null;
+            backend.guardResourceCleanup(() -> {
+                try {
+                    if (texture != null) {
+                        texture.close();
+                    }
+                } finally {
+                    backend.close();
+                }
+            });
+        }
+        releaseRenderer();
+        if (lease != null) {
+            lease.closeUnclaimed();
+        }
+        window = 0L;
+    }
+
+    private void releaseRenderer() {
         if (renderer != 0L) {
+            SDLRender.SDL_SetRenderDrawColor(renderer, (byte) 0, (byte) 0, (byte) 0, (byte) 255);
+            SDLRender.SDL_RenderClear(renderer);
+            SDLRender.SDL_RenderPresent(renderer);
             SDLRender.SDL_DestroyRenderer(renderer);
             renderer = 0L;
+        }
+    }
+
+    private void pollEarlyEvents() {
+        try (SDL_Event event = SDL_Event.malloc()) {
+            while (SDLEvents.SDL_PollEvent(event)) {
+                if (event.type() == SDLEvents.SDL_EVENT_QUIT
+                        || event.type() == SDLEvents.SDL_EVENT_WINDOW_CLOSE_REQUESTED
+                        && SDLEvents.SDL_GetWindowFromEvent(event) == window) {
+                    close();
+                    throw new CancellationException("Early loading window was closed");
+                }
+            }
+        }
+    }
+
+    private WindowState snapshot() {
+        if (window == 0L) {
+            return new WindowState(0, 0, INITIAL_WIDTH, INITIAL_HEIGHT, false, false, false, false);
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            IntBuffer x = stack.callocInt(1);
+            IntBuffer y = stack.callocInt(1);
+            IntBuffer width = stack.ints(INITIAL_WIDTH);
+            IntBuffer height = stack.ints(INITIAL_HEIGHT);
+            boolean position = SDLVideo.SDL_GetWindowPosition(window, x, y);
+            SDLVideo.SDL_GetWindowSize(window, width, height);
+            long flags = SDLVideo.SDL_GetWindowFlags(window);
+            return new WindowState(x.get(0), y.get(0), width.get(0), height.get(0), position,
+                    (flags & SDLVideo.SDL_WINDOW_MINIMIZED) != 0,
+                    (flags & SDLVideo.SDL_WINDOW_MAXIMIZED) != 0,
+                    (flags & SDLVideo.SDL_WINDOW_FULLSCREEN) != 0);
+        }
+    }
+
+    private void presentGameFrame(BufferedImage frame) {
+        if (!gameBackend.startFrame((width, height) -> {})) {
+            return;
+        }
+        if (gameTexture != null && (gameTexture.width() != frame.getWidth() || gameTexture.height() != frame.getHeight())) {
+            gameTexture.close();
+            gameTexture = null;
+        }
+        if (gameTexture == null) {
+            gameTexture = gameBackend.createTexture("Illusion loading screen", frame.getWidth(), frame.getHeight(),
+                    TextureFormat.RGBA8_UNORM, true);
+        }
+        ByteBuffer pixels = MemoryUtil.memAlloc(frame.getWidth() * frame.getHeight() * 4);
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            for (int pixel : frame.getRGB(0, 0, frame.getWidth(), frame.getHeight(), null, 0, frame.getWidth())) {
+                pixels.put((byte) (pixel >>> 16)).put((byte) (pixel >>> 8)).put((byte) pixel).put((byte) (pixel >>> 24));
+            }
+            pixels.flip();
+            gameBackend.writeToTexture(gameTexture, pixels);
+            IntBuffer width = stack.mallocInt(1);
+            IntBuffer height = stack.mallocInt(1);
+            SDLVideo.SDL_GetWindowSizeInPixels(window, width, height);
+            gameBackend.presentTexture(gameTexture, ThemeColor.ofRgb(0), width.get(0), height.get(0));
+        } finally {
+            MemoryUtil.memFree(pixels);
         }
     }
 }

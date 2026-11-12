@@ -32,6 +32,7 @@ object D3D12Settings {
         val reflexFrameLimitUs: Int,
         val meshTerrain: Boolean,
         val meshTerrainCull: Boolean,
+        val meshQuads: Int,
         val dumpHlsl: Boolean,
         val debugLayer: Boolean,
         val profiling: Boolean,
@@ -102,6 +103,7 @@ object D3D12Settings {
 
     /** `[mesh] terrainCull` —— 用 AS 剔除地形 meshlet（依赖 `[mesh] terrain`）。 */
     val meshTerrainCull: Boolean get() = snapshot().meshTerrainCull
+    val meshQuads: Int get() = snapshot().meshQuads
 
     val dumpHlsl: Boolean get() = snapshot().dumpHlsl
 
@@ -265,6 +267,7 @@ object D3D12Settings {
                 ?: (System.getenv("MCDR_REFLEX_FRAME_LIMIT_US")?.trim()?.toIntOrNull() ?: 0),
             meshTerrain = config(true) { IllusionConfig.MESH_TERRAIN.get() },
             meshTerrainCull = config(false) { IllusionConfig.MESH_TERRAIN_CULL.get() },
+            meshQuads = config(16) { IllusionConfig.MESH_QUADS.get() },
             dumpHlsl = config(false) { IllusionConfig.DUMP_HLSL.get() },
             dlssOutputHandover = config(true) { IllusionConfig.DLSS_OUTPUT_HANDOVER.get() } &&
                 !legacy("dlssOutputHandover") {

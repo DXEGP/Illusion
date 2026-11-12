@@ -20,7 +20,7 @@ displayURL="https://github.com/NTS-Official/Illusion"
 iconFile="assets/${mod_id}/icon.png"
 bannerFile="assets/${mod_id}/logo_flat_dark.png"
 
-credits="DXM Dev Team"
+credits="DirectX Mod Development Team"
 authors="NoTuring_Steve"
 
 description='''

@@ -1,5 +1,9 @@
 package io.github.dxegp.render.reconstruction.dlss
 
+import io.github.dxegp.render.frame.vanilla.recordDlssEvaluate
+import io.github.dxegp.render.frame.vanilla.recordSharpen
+import io.github.dxegp.render.frame.vanilla.recordVelocityPass
+
 import io.github.dxegp.Illusion
 import io.github.dxegp.d3d12.command.D3D12CommandEncoderBackend
 import io.github.dxegp.config.D3D12Settings
@@ -23,7 +27,10 @@ import io.github.dxegp.d3d12.resource.D3D12GpuTextureView
 import com.mojang.renderpearl.api.textures.GpuTextureView
 import com.mojang.serialization.Codec
 import io.github.dxegp.render.presentation.framegen.FrameGenerationConstants
+import io.github.dxegp.render.frameprep.FrameInputCoordinates
 import io.github.dxegp.render.reconstruction.SuperResolution
+import io.github.dxegp.render.reconstruction.ReconstructionFrameInputs
+import io.github.dxegp.render.reconstruction.ReconstructionHistory
 import java.io.File
 import java.lang.foreign.Arena
 import java.lang.foreign.MemoryLayout.PathElement
@@ -150,12 +157,11 @@ object DeepLearningSuperSampling {
 
     private var lastState: String? = null
 
-    /** 深度快照的结论串。与 [lastState] 分开记：两个挂点在同一帧，共用会互相覆盖。 */
-    private var lastDepthSnapshotState: String? = null
 
 
     /** 上一次**真正评价成功**时的输入状态，用来判 `reset`。 */
     private var evaluatedOnce = false
+    private val history = ReconstructionHistory()
 
     /** 已经警告过「比例低于该档名义输入」，只警告一次。 */
     private var reportedBelowNominal = false
@@ -646,12 +652,11 @@ object DeepLearningSuperSampling {
 
 
     /**
-     * 每帧**第一次**入口（主目标深度被清空**之前**）：录运动矢量 + 深度快照。**Evaluate 不挂这里**（此刻颜色里还没有本帧世界层）。
+     * 主目标深度被清空之前录制运动矢量，Evaluate 使用随后捕获的共享深度。
      */
     @JvmStatic
     fun captureMotionVectors() {
-        // FSR / XeSS 也要这份数据，所以闸门是「DLSS 开着 或 另一家超分在跑」。
-        if (!isEnabled() && !SuperResolution.needsVelocityPass()) {
+        if (!isEnabled()) {
             return
         }
         if (broken) {
@@ -672,79 +677,7 @@ object DeepLearningSuperSampling {
         val encoder = D3D12Device.sharedCommandEncoder() ?: return
         // 挂点在**帧图 main pass 的 RETURN**：旧挂点（清深度之前）实测深度全 0 => 运动矢量整张 0 => DLSS 把移动画面当静止累积（拖影）。
         encoder.recordVelocityPass()
-        // 深度快照与这里**同一个挂点、同一份深度**，紧接着调 [captureDepthSnapshot]（先速度 pass、后快照）。
     }
-
-    /**
-     * 深度快照的挂点：**帧图 main pass 的 RETURN**（`addMainPass` 无条件执行）—— 再晚深度就已被清成 0。见 docs/superresolution/dlss.md §5。
-     */
-    @JvmStatic
-    fun captureDepthSnapshot() {
-        if (!isEnabled()) {
-            // 关掉 DLSS 时把结论串复位，重新开启时能再报一次（否则沿用上次的"旧 DLL"结论）。
-            lastDepthSnapshotState = null
-            return
-        }
-        if (broken) {
-            return
-        }
-        val minecraft = Minecraft.getInstance()
-        if (minecraft.level == null) {
-            return
-        }
-        modeActive = true
-        // 世界层必须真的按 DLSS 输入比例出图（见 [ensureDataPlane]）。
-        
-        ensureDataPlane()
-        val encoder = D3D12Device.sharedCommandEncoder() ?: return
-        snapshotDlssDepth(encoder, minecraft)
-    }
-
-    /**
-     * 把**本帧世界层的深度**交给 native 快照：评价在 SMAA 那一刻，而 vanilla 早已把深度清成 0.0（深度项会变成常数）。
-     * 深度来源必须与 [applyIfEnabled] 填 `pInDepth` 的是**同一表达式**，否则快照与喂给 NGX 的指向不同资源。
-     */
-    private fun snapshotDlssDepth(encoder: D3D12CommandEncoderBackend, minecraft: Minecraft) {
-        val depth = minecraft.gameRenderer.mainRenderTarget().depthTexture as? D3D12GpuTexture
-        if (depth == null || depth.isClosed()) {
-            noteDepthSnapshot("the main render target has no D3D12 depth texture")
-            return
-        }
-        val result = try {
-            encoder.recordDlssDepthSnapshot(depth)
-        } catch (t: Throwable) {
-            noteDepthSnapshot("dx12SnapshotDlssDepth threw: $t", true)
-            return
-        }
-        p206Counter++
-        if (p206Counter % 120 == 0) {
-            IllusionLogger.debugMessage("evaluate result=".format(Locale.ROOT) + result.toString())
-        }
-        when (result) {
-            1 -> noteDepthSnapshot("captured this frame's world depth into the native D32 snapshot; "
-                + "the DLSS evaluation later this frame uses it instead of the depth vanilla clears")
-            0 -> noteDepthSnapshot("native skipped the snapshot (unusable arguments); DLSS falls back "
-                + "to the JVM-supplied depth")
-            -1 -> noteDepthSnapshot("native could not create/copy the snapshot; DLSS falls back to the "
-                + "JVM-supplied depth", true)
-            Int.MIN_VALUE -> noteDepthSnapshot("the loaded MCDR.dll has no mcdr_dx12SnapshotDlssDepth "
-                + "(it predates this export), so the depth vanilla clears is used instead")
-            else -> noteDepthSnapshot("dx12SnapshotDlssDepth returned an unexpected value $result", true)
-        }
-    }
-
-    private fun noteDepthSnapshot(message: String, warn: Boolean = false) {
-        if (lastDepthSnapshotState == message) {
-            return
-        }
-        lastDepthSnapshotState = message
-        if (warn) {
-            Illusion.LOGGER.warn("DLSS depth snapshot: {}", message)
-        } else {
-            Illusion.LOGGER.info("DLSS depth snapshot: {}", message)
-        }
-    }
-
 
     /** 是否启用了"把 JVM 建的纹理交给 native 当 DLSS 输出"的验收模式（默认关闭）。 */
     @JvmStatic
@@ -877,14 +810,13 @@ object DeepLearningSuperSampling {
         val renderTarget = minecraft.gameRenderer.mainRenderTarget()
         val color = (renderTarget.colorTextureView as? D3D12GpuTextureView)?.texture() as? D3D12GpuTexture
             ?: return noteState("the world layer is not a D3D12 texture")
-        val depth = renderTarget.depthTexture as? D3D12GpuTexture
-            ?: return noteState("the main render target has no D3D12 depth texture")
+        val frameInputs = ReconstructionFrameInputs.current(minecraft)
+            ?: return noteState("no current world depth or motion vectors")
+        val depth = frameInputs.depth
         // 世界切换时主目标整批重建，旧纹理可能已被释放；把句柄交给 native 会在 `GetDesc()` 上撞野指针。
         if (color.isClosed() || depth.isClosed()) {
             return noteState("the world layer's color/depth was released this frame (world transition)")
         }
-        // pInOutput：`targetForFrame()` 在 renderScale == 100% 时返回 null，而 NGX 要求输入输出是两张资源。
-        // DLAA 正是 100%：取主目标颜色纹理，native 重定向到交接的 target 尺寸纹理，评价完再拷回。
         val guiTarget = D3D12GUISplit.targetForFrame() ?: D3D12GUISplit.ensureTargetForDlss()
         val guiOutput = (guiTarget?.colorTextureView as? D3D12GpuTextureView)
             ?.texture() as? D3D12GpuTexture
@@ -932,19 +864,19 @@ object DeepLearningSuperSampling {
         this.handoverOkThisFrame = handoverOkThisFrame
         val packetOutput = output
 
-        // 运动矢量本该在上一处挂点（清深度之前）录好，这里是兜底；同帧已录过时 D3D12Velocity 的每帧闸门直接返回。
-        encoder.recordVelocityPass()
-        val motionVectors = D3D12Velocity.currentHandle()
+        val motionVectors = frameInputs.motionVectors
         if (motionVectors == 0L) {
             return noteState("no motion-vector texture (the velocity pass has no history yet on the "
                 + "frame DLSS is switched on, or it disabled itself - see the velocity log)")
         }
 
         val jitter = D3D12Temporal.jitter()
+        if (history.hasConsumed(frameInputs)) return
         val scalePercent = D3D12RenderScale.percent()
         val window = minecraft.window
         val resetReason = resetReason(level, renderWidth, renderHeight, targetWidth, targetHeight,
             scalePercent, window.width, window.height)
+            ?: if (history.requiresReset(frameInputs, frameInputs.motionCoverage.name)) "frame history changed" else null
         p205Counter++
         if (p205Counter % 120 == 0) {
             IllusionLogger.debugMessage(
@@ -983,6 +915,7 @@ object DeepLearningSuperSampling {
         when (result) {
             // 1 = 这一帧真的评价了：结果已经写进 pInOutput，本帧不能再做世界层 blit。
             1 -> {
+                history.commit(frameInputs, frameInputs.motionCoverage.name)
                 onEvaluated(level, renderWidth, renderHeight, targetWidth, targetHeight, scalePercent,
                     window.width, window.height, jitter[0].toFloat(), jitter[1].toFloat(), resetReason)
                 // 升采样之后的后置锐化（SDK 自带 sharpness 已废弃）。
@@ -1202,7 +1135,7 @@ object DeepLearningSuperSampling {
     private var p206Counter: Int = 0
 
     /** 上报给 DLSS/DLAA 的像素空间 jitter 必须是 `(+Jx, -Jy)`：实机 A/B 定案，其余符号组合都会让静止画面持续轻晃。 */
-    private fun reportedJitter(jx: Float, jy: Float): FloatArray = floatArrayOf(jx, -jy)
+    private fun reportedJitter(jx: Float, jy: Float): FloatArray = FrameInputCoordinates.sdkJitter(jx, jy)
 
     /**
      * 从透视投影矩阵反算垂直 FOV：m11 = 1/tan(fovY/2)，列主序在 index 5。不能用 `options.fov()` 标称值（漏掉疾跑/药水等修饰符）。
@@ -1293,21 +1226,12 @@ object DeepLearningSuperSampling {
             seg.set(F32, layout.byteOffset(PathElement.groupElement("cameraFwdY")), fwdY)
             seg.set(F32, layout.byteOffset(PathElement.groupElement("cameraFwdZ")), fwdZ)
             // near/far 从投影解出：列主序 m[10]=A=(f+n)/(n-f)、m[14]=B=2fn/(n-f)，于是 n=B/(A-1)、f=B/(A+1)。
-            val projA = proj[10]
-            val projB = proj[14]
-            val nearRaw = if (projA != 1.0f && projA.isFinite() && projB.isFinite()) {
-                projB / (projA - 1.0f)
-            } else {
-                0.0f
-            }
-            val farRaw = if (projA != -1.0f && projA.isFinite() && projB.isFinite()) {
-                projB / (projA + 1.0f)
-            } else {
-                0.0f
-            }
-            // MC 是 reverse-Z（构造投影时 near/far 互换），解出的两个平面会跟着互换 —— 交给 SL 前按大小改正。
-            val nearZ = if (nearRaw > farRaw) farRaw else nearRaw
-            val farZ = if (nearRaw > farRaw) nearRaw else farRaw
+            val cameraProjection = FloatArray(16)
+            Minecraft.getInstance().gameRenderer.gameRenderState().levelRenderState.cameraRenderState
+                .projectionMatrix.get(cameraProjection)
+            val planes = FrameInputCoordinates.depthPlanes(cameraProjection) ?: return
+            val nearZ = planes[0]
+            val farZ = planes[1]
             seg.set(F32, layout.byteOffset(PathElement.groupElement("cameraNear")), nearZ)
             seg.set(F32, layout.byteOffset(PathElement.groupElement("cameraFar")), farZ)
             seg.set(F32, layout.byteOffset(PathElement.groupElement("cameraFovRadians")), fovRadians)
@@ -1400,6 +1324,10 @@ object DeepLearningSuperSampling {
     }
 
     /** 离开 DLSS：复位本会话的输入状态（下次回来必须 reset=1），并把我们打开的数据面还回去。 */
+    fun releaseTemporalOwnership() {
+        leaveDlssMode()
+    }
+
     private fun leaveDlssMode() {
         if (!modeActive && !forcedTemporal && !forcedVelocity) {
             return
@@ -1412,23 +1340,22 @@ object DeepLearningSuperSampling {
         if (forcedTemporal) {
             forcedTemporal = false
             D3D12Temporal.reset()
-            D3D12Temporal.enabled = false
+            D3D12Temporal.enabled = D3D12Settings.temporalChain
             if (forcedVelocity) {
                 forcedVelocity = false
-                D3D12Velocity.enabled = false
+                D3D12Velocity.enabled = D3D12Settings.temporalChain
             }
-            Illusion.LOGGER.info("DLSS is no longer selected: the temporal data plane "
-                + "it had switched on is back to off")
+            IllusionLogger.debugMessage("DLSS: temporal ownership released")
         } else if (forcedVelocity) {
             forcedVelocity = false
             D3D12Velocity.reset()
-            D3D12Velocity.enabled = false
-            Illusion.LOGGER.info("DLSS is no longer selected: the velocity pass it had "
-                + "switched on is back to off")
+            D3D12Velocity.enabled = D3D12Settings.temporalChain
+            IllusionLogger.debugMessage("DLSS: velocity ownership released")
         }
     }
 
     private fun resetInputState() {
+        history.reset()
         evaluatedOnce = false
         // 熔断与「已采样」都是**会话级**状态，退出 DLSS 时必须复位，否则一次黑帧会让之后每次进世界都退化成线性放大。
         resetOutputSampleSchedule()
@@ -1441,7 +1368,6 @@ object DeepLearningSuperSampling {
         lastWindowHeight = -1
         lastLevel = null
         lastState = null
-        lastDepthSnapshotState = null
     }
 
     /** `dx12QueryDlss` 每次进入 DLSS 模式探一次：不可用时不必再每帧下探，原因（含 native 文本）进 JVM 日志。 */
@@ -1548,8 +1474,14 @@ object DeepLearningSuperSampling {
         packet.set(F32, offset("exposureScale"), EXPOSURE_SCALE)
         packet.set(I32, offset("exposureMode"), EXPOSURE_MODE_NONE)
         packet.set(I32, offset("alphaUpscaling"), ALPHA_UPSCALING)
-        packet.set(F32, offset("nearZ"), NEAR_Z)
-        packet.set(F32, offset("farZ"), FAR_Z)
+        val cameraProjection = FloatArray(16)
+        Minecraft.getInstance().gameRenderer.gameRenderState().levelRenderState.cameraRenderState
+            .projectionMatrix.get(cameraProjection)
+        val planes = checkNotNull(FrameInputCoordinates.depthPlanes(cameraProjection)) {
+            "DLSS input has no valid reversed D3D perspective depth planes"
+        }
+        packet.set(F32, offset("nearZ"), planes[0])
+        packet.set(F32, offset("farZ"), planes[1])
         packet.set(I32, offset("depthInverted"), DEPTH_INVERTED)
         packet.set(I32, offset("reset"), if (reset) 1 else 0)
         packet.set(I32, offset("depthFormatOrdinal"), depthFormatOrdinal)

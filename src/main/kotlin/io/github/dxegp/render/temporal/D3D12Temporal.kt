@@ -9,6 +9,7 @@ import io.github.dxegp.d3d12.ffi.MCDR_ABI
 import io.github.dxegp.render.resolution.D3D12RenderScale
 import io.github.dxegp.d3d12.resource.D3D12GpuBuffer
 import io.github.dxegp.render.reconstruction.dlss.DeepLearningSuperSampling
+import io.github.dxegp.render.reconstruction.SuperResolution
 import net.minecraft.client.Minecraft
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
@@ -47,7 +48,9 @@ object D3D12Temporal {
      * roll even with the dev switch [enabled] off, or TAA degrades into a static blur.
      */
     @JvmStatic
-    fun isActive(): Boolean = enabled || D3D12TAA.isSelected() || DeepLearningSuperSampling.isEnabled()
+    fun isActive(): Boolean = enabled || D3D12TAA.isSelected() || DeepLearningSuperSampling.isEnabled() ||
+        (SuperResolution.needsVelocityPass() && SuperResolution.isEnabled()) ||
+        io.github.dxegp.render.vrs.D3D12VariableShadingRate.isEnabled()
 
     /**
      * Whether any temporal resolve really consumes the sub-pixel jitter; injecting it without a consumer
@@ -55,7 +58,8 @@ object D3D12Temporal {
      */
     private fun hasJitterConsumer(): Boolean =
         D3D12TAA.isSelected() ||
-            (DeepLearningSuperSampling.isEnabled() && !DeepLearningSuperSampling.isStalled())
+            (DeepLearningSuperSampling.isEnabled() && !DeepLearningSuperSampling.isStalled()) ||
+            (SuperResolution.needsVelocityPass() && SuperResolution.isEnabled())
 
     /** Whether the jitter is really written into the projection (the capture path ignores it). */
     @Volatile
@@ -69,6 +73,9 @@ object D3D12Temporal {
         }
 
     private var frameIndex: Long = 0L
+
+    internal val frameSequence: Long
+        get() = frameIndex
 
     /** Backend-reported phase length (0 = not applicable); recorded only, see [adoptPhaseCount]. */
     @Volatile
@@ -113,6 +120,7 @@ object D3D12Temporal {
      * several times, and advancing per upload would give two jitters within one frame.
      */
     private var uploadFrameNs: Long = Long.MIN_VALUE
+    private var frameWorld: Any? = null
 
     private var jitterX: Double = 0.0
     private var jitterY: Double = 0.0
@@ -120,8 +128,8 @@ object D3D12Temporal {
     private var previousJitterY: Double = 0.0
 
     /**
-     * This frame's sub-pixel offset in pixels, `[-0.5, 0.5)`; the velocity output is already jittered, so the
-     * TAA resolve must not subtract it again.
+     * This frame's projection offset in pixels, `[-0.5, 0.5)`; velocity removes this offset and
+     * consumers account for jittered history sampling separately.
      */
     val currentJitterX: Double
         get() = jitterX
@@ -164,6 +172,8 @@ object D3D12Temporal {
     /** Camera world position this frame / previous frame. */
     private var cameraPosition: FloatArray? = null
     private var previousCameraPosition: FloatArray? = null
+    private var cameraPositionDouble: DoubleArray? = null
+    private var previousCameraPositionDouble: DoubleArray? = null
 
     /** Camera model-view from vanilla's CPU render state (fed by [captureCameraView]); no GPU readback. */
     private var stateCameraView: FloatArray? = null
@@ -188,6 +198,11 @@ object D3D12Temporal {
     fun reset() {
         frameIndex = 0L
         uploadFrameNs = Long.MIN_VALUE
+        frameWorld = null
+        lastRollFrameId = -1L
+        injectedFrameId = Long.MIN_VALUE
+        lastSizeWidth = 0
+        lastSizeHeight = 0
         // Bump the generation first: even if a release below throws, consumers already know not to blend.
         historyGeneration++
         jitterX = 0.0
@@ -196,6 +211,10 @@ object D3D12Temporal {
         previousJitterY = 0.0
         projection = null
         previousProjection = null
+        stateProjection = null
+        previousStateProjection = null
+        stateCameraView = null
+        previousStateCameraView = null
         viewProj = null
         previousViewProj = null
         modelViews = ArrayList()
@@ -204,6 +223,8 @@ object D3D12Temporal {
         previousChunkSections = emptyList()
         cameraPosition = null
         previousCameraPosition = null
+        cameraPositionDouble = null
+        previousCameraPositionDouble = null
         D3D12Velocity.reset()
         D3D12TAA.reset()
         D3D12ObjectMotion.reset()
@@ -214,6 +235,14 @@ object D3D12Temporal {
      */
     @Synchronized
     fun beginFrame() {
+        val minecraft = Minecraft.getInstance()
+        val world = minecraft.level ?: return
+        if (frameWorld === world && uploadFrameNs == minecraft.frameTimeNs) return
+        if (frameWorld !== world) reset()
+        frameWorld = world
+        uploadFrameNs = minecraft.frameTimeNs
+        previousCameraPosition = cameraPosition
+        previousCameraPositionDouble = cameraPositionDouble
         // Camera position comes straight from `Camera` at the frame start. Deriving it from the Global
         // Settings UBO gave garbage, and garbage there means a zero motion field and permanent ghosting.
         captureCameraFromCamera()
@@ -263,13 +292,12 @@ object D3D12Temporal {
             return pristine
         }
         // Advance at most once per frame (see [uploadFrameNs]).
-        val stamp = Minecraft.getInstance().frameTimeNs
-        if (stamp != uploadFrameNs) {
-            uploadFrameNs = stamp
-            beginFrame()
-        }
-        // Prefer the CPU render state (authoritative); the UBO bytes only serve as a fallback.
-        projection = stateProjection?.copyOf() ?: pristine.copyOf()
+        if (Minecraft.getInstance().level == null || width <= 0 || height <= 0) return pristine.copyOf()
+        if (lastSizeWidth != 0 && (lastSizeWidth != width || lastSizeHeight != height)) reset()
+        beginFrame()
+        lastSizeWidth = width
+        lastSizeHeight = height
+        projection = pristine.copyOf()
         // Only a real temporal consumer gets jittered (SMAA/OFF must stay pristine).
         if (!hasJitterConsumer() || !jitterEnabled) {
             return pristine.copyOf()
@@ -352,6 +380,7 @@ object D3D12Temporal {
         if (!pos.x.isFinite() || !pos.y.isFinite() || !pos.z.isFinite()) {
             return
         }
+        cameraPositionDouble = doubleArrayOf(pos.x, pos.y, pos.z)
         captureCamera(pos.x.toFloat(), pos.y.toFloat(), pos.z.toFloat())
     }
 
@@ -360,20 +389,12 @@ object D3D12Temporal {
         if (data.remaining() != 64) {
             return null
         }
-val size = renderSize() ?: return null
+        val size = renderSize() ?: return null
         val pristine = readFloats(data, 0, 16) ?: return null
         // Frame identity = present count, not a time window: at low frame rates a second upload in the same
         // frame would roll the jitter again and the raster and the resolve end up disagreeing.
-        val jittered: FloatArray = if (lastRollFrameId == presentedFrameId
-            && projection != null && lastSizeWidth == size[0] && lastSizeHeight == size[1]) {
-            // Repeated write in the same frame: keep the jitter, the first write captured the projection.
-            jitterProjection(pristine, clipJitterX(size[0]), clipJitterY(size[1]))
-        } else {
-            lastRollFrameId = presentedFrameId
-            lastSizeWidth = size[0]
-            lastSizeHeight = size[1]
-            onLevelProjectionUpload(pristine, size[0], size[1])
-        }
+        val jittered = onLevelProjectionUpload(pristine, size[0], size[1])
+        lastRollFrameId = presentedFrameId
 
         // Remember the jitter really fed to the raster, so the DLSS side can compare reported vs rendered.
         injectedJitterX = jitterX
@@ -569,11 +590,11 @@ val size = renderSize() ?: return null
 
     /** This frame's unjittered projection. */
     @Synchronized
-    fun currentProjection(): FloatArray? = stateProjection?.copyOf() ?: projection?.copyOf()
+    fun currentProjection(): FloatArray? = projection?.copyOf() ?: stateProjection?.copyOf()
 
     /** Previous frame's unjittered projection; null on the first frame. */
     @Synchronized
-    fun previousProjection(): FloatArray? = previousStateProjection?.copyOf() ?: previousProjection?.copyOf()
+    fun previousProjection(): FloatArray? = previousProjection?.copyOf() ?: previousStateProjection?.copyOf()
 
     /** Legacy entry: saves this frame's unjittered view-projection (16 floats, column-major). */
     @Synchronized
@@ -708,17 +729,13 @@ val size = renderSize() ?: return null
         return true
     }
 
-    /**
-     * Camera world position. History rolls here (not in [beginFrame]): the upload order of the camera and the
-     * projection is not ours, so "roll when a new value arrives" is order-independent.
-     */
+    /** Camera world position; previous position rolls exactly once in [beginFrame]. */
     @Synchronized
     fun captureCamera(x: Float, y: Float, z: Float) {
         val current = cameraPosition
         if (current != null && current[0] == x && current[1] == y && current[2] == z) {
             return
         }
-        previousCameraPosition = current
         cameraPosition = floatArrayOf(x, y, z)
     }
 
@@ -736,6 +753,11 @@ val size = renderSize() ?: return null
      */
     @Synchronized
     fun cameraDelta(): FloatArray? {
+        val preciseNow = cameraPositionDouble
+        val precisePrevious = previousCameraPositionDouble
+        if (preciseNow != null && precisePrevious != null) return FloatArray(3) {
+            (preciseNow[it] - precisePrevious[it]).toFloat()
+        }
         val now = cameraPosition ?: return null
         val prev = previousCameraPosition ?: return null
         return floatArrayOf(now[0] - prev[0], now[1] - prev[1], now[2] - prev[2])

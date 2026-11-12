@@ -1,6 +1,10 @@
 package io.github.dxegp.render.reconstruction
 
+import io.github.dxegp.render.frame.vanilla.recordSrRelease
+import io.github.dxegp.render.frame.vanilla.recordVelocityPass
+
 import io.github.dxegp.render.presentation.framegen.FrameGenerationConstants
+import io.github.dxegp.render.frameprep.FrameInputCoordinates
 
 import io.github.dxegp.Illusion
 import io.github.dxegp.config.SrBackend
@@ -45,9 +49,9 @@ object SuperResolution {
 
     private const val NEAR_PLANE = 0.05f
 
-    private const val PRE_EXPOSURE = 1.0f
+    private const val PRE_EXPOSURE = FrameInputCoordinates.PRE_EXPOSURE
 
-    private const val MOTION_VECTOR_SCALE = 1.0f
+    private const val MOTION_VECTOR_SCALE = FrameInputCoordinates.MOTION_SCALE
 
     /** 上报给后端的 jitter 固定 `(+Jx, -Jy)`：只翻 y。 */
     private const val JITTER_SIGN_Y = -1.0f
@@ -56,11 +60,12 @@ object SuperResolution {
 
     private var lastState: String = ""
 
-    /** 上一组 (backend, 尺寸, 比例)；变化即要求后端 reset 历史。 */
-    private var lastKey: String = ""
+    private val history = ReconstructionHistory()
 
     /** 已建上下文的 key：`mcdr_dx12SrCreate` 幂等，但不必每帧付一次 ABI 往返。 */
     private var createdFor: String = ""
+    private var providerOwned = false
+    private var providerOwner: D3D12CommandEncoderBackend? = null
 
     private var lastFrameNanos: Long = 0L
 
@@ -138,10 +143,6 @@ private const val DEFAULT_RENDER_PERCENT = 75
     @JvmStatic
     fun backendId(): Int = currentBackend().id
 
-    /**
-     * 速度通道 / 相机矩阵的生产者仍在 [DeepLearningSuperSampling.captureMotionVectors] 里，FSR / XeSS 也要用；
-     * 这个谓词供那个挂点的闸门使用：DLSS 关着但另一家超分在跑时它必须继续工作。
-     */
     @JvmStatic
     fun needsVelocityPass(): Boolean = when (currentBackend()) {
         SrBackend.FSR, SrBackend.XESS -> true
@@ -462,7 +463,7 @@ private const val DEFAULT_RENDER_PERCENT = 75
     }
 
     /**
-     * 切后端。**不调 `mcdr_dx12SrDestroy`**：那一刻可能还有打开的命令列表；只清 [createdFor] / [lastKey]，
+     * 切后端。**不调 `mcdr_dx12SrDestroy`**：那一刻可能还有打开的命令列表；只清创建缓存与历史，
      * 由 native 的 `ensureProvider` 放掉旧 provider（它自己保证 GPU 已追平）。
      */
     private fun requestBackend(requested: SrBackend) {
@@ -486,7 +487,7 @@ private const val DEFAULT_RENDER_PERCENT = 75
             // 勾上这一家 = 按它自己的质量档出图：不对齐会让「行的显示值」与实际比例不符（如从 DLSS 的 58% 切来）。
             val tier = qualityOf(requested)
             val nominal = percentForQuality(tier)
-            if (tier != NATIVE_AA_TIER && D3D12RenderScale.percent() != nominal) {
+            if (D3D12RenderScale.percent() != nominal) {
                 Illusion.LOGGER.info(
                     "render scale {}% -> {}% to match the {} quality tier",
                     D3D12RenderScale.percent(), nominal, QUALITY_NAMES[tier],
@@ -498,7 +499,8 @@ private const val DEFAULT_RENDER_PERCENT = 75
         pushBackendToNative(requested)
         syncOptions(requested)
         createdFor = ""
-        lastKey = ""
+        history.reset()
+        autoScaleAdjusted = false
         lastState = ""
         Illusion.LOGGER.info("backend: {} -> {}", previous, requested)
     }
@@ -538,7 +540,7 @@ private const val DEFAULT_RENDER_PERCENT = 75
             return
         }
         createdFor = ""
-        lastKey = ""
+        history.reset()
         lastState = ""
         // options.txt 里 backend = FSR/XeSS 而 dxrMcDlss 仍为 true 是升级用户最常见的组合：必须在这里让位，
         // 否则 DLSS 先跑起来改了比例再被中途关掉，速度通道此后一直没纹理。NONE 不算「另一家」。
@@ -584,10 +586,15 @@ private const val DEFAULT_RENDER_PERCENT = 75
     /** 帧内挂点（`GameRendererSmaaWorldMixin`：SMAA 之后、`prepareForGui` 之前）。DLSS 原样委托。 */
     @JvmStatic
     fun applyIfEnabled() {
+        if (Minecraft.getInstance().level == null) {
+            releaseIfCreated()
+            return
+        }
         when (backendId()) {
             MCDR_ABI.SR_BACKEND_NONE -> releaseIfCreated()
             MCDR_ABI.SR_BACKEND_DLSS -> {
                 timing.reset()
+                if (!releaseProvider()) return
                 // 从 FSR / XeSS 切回 DLSS：先还原我们打开的数据面，让 DLSS 用自己的记账重新打开。
                 if (forcedTemporal || forcedVelocity) {
                     releaseDataPlane()
@@ -638,13 +645,54 @@ private const val DEFAULT_RENDER_PERCENT = 75
     @JvmStatic
     fun releaseIfCreated() {
         timing.reset()
-        if (createdFor.isNotEmpty()) {
-            createdFor = ""
-            lastKey = ""
-            MCDR_ABI.D3D12SrDestroy()
-            IllusionLogger.debugMessage("released (backend is none)")
-        }
+        if (!releaseProvider()) return
+        DeepLearningSuperSampling.releaseTemporalOwnership()
+        history.reset()
+        ReconstructionFrameInputs.release()
         releaseDataPlane()
+    }
+
+    private fun releaseProvider(): Boolean {
+        if (!providerOwned) return true
+        val encoder = providerOwner ?: return false
+        if (encoder.recordSrRelease() != 1) return false
+        providerOwned = false
+        createdFor = ""
+        history.reset()
+        return true
+    }
+
+    private fun retainProvider(encoder: D3D12CommandEncoderBackend) {
+        if (providerOwner === encoder) return
+        check(providerOwner == null)
+        providerOwner = encoder
+        encoder.retainUntilCommandsClosed(AutoCloseable {
+            MCDR_ABI.D3D12SrDestroy()
+            providerOwned = false
+            providerOwner = null
+            createdFor = ""
+            history.reset()
+        })
+    }
+
+    @JvmStatic
+    fun captureFrameInputs() {
+        if (!isEnabled()) {
+            ReconstructionFrameInputs.invalidate()
+            return
+        }
+        val minecraft = Minecraft.getInstance()
+        if (minecraft.level == null) return
+        if (backendId() == MCDR_ABI.SR_BACKEND_DLSS) {
+            DeepLearningSuperSampling.captureMotionVectors()
+        } else {
+            DeepLearningSuperSampling.releaseTemporalOwnership()
+            ensureDataPlane()
+            if (!D3D12Temporal.captureCameraFromState(minecraft)) return
+            D3D12Device.sharedCommandEncoder()?.recordVelocityPass()
+        }
+        val encoder = D3D12Device.sharedCommandEncoder() ?: return
+        ReconstructionFrameInputs.capture(encoder, minecraft)
     }
 
     /** 只还原**我们**打开的那两个字段；否则 backend=none 之后 jitter / 速度通道还在跑（画面还在抖）。 */
@@ -706,9 +754,11 @@ private const val DEFAULT_RENDER_PERCENT = 75
         val minecraft = Minecraft.getInstance()
         // 标题界面 / 加载界面：没有世界层，谈不上"世界层升采样"。
         if (minecraft.level == null) {
+            history.reset()
+            ReconstructionFrameInputs.release()
             return
         }
-        val caps = MCDR_ABI.querySrCaps(backend)
+        val caps = cachedCaps(backend)
         if (caps == null) {
             return note("the loaded MCDR.dll has no mcdr_dx12SrQueryCaps (the DLL predates this abstraction)")
         }
@@ -720,10 +770,9 @@ private const val DEFAULT_RENDER_PERCENT = 75
         if (color == null) {
             return note("the world layer is not a D3D12 texture")
         }
-        val depth = renderTarget.depthTexture as? D3D12GpuTexture
-        if (depth == null) {
-            return note("the main render target has no D3D12 depth texture")
-        }
+        val frameInputs = ReconstructionFrameInputs.current(minecraft)
+            ?: return note("no current world depth or motion vectors")
+        val depth = frameInputs.depth
         // 世界切换 / 维度加载会整批重建主目标：Java 对象可能还在但 native 资源已释放，塞进 dispatch 会在
         // native 里撞野指针。宁可这一帧不升采样。
         if (color.isClosed() || depth.isClosed()) {
@@ -753,8 +802,8 @@ private const val DEFAULT_RENDER_PERCENT = 75
         if (renderWidth < minRenderWidth || renderHeight < minRenderHeight) {
             if (!autoScaleAdjusted) {
                 val needed = maxOf(
-                    ceil(minRenderWidth * 100.0 / renderWidth).toInt(),
-                    ceil(minRenderHeight * 100.0 / renderHeight).toInt(),
+                    ceil(minRenderWidth * 100.0 / displayWidth).toInt(),
+                    ceil(minRenderHeight * 100.0 / displayHeight).toInt(),
                 ).coerceIn(D3D12RenderScale.minimumPercent(), 100)
                 autoScaleAdjusted = true
                 D3D12RenderScale.setPercentAtFrameBoundary(needed)
@@ -772,7 +821,13 @@ private const val DEFAULT_RENDER_PERCENT = 75
         if (output == null) {
             return note("could not create the display-sized UAV output texture")
         }
-        if (renderWidth == displayWidth && renderHeight == displayHeight) {
+        val nativeAa = qualityOf(currentBackend()) == NATIVE_AA_TIER
+        if (nativeAa && !caps.nativeAA) return note("native AA is unavailable")
+        if (nativeAa && (renderWidth != displayWidth || renderHeight != displayHeight)) {
+            D3D12RenderScale.setPercentAtFrameBoundary(100)
+            return note("waiting for native AA render size")
+        }
+        if (!nativeAa && renderWidth == displayWidth && renderHeight == displayHeight) {
             // 100% 没有可放大的内容（options.txt 里写死 backend + 100% 会撞到这里）：降一次档到滑条吸附值 75。
             if (!autoScaleAdjusted && D3D12RenderScale.percent() >= 100
                 && !D3D12RenderScale.isLockedByDlaa()
@@ -793,9 +848,7 @@ private const val DEFAULT_RENDER_PERCENT = 75
         // 数据面：jitter / 速度通道构建期默认关闭；放在「这一帧真会升采样」之后，避免没有消费者却在抖。
         ensureDataPlane()
 
-        // 与 DLSS 同一个挂点、同一份兜底（本帧已录过时会自己跳过）；首帧没有历史必然为空。
-        encoder.recordVelocityPass()
-        val motionVectors = D3D12Velocity.currentHandle()
+        val motionVectors = frameInputs.motionVectors
         if (motionVectors == 0L) {
             // 每帧都到这里时，一行诊断比「什么都没跑」有用（按秒限流）。
             val now = System.nanoTime()
@@ -807,10 +860,14 @@ private const val DEFAULT_RENDER_PERCENT = 75
 
         val createKey = "$backend:$renderWidth:$renderHeight:$displayWidth:$displayHeight"
         if (createdFor != createKey) {
+            retainProvider(encoder)
             val created = MCDR_ABI.D3D12SrCreate(encoder.nativeHandle(), backend,
                 renderWidth, renderHeight, displayWidth, displayHeight)
             when (created) {
-                1 -> createdFor = createKey
+                1 -> {
+                    createdFor = createKey
+                    providerOwned = true
+                }
                 0 -> {
                     createdFor = ""
                     return note("mcdr_dx12SrCreate refused backend ${backendName(backend)}")
@@ -821,17 +878,21 @@ private const val DEFAULT_RENDER_PERCENT = 75
         }
 
         val jitter = D3D12Temporal.jitter()
-        val frameKey = "$createKey:${D3D12RenderScale.percent()}"
-        val reset = frameKey != lastKey
-        lastKey = frameKey
+        if (history.hasConsumed(frameInputs)) return
+        val frameKey = "$createKey:${D3D12RenderScale.percent()}:${frameInputs.motionCoverage}"
+        val reset = history.requiresReset(frameInputs, frameKey)
 
         val camera = minecraft.gameRenderer.gameRenderState().levelRenderState.cameraRenderState
-        val farPlane = if (camera.depthFar > 0.0f) camera.depthFar else FALLBACK_FAR
+        val cameraProjection = FloatArray(16)
+        camera.projectionMatrix.get(cameraProjection)
+        val planes = FrameInputCoordinates.depthPlanes(cameraProjection)
+        val nearPlane = planes?.get(0) ?: NEAR_PLANE
+        val farPlane = planes?.get(1) ?: if (camera.depthFar > 0.0f) camera.depthFar else FALLBACK_FAR
         val fov = fovFromProjection(D3D12Temporal.currentProjection())
         val sharpness = sharpness()
 
         // 掩码产生器必须与 evaluate 同一条命令列表；关掉配置时传 0（= 没有这张纹理）。
-        val mask = if (mask()) D3D12SrMask.produce(encoder, renderWidth, renderHeight) else 0L
+        val mask = if (mask()) D3D12SrMask.produceForProvider(encoder, renderWidth, renderHeight, backend) else 0L
         if (mask() && mask == 0L) {
             note("the super-resolution mask producer did not run: " + D3D12SrMask.note())
         }
@@ -851,7 +912,7 @@ private const val DEFAULT_RENDER_PERCENT = 75
                 desc.set(F32, OFF_MV_SCALE_Y, MOTION_VECTOR_SCALE)
                 desc.set(F32, OFF_PRE_EXPOSURE, PRE_EXPOSURE)
                 desc.set(F32, OFF_FRAME_MS, frameTimeMs())
-                desc.set(F32, OFF_NEAR, NEAR_PLANE)
+                desc.set(F32, OFF_NEAR, nearPlane)
                 desc.set(F32, OFF_FAR, farPlane)
                 desc.set(F32, OFF_FOV, fov)
                 desc.set(F32, OFF_SHARPNESS, sharpness)
@@ -871,7 +932,7 @@ private const val DEFAULT_RENDER_PERCENT = 75
                 desc.set(F32, OFF_ASPECT, displayWidth.toFloat() / displayHeight.toFloat())
                 desc.set(F32, OFF_METERS, 1.0f)
                 // 帧生成常量不依赖 SR 后端：每次真出帧都推一份，jitter 用与 dispatch 同一份值。
-                FrameGenerationConstants.push(jitter[0].toFloat(), jitter[1].toFloat() * JITTER_SIGN_Y,
+                FrameGenerationConstants.push(jitter[0].toFloat(), jitter[1].toFloat(),
                     reset)
                 MCDR_ABI.D3D12SrEvaluate(encoder.nativeHandle(), desc)
             }
@@ -884,6 +945,7 @@ private const val DEFAULT_RENDER_PERCENT = 75
         val evalNanos = System.nanoTime() - evalStarted
         when (result) {
             1 -> {
+                history.commit(frameInputs, frameKey)
                 // hudless 下这张 UAV 就是呈现源（不能搬进 GUI 目标，那是 UI 层）；否则搬进 GUI 目标，
                 // 本帧的 prepareForGui 据此跳过世界层 blit。
                 val blitStarted = System.nanoTime()

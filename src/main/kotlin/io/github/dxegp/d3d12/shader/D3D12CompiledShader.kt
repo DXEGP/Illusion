@@ -7,4 +7,5 @@ data class D3D12CompiledShader(
     val fragmentHlsl: String,
     val entries: List<D3D12BindGroupEntry>,
     val vertexInputs: List<D3D12ShaderIo>,
+    val rootConstants: D3D12RootConstantLayout?,
 )

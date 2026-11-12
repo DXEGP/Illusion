@@ -17,6 +17,8 @@ import org.lwjgl.sdl.SDLError
 import org.lwjgl.sdl.SDLVideo
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+import net.neoforged.fml.loading.EarlyLoadingScreenController
+import io.github.dxegp.bootstrap.earlywindow.service.DxrmcEarlyWindowProvider
 
 /**
  * Direct3D 12 [GpuBackend] 实现：建窗口、建设备、跑自检链。
@@ -46,7 +48,8 @@ class D3D12Backend : GpuBackend {
             LOGGER.warn("glContext = true has no effect since 26.3: the GL context belongs to "
                 + "the OpenGL backend, the D3D12 backend never requests one")
         }
-        val handle = SDLVideo.SDL_CreateWindow(title ?: "", width, height, flags)
+        val earlyWindow = (EarlyLoadingScreenController.current() as? DxrmcEarlyWindowProvider)?.claimWindow() ?: 0L
+        val handle = if (earlyWindow != 0L) earlyWindow else SDLVideo.SDL_CreateWindow(title ?: "", width, height, flags)
         if (handle == 0L) {
             D3D12Fatal.crash("SDL_CreateWindow failed for DX12 (video driver: "
                 + "${SDLVideo.SDL_GetCurrentVideoDriver()}): ${SDLError.SDL_GetError()}", null)

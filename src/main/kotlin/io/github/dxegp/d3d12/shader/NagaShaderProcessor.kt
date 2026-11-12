@@ -36,10 +36,26 @@ data class D3D12ShaderResources(
 
 data class D3D12ShaderInterface(val inputs: List<D3D12ShaderIo>, val outputs: List<D3D12ShaderIo>)
 
+data class D3D12RootConstantLayout(
+    val register: Int,
+    val space: Int,
+    @SerializedName("byte_size") val byteSize: Int,
+    @SerializedName("dword_count") val dwordCount: Int,
+    val members: List<D3D12ShaderBufferMember> = emptyList(),
+)
+
+data class D3D12ShaderBufferMember(
+    val name: String,
+    @SerializedName("hlsl_type") val hlslType: String,
+    val offset: Int,
+    val size: Int,
+)
+
 data class D3D12ShaderManifest(
     val schema: String,
     val resources: D3D12ShaderResources,
     @SerializedName("stage_io") val stageIo: D3D12ShaderInterface,
+    @SerializedName("push_constants") val pushConstants: D3D12RootConstantLayout?,
 )
 
 data class D3D12ShaderConversion(val hlsl: String, val manifest: D3D12ShaderManifest)
@@ -63,6 +79,8 @@ internal object NagaShaderProcessor {
             addProperty("stage", if (stage == ShaderType.FRAGMENT) "fragment" else "vertex")
             addProperty("shader_model", "6_9")
             addProperty("register_layout", "host")
+            addProperty("push_constant_register", D3D12RootConstantLayoutContract.REGISTER)
+            addProperty("push_constant_space", D3D12RootConstantLayoutContract.SPACE)
             add("bindings", gson.toJsonTree(bindings))
             add("vertex_attributes", gson.toJsonTree(vertexAttributes))
             add("fragment_inputs", gson.toJsonTree(vertexOutputs.associate { it.name to it.location }))
@@ -90,4 +108,11 @@ internal object NagaShaderProcessor {
             throw ShaderCompileException("naga: $filename: ${error.message}")
         }
     }
+}
+
+internal object D3D12RootConstantLayoutContract {
+    const val REGISTER = 0
+    const val SPACE = 1
+    const val MAX_DWORDS = 32
+    const val MAX_ROOT_DWORDS = 64
 }

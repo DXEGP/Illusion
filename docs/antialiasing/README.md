@@ -191,9 +191,11 @@ CycleButton 重新读值，界面会停留在旧文字上。
 注入有双重闸门，缺一不可：
 
 ```kotlin
-fun isActive() = enabled || D3D12TAA.isSelected() || DeepLearningSuperSampling.isEnabled()
+fun isActive() = enabled || D3D12TAA.isSelected() || DeepLearningSuperSampling.isEnabled() ||
+    (SuperResolution.needsVelocityPass() && SuperResolution.isEnabled())
 private fun hasJitterConsumer() = D3D12TAA.isSelected() ||
-    (DeepLearningSuperSampling.isEnabled() && !DeepLearningSuperSampling.isStalled())
+    (DeepLearningSuperSampling.isEnabled() && !DeepLearningSuperSampling.isStalled()) ||
+    (SuperResolution.needsVelocityPass() && SuperResolution.isEnabled())
 ```
 
 只有 `isActive()` 且 `hasJitterConsumer()` 且 `jitterEnabled` 都为真才真正改写矩阵，否则
@@ -384,8 +386,8 @@ GUI 不参与抗锯齿，也不参与速度缓冲，原因分三层：
 1. 渲染缩放 ≠ 100% 时，让 GUI 待在自己的窗口尺寸目标里，scissor 与世界层尺寸解耦；
 2. 帧生成的 hudless 模式下，它就是交给后端的 **UI 纹理**。
 
-启用条件是 `D3D12RenderScale.isEnabled()`（`percent != 100`）**或** hudless 已武装。100% 且
-非 hudless 时整体关闭，行为与 vanilla 完全一致 —— 这条「零行为变化」的默认路径是刻意保留的。
+启用条件是 `D3D12RenderScale.isEnabled()`（`percent != 100`）、hudless 已武装或本帧已经准备好 GUI 目标。
+DLAA 与 FSR/XeSS Native AA 在 100% 下成功重建时保留 GUI 目标，确保最终呈现选中重建结果。
 
 ### 6.2 一帧里的搬运
 
@@ -394,7 +396,7 @@ GUI 不参与抗锯齿，也不参与速度缓冲，原因分三层：
 1. 清 `preparedThisFrame` 与 `frameTarget`；
 2. 读走并清零 `worldLayerDoneThisFrame`（DLSS 在更早的挂点已经把升采样结果直写进 GUI 目标）；
 3. hudless 已武装时**无条件**走拆分（100% 缩放也不能让界面落回世界层）；
-4. 否则主目标真实尺寸就等于窗口尺寸时直接返回 —— 不需要拆分；
+4. 否则主目标真实尺寸等于窗口尺寸，且世界层尚未由 SR 写入 GUI 目标时直接返回；
 5. `ensureTarget()` 建/校正目标；**先定 `frameTarget` 再考虑 blit** —— 界面画在哪与搬运成败无关，绝不能因为 blit 失败把界面塞回世界目标（会重新触发 scissor 越界）；
 6. 清 GUI 目标的深度（vanilla 在 GUI 之前会清一次主目标深度，界面换了目标就要补同样的清）；
 7. hudless 分支：把 UI 层清成全透明 `(0,0,0,0)`，不做世界层搬运，`preparedThisFrame` 保持

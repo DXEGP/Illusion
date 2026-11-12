@@ -44,10 +44,10 @@ mixin 处理的是接口拿到**之前**、以及接口给不了的东西：
 | 跨帧状态机 | 状态要活过注入点，mixin 类不能随便加字段 | `D3D12GUISplit`、`D3D12RenderScale` |
 | 任何 native 调用 | mixin 只做转发，FFM 绑定集中在 `MCDR_ABI`（唯一 native 入口） | `D3D12RenderProf.begin/end` 这类 `@JvmStatic` 中转 |
 | 可测的纯计算 | 注入点是「没有单测的代码」 | `scaledForAttachment` 的取整规则 |
-| 被多处复用的逻辑 | 注入代码不许引用 `io.github.dxegp.mixin.*` 里的类 | `compat\FpsLimitCompat`、`EarlyWindowSurface` |
+| 被多处复用的逻辑 | 注入代码不许引用 `io.github.dxegp.mixin.*` 里的类 | `client\compat\FpsLimitCompat` |
 
-最后一条不是风格问题：Mixin 会对被注入代码引用的类做 `IllegalClassLoadError` 检查。`FpsLimitCompat` 之所以单独放在
-`compat` 包、`EarlyWindowSurface` 之所以放在 `bootstrap\earlywindow`，就是为了绕开这个检查。
+Mixin 会对被注入代码引用的类做 `IllegalClassLoadError` 检查。
+可复用业务逻辑放在对应业务包，避免触发 mixin 类加载检查。
 
 ## 2. 注册：三个文件决定一切
 
@@ -98,7 +98,7 @@ file="META-INF/accesstransformer.cfg"
 
 | 系统 | 条数 | 它回答的问题 |
 | --- | --- | --- |
-| 窗口创建与生命周期 | 3 | 谁建窗口，退出时窗口上显示什么 |
+| 窗口创建与生命周期 | 1 | D3D12Backend 直接领用窗口，GL 呈现保留调试挂点 |
 | 渲染管线与着色器登记 | 3 | 编译管线时把哪份源码交给后端，着色器失败要不要升级成崩溃 |
 | 渲染目标尺寸 | 3 | 百分比渲染比例下谁该缩、谁绝对不能缩 |
 | GUI 拆分与目标归属 | 3 | 一帧里 GUI 画到哪个目标 |
@@ -108,17 +108,15 @@ file="META-INF/accesstransformer.cfg"
 | 限帧兼容 | 2 | 「永不」这个限帧档从哪来 |
 | 阶段计时 | 10 | 每帧各段耗时 |
 
-### 3.2 窗口创建与生命周期（3）
+### 3.2 窗口创建与生命周期（1）
 
 | Mixin | 目标（类#方法） | 注入点 | 目的 |
 | --- | --- | --- | --- |
-| `core\WindowAdoptCreatedMixin` | `Window#createWindow(GpuBackend,int,int,String)` | `@Inject` HEAD, cancellable | 仅当后端是 `D3D12Backend` 时接管早期 SDL 窗口，游戏不再另建第二个窗口 |
-| `core\MinecraftCloseEarlyWindowMixin` | `Minecraft#close` | `@Inject` HEAD, remap=false | 先把手里的 SDL 窗口刷黑，退出时不闪加载屏（详见 §5.7） |
 | `render\GlSurfacePresentMixin` | `GlSurface#present` | `@Inject` HEAD, cancellable | `[debug] skipGlSwap` 为真时不做 GL 呈现；父窗口上存在真 SwapBuffers 过的 GL 链会让 RTSS OSD 变 0 像素 |
 
-`WindowAdoptCreatedMixin` 有两条容易误删的分支：句柄走系统属性 `dxrmc.earlywindow.handle`（provider 在 loader 的
-early-service 类加载器里，与游戏类加载器不共享静态），接管成功后**立刻清除**，避免后续窗口拿到陈旧句柄；后端不是
-D3D12 时**保留**，因为游戏每个后端尝试都会建一次窗口，我们的后端可能第二次才起来。
+窗口接管直接发生在 `D3D12Backend.createWindow`，因此 `lastWindowHandle` 与正常创建路径一致。
+父 classloader 唯一定义的 provider 持有一次性 `EarlyWindowLease`；游戏通过 `EarlyLoadingScreenController.current()`
+取得当前 provider，再调用 `claimWindow()`。不使用系统属性传递 native 句柄。
 
 ### 3.3 渲染管线与着色器登记（3）
 
@@ -162,8 +160,10 @@ D3D12 时**保留**，因为游戏每个后端尝试都会建一次窗口，我�
 | `render\LevelRendererMainPassDepthMixin` | `LevelRenderer#lambda$addMainPass$0` | `@Inject` RETURN, remap=false | 采时域数据、录速度 pass、深度快照、OIT 透射率（唯一无条件入帧图的 pass，且在任何清深度之前） |
 | `render\ChunkSectionsToRenderSamplerMixin` | `ChunkSectionsToRender#renderGroup` / `#renderOit` | `@ModifyVariable`（HEAD, argsOnly）×2 | 只给地形专用 sampler 加超分 mip bias，不污染共享 sampler 缓存 |
 | `render\GameRendererTransparencyMixin` | `GameRenderer#useImprovedTransparency` | `@Inject` HEAD, cancellable | mesh 地形强制返回 `true`：mesh 路径的线程组顺序不保证，只能走顺序无关的 Wavelet OIT |
-| `render\SectionUploadCaptureMixin` | `SectionRenderDispatcher$RenderSection#addSectionBuffersToUberBuffer` | `@Inject` HEAD | 记下每段每层的 indexCount 与缓冲尺寸，供 meshlet 几何构建 |
-| `render\DynamicGpuDataCaptureMixin` | `DynamicGpuData#writeChunkSectionCommands`（HEAD/RETURN）、`#writeChunkSectionsInstanced`（HEAD） | `@Inject` ×3 | 抓 `drawIndexedIndirect` 的参数缓冲，mesh 路径按同一份参数重放 |
+| `terrain\SectionUploadCaptureMixin` | `SectionRenderDispatcher$RenderSection#addSectionBuffersToUberBuffer` | `@Inject` HEAD | 将顶点数据交给本次 `CompiledSectionMesh` 的几何 owner，上传重试与仅索引更新不重建描述符 |
+| `terrain\CompiledSectionGeometryMixin` | `CompiledSectionMesh`、`#close` | owner 接口 + `@Inject` HEAD | 持有每个网格独立的几何状态，释放时退休；已冻结帧快照保持有效 |
+| `terrain\LevelRendererMeshCaptureMixin` | `LevelRenderer#extractSectionDrawGroups`、`#resetLevelRenderData` | `@ModifyExpressionValue` NEW + `@Local` + `@Inject` | 将 IndexedDraw 绑定到实际网格的图层快照及段信息，并清理帧缓存 |
+| `terrain\DynamicGpuDataCaptureMixin` | `DynamicGpuData#writeChunkSectionCommands` | `@Inject` RETURN | 将参数 buffer 身份、offset、length 绑定到冻结的绘制快照 |
 
 深度唯一有效的采集点是 `LevelRenderer#lambda$addMainPass$0` 的 RETURN：帧图 main pass 是唯一无条件进入帧图的 pass，
 深度在那一刻有效、且在全部 `clearDepthTexture` 之前。**不要改挂 `GameRenderer.render`**（那时深度已清过三次，采样全为
@@ -249,7 +249,6 @@ javac 给枚举隐式加了 `name` / `ordinal`，少写就 `NoSuchMethodExceptio
 | 8 | `GuiRenderer#draw` / `CubeMap#render` | 换到 GUI 目标 | GUI 拆分 |
 | 9 | `GameRenderer#processBlurEffect` | 背景模糊换到 GUI 目标 | GUI 拆分 |
 | 10 | `GuiRenderer#render` | 开 `GUI` 段 | 计时 |
-| 11 | `Minecraft#close` HEAD | 接管来的 SDL 窗口刷黑 | 退出闪屏 |
 
 第 7 步的顺序是硬约束，为什么必须是这个顺序、以及 SMAA 与 DLSS 为什么各判各的开关，写在抗锯齿与超分两篇文档里；
 这里只记一个事实：**它是全帧唯一一个「世界已画完、GUI 还没画」的可注入时刻。**
@@ -258,100 +257,93 @@ javac 给枚举隐式加了 `name` / `ordinal`，少写就 `NoSuchMethodExceptio
 
 ### 5.1 它解决什么问题
 
-FML 会在游戏窗口存在之前显示一个加载窗口。默认实现走原版 GL 路线，而我们的呈现链要的是「一个 HWND + 自建 D3D12
-交换链」；让游戏自己建窗口就会出现两个窗口 —— `WindowAdoptCreatedMixin` 注释里的原话是「Without this the early
-loading window and the game window are two different windows」。所以目标是：**我们自己建那个窗口、把加载屏画进去，
-然后在 `Window#createWindow` 那一刻把它交出去**，让 D3D12 交换链绑的是同一个 HWND。接管**只对 D3D12 后端生效**：
-原版 OpenGL / Vulkan 路径需要自己的 GL attributes / surface flags，必须自己建窗口，那种情况下我们把窗口收走并隐藏。
+provider 创建不带 `SDL_WINDOW_OPENGL` 的可缩放 SDL 窗口，以 CPU 合成图像并通过明确指定的 SDL software renderer
+显示。游戏的 `D3D12Backend.createWindow` 领用同一个 `SDL_Window*`，并记录 `lastWindowHandle`，没有第二次建窗。
+正式交接后由游戏传入的 `ELSRenderBackend` 上传并呈现加载图像，使用现有设备和窗口。
 
 ### 5.2 `ImmediateWindowProvider` 的契约
 
 | 方法 | 我们做什么 | 约束 |
 | --- | --- | --- |
 | `name()` | 返回 `"dxrmc"` | `fml.toml` 的 `earlyWindowProvider` 就是按这个名字选的 |
-| `initialize(ProgramArgs)` | 初始化 SDL、建 854x480 可缩放窗口、建软件 renderer、画第一帧、把句柄写进系统属性 | 任何一步失败都直接 return，句柄留 0 |
-| `periodicTick()` | 每 4 tick 重画一次 | **不得 drain SDL 事件**（见 §5.3） |
+| `initialize(ProgramArgs)` | 初始化 SDL、建 854x480 可缩放窗口、创建窗口租约、建软件 renderer、画第一帧 | 抛出异常时释放已取得的资源 |
+| `periodicTick()` | 早期在创建窗口的线程轮询已分配的 SDL_Event，每 4 tick 重画一次 | 交接后只在游戏呈现线程绘图，不再轮询事件 |
 | `updateProgress(String)` | 空实现 | 说明文字固定（`Initializing DirectX 12 backend...`），因为它描述的是正在初始化的后端 |
 | `completeProgress()` | `progressTicks = 50` 后重画 | 进度条只用于「还在加载」的观感 |
-| `handOverToMinecraft(Supplier)` | 读 `dxrmc.earlywindow.adopted` 决定交窗口还是丢弃 | 返回固定 `WindowState(0,0,854,480,false,…)` |
-| `close()` | 只销毁 renderer，不销毁窗口 | 窗口归游戏所有了 |
-| `setMinecraftVersion` / `setNeoForgeVersion` / `crash` / `stopEventPolling()` | 只打日志；`stopEventPolling` 空实现（我们从没启动过事件轮询） | — |
+| `handOverToMinecraft(Supplier)` | 返回真实窗口状态，调用 supplier，上传并呈现第一张游戏后端加载图像 | 校验 backend 仍使用同一 SDL 窗口 |
+| `close()` | 释放加载纹理、加载 backend、软件 renderer 与未领用窗口 | 已领用窗口只由游戏销毁 |
+| `stopEventPolling()` | 在 provider monitor 内停止后续绘制 | 与 periodicTick、claimWindow、handover、close 使用同一把锁 |
+| `setMinecraftVersion` / `setNeoForgeVersion` / `crash` | 只打日志 | — |
 | `displayFatalErrorAndExit(...)` | 打 ERROR 后 `Runtime.getRuntime().halt(1)` | 加载阶段没有可用的崩溃界面 |
 
 ### 5.3 三个实现细节（必须这样做）
 
-**用软件 renderer，不用默认 renderer。** 调 `SDL_CreateRenderer(window, "software")`，返回 0 时才退回默认 renderer 并打
-一条 WARN —— 软件 renderer 在任何显卡 / 驱动状态下都能画出加载屏，而这一步正好发生在显卡后端还没起来的时候。
+**用软件 renderer。** 调 `SDL_CreateRenderer(window, "software")`，返回 0 时记录 WARN 并停用早期画面。
+禁止使用默认 renderer 回退，以免自动选择图形 API。
 
 **加载屏用 AWT 合成，整帧走 surface → texture，不要建流式纹理。** 素材：`assets\logo_flat_dark.jpg`、Mojangles ASCII 页
 （`assets\dxrmc\mojangles_ascii.png`，16×16 格、每格 8×8）；配色：进度条 `0xC46BFF`、轨道 `0x2E3238`、背景纯黑、文字 `0xD8,0xDC,0xE2`；
 整帧经 `SDL_CreateSurfaceFrom`（`ARGB8888`）+ `SDL_CreateTextureFromSurface` + `RenderTexture` 上屏 —— 软件 renderer **静默忽略**流式纹理上传。
 
-**不要在 `periodicTick()` 里 drain SDL 事件。** FML 在加载线程上调用 `periodicTick()`，而 `SDL_PollEvent(NULL)` 只要还有
-待处理事件就一直返回 `true` —— 清一次事件队列就卡死加载线程。代码里用 NOTE 注释标明这是故意的。
+**在创建窗口的线程轮询已分配的 `SDL_Event`。** FML 的 `runOffThread` 在调用线程每 10ms 等待期间调用
+`ImmediateWindowHandler.renderTick()`，默认 `DisplayWindow.periodicTick()` 同样在这里处理 SDL 事件。
+provider 用 `SDL_Event.malloc()` 配合 `SDL_PollEvent(event)` 实际取出事件，支持加载时移动、缩放与系统关闭请求。
+禁止用 `SDL_PollEvent(NULL)` 排空队列：该调用只探测事件，不取出事件。
+关闭请求释放未领用资源并抛出 `CancellationException` 中断加载。`stopEventPolling()` 与领用在同一同步锁内停用轮询，
+交接后游戏拥有全部事件，provider 只绘制加载画面。
 
-### 5.4 交接协议：两个系统属性
+### 5.4 交接协议：父 classloader 中的一次性租约
 
-provider 跑在 loader 的 early-service 类加载器里，mixin 跑在游戏类加载器里，**两边不能共享静态字段**。
-唯一能共享的就是 JVM 级系统属性：
+FML 12.0.12 将 early-service classloader 作为游戏 classloader 的 parent/fallback。
+service 包只在外层 JAR 定义一次，游戏从 `EarlyLoadingScreenController.current()` 获得 provider 实例。
 
-| 属性 | 写入方 | 读取方 | 语义 |
+| 操作 | 所有者 | 结果 | 语义 |
 | --- | --- | --- | --- |
-| `dxrmc.earlywindow.handle` | `initialize()` | `WindowAdoptCreatedMixin` | 待接管的窗口句柄；被接管时被 mixin 清除 |
-| `dxrmc.earlywindow.adopted` | `WindowAdoptCreatedMixin`（值为 `"1"`） | `handOverToMinecraft` | 「窗口真的被 D3D12 路径拿走了」，读后清除 |
+| `claimWindow()` | provider / `EarlyWindowLease` | 一次返回 SDL 句柄 | 在同步锁内停止绘制并释放软件 renderer，窗口所有权交给游戏 |
+| `closeUnclaimed()` | `EarlyWindowLease` | 幂等销毁未领用窗口 | 已领用窗口保持游戏所有权 |
 
 三条不变量：
 
-1. 句柄**用后即清**，后面的窗口不会捡到陈旧句柄。
-2. 非 D3D12 后端**不清**句柄 —— 游戏每个后端尝试建一次窗口，我们的后端可能第二次才起来。
-3. `handOverToMinecraft` 无论哪条分支都把两个属性清掉。
+1. 租约只允许成功领用一次，关闭后不能领用。
+2. 游戏侧在后端正常建窗入口领用，后端自检看到同一个非零 `lastWindowHandle`。
+3. `WindowState` 采集真实位置、逻辑尺寸与最小化、最大化、全屏标志；图像按逻辑尺寸合成，呈现使用实时像素尺寸。
 
-### 5.5 为什么必须是一个独立 jar，以及安装器在做什么
+### 5.5 发布容器与首次启动
 
-FML 只在 `mods/` 下的**顶层 `*.jar`** 里找早期服务（`EarlyServiceDiscovery` 按 `.jar` 后缀扫目录），而且**带这类
-`META-INF/services` 条目的 jar 会被认领、并从模组发现中排除**。后果很直接：provider 放进模组 jar，模组自己就会从
-模组列表里消失。`META-INF/jarjar` 也不行 —— 嵌套 jar 的解压发生在 `ImmediateWindowHandler.load()` 之后。
+外层 JAR 提供 early services，并通过标准 `META-INF/jarjar/metadata.json` 包含普通模组内层 JAR。
+FML 12.0.12 发现外层服务容器后，仍将它交给 JiJ dependency locator，内层模组照常发现。
 
-于是拆成两个 jar：
+完整构建与发现链见 [earlywindow-packaging.md](earlywindow-packaging.md)。
 
 | 产物 | 内容 | 谁加载 |
 | --- | --- | --- |
-| `dxr_mc-<ver>.jar` | 正常模组，**排除** `earlywindow` 类与那条 service 文件 | 模组发现 |
-| `META-INF/dxrmc/earlywindow.jar`（嵌在上者内部） | 只有 `io/github/dxegp/bootstrap/earlywindow/service/**` + service 文件 + 加载屏图片 | 由安装器解到 `mods/` |
+| `dxr_mc-<ver>.jar` | early services、加载图片与 JiJ 元数据 | early-service classloader |
+| `META-INF/jarjar/illusion-core.jar` | 正常模组代码、配置、native 与资源 | 游戏 classloader |
 
-安装器 `EarlyWindowJarInstaller.ensureInstalled()` 在模组构造期跑（`Illusion.init` 第 44 行），做两件事：
+`GraphicsBootstrapper` 在 provider 选择前通过 FMLConfig API 设置默认 provider；尊重禁用早期窗口与明确选择其他 provider 的配置。
 
-1. 把内嵌 jar 写到 `mods\dxrmc-earlywindow.jar`。与磁盘上内容相同就跳过；先写同目录 `.tmp` 再 `Files.move`（半写的 jar
-   会让下一次启动失败）；旧 jar 被当前进程占用无法替换时，把旧 jar 移成 `dxrmc-earlywindow.stale` 再把新的放到正式路径。
-2. 把 `config\fml.toml` 的 `earlyWindowProvider` 改成 `"dxrmc"`：已有该键就整行替换，没有就追加；`fml.toml` 不存在时不动（不创建）。
-
-两条都生效需要**重启一次**，日志会明说「restart the game once」。内容相同则不写盘，所以正常启动不会每次都改文件。
+首次启动无需解包安装器或额外重启。升级时删除旧 `mods/dxrmc-earlywindow.jar`，避免重复服务定义。
 
 ### 5.6 失败与退回
 
 | 失败点 | 触发条件 | 结果 |
 | --- | --- | --- |
-| SDL 初始化 / 建窗口失败 | `SDL_Init(SDL_INIT_VIDEO)` 或 `SDL_CreateWindow` 返回 0 | 打 ERROR 后 return，句柄保持 0、属性不写；`WindowAdoptCreatedMixin` 直接放行，原版自己建窗口 |
-| 软件 renderer 不可用 | `SDL_CreateRenderer(window,"software")` 返回 0 | 打 WARN，退回默认 renderer，继续 |
-| 后端不是 D3D12 | `Window#createWindow` 收到的 backend 不是 `D3D12Backend` | mixin 不接管；交接时打日志「graphics backend is not D3D12 - dropping the early window…」+ `close()` + `SDL_HideWindow` |
-| 句柄解析失败 / 为 0 | 属性不是数字，或值为 `"0"` | mixin 不接管，原版建窗口 |
+| SDL 初始化 / 建窗口失败 | `SDL_Init(SDL_INIT_VIDEO)` 或 `SDL_CreateWindow` 返回 0 | 打 ERROR 后 return，D3D12 后端正常创建游戏窗口 |
+| 软件 renderer 不可用 | `SDL_CreateRenderer(window,"software")` 返回 0 | 打 WARN，保留待领用窗口，无默认 renderer 回退 |
+| 后端不是 D3D12 | 游戏未领用租约 | 交接时关闭 provider 并销毁未领用窗口 |
+| 交接 backend 创建 / 呈现失败 | supplier 或初次绘制抛出异常 | 释放 provider 的纹理和 backend，游戏继续拥有已领用窗口，异常向上传播 |
 | 纹理 / 表面创建失败 | `SDL_CreateSurfaceFrom` / `SDL_CreateTextureFromSurface` 返回 0 | 只打一次 WARN（`textureFailureLogged` 去重），这一帧不显示，加载继续 |
 | 致命加载错误 | `displayFatalErrorAndExit` | 打 ERROR，`Runtime.halt(1)` |
 
-注意「接管成功」这条路径上**故意不销毁 renderer**：销毁它会让窗口黑到游戏第一帧呈现为止，观感上就是闪一下。
-最后一帧一直被保留，直到 `Minecraft#close` 时刷黑。
+领用前停止并同步所有早期绘制，清黑软件 backing surface 并销毁 renderer。
+正式加载图像由 supplier 提供的 `RenderPearlRenderBackend` 上传，复用 `RenderSystem.getDevice()` 与游戏 `windowSurface()`。
 
-### 5.7 退出时为什么要涂黑
+### 5.7 退出与资源所有权
 
-`Minecraft#close` 的顺序是：`windowSurface.close()`（销毁 D3D12 交换链）→ … → `finally` 里才 `window.close()`
-（`SDL_DestroyWindow`）。在交换链已经停止呈现、SDL 窗口还没销毁的这一小段里，SDL 会把手里的
-**最后一次 present 的那一帧**重新铺到客户区 —— 也就是早期加载屏。所以：
+软件 renderer 在 D3D12 领用前已经清黑并销毁，退出时不会重新呈现残留的早期加载图像。
+provider 的关闭操作幂等，只释放加载资源和未领用窗口；已领用窗口由游戏原有生命周期销毁一次。
 
-- `MinecraftCloseEarlyWindowMixin` 在 `close` 的 HEAD 调 `EarlyWindowSurface.paintBlack()`，
-  用 `SDL_CreateRenderer(handle, "software")` + 黑色 + `SDL_RenderClear` + `RenderPresent` 把最后那帧换成黑色。
-- 句柄是一次性的：`paintBlack()` 取出后立刻清零，重复调用什么都不做。
-- 没走单窗口路径（句柄为 0）时，这个 mixin 是空操作。
-- 刷黑失败只打一条 WARN：`cannot clear the adopted window before shutdown: …`，不阻断关闭。
+加载图像的实际视觉连续性、DPI/全屏变化和 RTSS 注入仍需要在 Windows 客户端实测。
 
 ## 6. 新增一个 mixin 的规范
 
@@ -426,13 +418,12 @@ mixin 侧（前缀 `Illusion/src/main/java/io/github/dxegp/`，逐条清单见 `
 
 | 文件 | 内容 |
 | --- | --- |
-| `mixin/core/WindowAdoptCreatedMixin.java`、`mixin/core/MinecraftCloseEarlyWindowMixin.java` | 接管早期 SDL 窗口（仅 D3D12）、退出前刷黑 |
 | `mixin/antialiasing/GameRendererSmaaWorldMixin.java` | 全帧唯一的「世界画完 / GUI 未画」挂点 |
 | `mixin/temporal/LevelRendererMainPassDepthMixin.java` | main pass RETURN：时域、速度、深度、透射率 |
 | `mixin/resolution/MainTargetRenderScaleMixin.java`、`mixin/resolution/RenderTargetCreateBuffersScaleMixin.java`、`mixin/resolution/LevelRendererWorldTargetsScaleMixin.java` | 渲染比例的三个尺寸点 |
 | `mixin/presentation/GuiRendererTargetMixin.java`、`mixin/presentation/CubeMapTargetMixin.java`、`mixin/presentation/GameRendererBlurTargetMixin.java` | GUI 目标归属 |
 | `mixin/backend/FrontendGpuDeviceCompilePipelineMixin.java`、`mixin/backend/ShaderManagerRequiredFailureMixin.java`、`mixin/backend/GameRendererPreloadUiShaderMixin.java` | 管线与着色器 |
-| `mixin/terrain/SectionUploadCaptureMixin.java`、`mixin/temporal/DynamicGpuDataCaptureMixin.java` | 地形数据采集 |
+| `mixin/terrain/SectionUploadCaptureMixin.kt`、`CompiledSectionGeometryMixin.kt`、`LevelRendererMeshCaptureMixin.kt`、`DynamicGpuDataCaptureMixin.kt` | 地形网格所有权、退休与绘制快照采集 |
 | `mixin/diagnostics/` 下的 ProfMixin、`mixin/debug/PreparedFrameProfMixin.java` | 阶段计时 |
 | `mixin/options/OptionsMixin.java`、`mixin/options/OptionsRenderOptionsMixin.java`、`mixin/options/OptionsAntiAliasingMixin.java`、`mixin/options/OptionsGraphicsPresetMixin.java` | `Options` 上的四处注入 |
 | `mixin/options/PreferredGraphicsApiMixin.java`、`mixin/options/PreferredGraphicsApiAccessor.java` | 往原版枚举里追加 D3D12 |
@@ -444,8 +435,8 @@ mixin 侧（前缀 `Illusion/src/main/java/io/github/dxegp/`，逐条清单见 `
 | 文件 | 内容 |
 | --- | --- |
 | `Illusion/src/main/java/io/github/dxegp/bootstrap/earlywindow/service/DxrmcEarlyWindowProvider.java` | 独立 jar 里的 provider：SDL 窗口 + AWT 加载屏 + 交接 |
-| `Illusion/src/main/kotlin/io/github/dxegp/bootstrap/earlywindow/EarlyWindowJarInstaller.kt` | 解出 `mods\dxrmc-earlywindow.jar`、改 `fml.toml` |
-| `Illusion/src/main/kotlin/io/github/dxegp/bootstrap/earlywindow/EarlyWindowSurface.kt` | 记住 / 刷黑被接管的窗口句柄 |
+| `Illusion/src/main/kotlin/io/github/dxegp/bootstrap/earlywindow/service/EarlyWindowLease.kt` | 一次性窗口租约、未领用窗口的幂等销毁 |
+| `Illusion/src/main/kotlin/io/github/dxegp/bootstrap/earlywindow/service/DxrmcGraphicsBootstrapper.kt` | 首次启动 provider 选择与旧服务冲突检查 |
 | `Illusion/src/main/java/io/github/dxegp/client/compat/FpsLimitCompat.java` | 反射安装 `InactivityFpsLimit.NEVER`（`compat` 包唯一文件） |
 | `Illusion\src\main\resources\dxr_mc.mixins.json`、`...\META-INF\accesstransformer.cfg` | 44 条注册；两条 AT |
 | `Illusion\src\main\resources\META-INF\services\net.neoforged.neoforgespi.earlywindow.ImmediateWindowProvider`、`...\neoforge.mods.toml` | provider 的 service 声明；`[[mixins]]` 与 `[[accessTransformers]]` 登记 |
@@ -473,9 +464,7 @@ mixin 侧（前缀 `Illusion/src/main/java/io/github/dxegp/`，逐条清单见 `
    同时更新 `dxr_mc.mixins.json` 的条数与 §3.1 的总览（现在是 3/3/3/3/6/10/4/2/10 = 44）。
 2. **§4 的时序**：注入点的相对顺序是后端的假设。移动一个挂点时（尤其是第 5、7 步），
    先确认 `D3D12TAA` / DLSS / `D3D12GUISplit` 的消费时机，再改这张表。
-3. **§5 的交接协议**：`dxrmc.earlywindow.handle` / `.adopted` 两个属性、`mods\dxrmc-earlywindow.jar`
-   的路径与 `fml.toml` 的键名都是硬编码字符串。改任何一个，provider、mixin、安装器三处要同时改，
-   并且这里要写清楚新值。
+3. **§5 的交接协议**：保持父 classloader 的唯一服务定义、一次性窗口租约与游戏 backend 复用契约同步。
 
 写作约定（与 `Illusion\docs\` 其他文档一致）：
 

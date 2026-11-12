@@ -1,135 +1,105 @@
 package io.github.dxegp.render.terrain.mesh
 
+import com.mojang.renderpearl.api.buffers.GpuBuffer
+import com.mojang.renderpearl.api.buffers.GpuBufferSlice
 import net.minecraft.client.renderer.DynamicGpuData
-import net.minecraft.core.SectionPos
-import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.concurrent.ConcurrentHashMap
+import java.util.IdentityHashMap
+import io.github.dxegp.d3d12.resource.D3D12TransientMemory
 
-/**
- * 捕获 vanilla 每帧的 MDI 段列表（参数缓冲在 UPLOAD 堆、CPU 读不回，只能在这里记）。
- * 键用 `GpuBufferSlice.offset`，绘制时按同一 offset 取回批次。见 docs/mesh&vrs/README.md §2.3。
- */
 object D3D12MeshDrawCapture {
+    internal data class DrawSnapshot(
+        val command: DynamicGpuData.IndexedDraw,
+        val section: DynamicGpuData.ChunkSectionInfo,
+        val geometry: D3D12SectionGeometry.LayerUpload,
+    )
 
-    /** 一批 MDI：`IntArray(drawCount * 4)` = 每段 (indexCount, firstIndex, baseVertex, baseInstance)。 */
-    class Batch(val offset: Long, val strided: IntArray, val drawCount: Int)
+    class Batch internal constructor(internal val draws: List<DrawSnapshot>) {
+        val drawCount: Int get() = draws.size
+        val quadsPerMeshlet: Int = run {
+            val maximum = draws.maxOfOrNull { it.geometry.maximumMeshletQuads } ?: 0
+            when { maximum > 32 -> 64; maximum > 16 -> 32; else -> 16 }
+        }
+    }
 
-    private val batches = ConcurrentHashMap<Long, Batch>()
+    class BatchTables(val sections: GpuBufferSlice, val meshlets: GpuBufferSlice, val sectionCount: Int,
+                      val meshletCount: Int)
 
-    /** 段位置（`SectionPos.asLong`），按 baseInstance 索引。 */
-    @Volatile private var sectionKeys: LongArray = LongArray(0)
-    @Volatile private var sectionVisibility: FloatArray = FloatArray(0)
+    private data class CommandRange(val offset: Long, val length: Long)
 
-    /** 方块坐标（写进 SectionDesc 的 `chunkX/Y/Z`，着色器里再减 `CameraBlockPos`）。 */
-    @Volatile private var sectionBlockX: IntArray = IntArray(0)
-    @Volatile private var sectionBlockY: IntArray = IntArray(0)
-    @Volatile private var sectionBlockZ: IntArray = IntArray(0)
+    private val captured = IdentityHashMap<DynamicGpuData.IndexedDraw, DrawSnapshot>()
+    private val batches = IdentityHashMap<GpuBuffer, MutableMap<CommandRange, Batch>>()
 
-    /** 每帧清空：一次 `writeChunkSectionCommands` 写全部图层，不能按旧 offset 做过期淘汰。 */
-    @JvmStatic
+    @Synchronized
     fun beginFrame() {
+        captured.clear()
         batches.clear()
     }
 
-    @JvmStatic
-    fun captureBatch(offset: Long, draws: List<DynamicGpuData.IndexedDraw>) {
-        if (draws.isEmpty()) return
-        val packed = IntArray(draws.size * 4)
-        for (i in draws.indices) {
-            val d = draws[i]
-            packed[i * 4] = d.indexCount()
-            packed[i * 4 + 1] = d.firstIndex()
-            packed[i * 4 + 2] = d.baseVertex()
-            packed[i * 4 + 3] = d.baseInstance()
-        }
-        batches[offset] = Batch(offset, packed, draws.size)
+    @Synchronized
+    fun captureDraw(command: DynamicGpuData.IndexedDraw,
+                    geometry: D3D12SectionGeometry.LayerUpload?,
+                    sections: List<DynamicGpuData.ChunkSectionInfo>) {
+        if (geometry == null) return
+        val section = sections.getOrNull(command.baseInstance()) ?: return
+        captured[command] = DrawSnapshot(command, section, geometry)
     }
 
-    @JvmStatic
-    fun captureSections(infos: List<DynamicGpuData.ChunkSectionInfo>) {
-        val keys = LongArray(infos.size)
-        val visibility = FloatArray(infos.size)
-        val bx = IntArray(infos.size)
-        val by = IntArray(infos.size)
-        val bz = IntArray(infos.size)
-        for (i in infos.indices) {
-            val s = infos[i]
-            // x/y/z 是**方块坐标**（写进 slot1 的 ChunkPosition），注册表键却是 SectionPos.asLong（段坐标）：
-            // 拿方块坐标当键实测 369 段只命中 1 段。
-            keys[i] = SectionPos.asLong(
-                SectionPos.blockToSectionCoord(s.x()),
-                SectionPos.blockToSectionCoord(s.y()),
-                SectionPos.blockToSectionCoord(s.z()),
-            )
-            visibility[i] = s.visibility()
-            bx[i] = s.x()
-            by[i] = s.y()
-            bz[i] = s.z()
+    @Synchronized
+    fun captureBatches(commands: Array<GpuBufferSlice>, groups: List<List<DynamicGpuData.IndexedDraw>>) {
+        for (groupIndex in 0 until minOf(commands.size, groups.size)) {
+            val draws = groups[groupIndex]
+            if (draws.isEmpty()) continue
+            val snapshots = draws.map { captured[it] }
+            if (snapshots.any { it == null }) continue
+            val slice = commands[groupIndex]
+            val range = CommandRange(slice.offset(), slice.length())
+            batches.getOrPut(slice.buffer()) { mutableMapOf() }[range] =
+                Batch(snapshots.filterNotNull())
         }
-        sectionKeys = keys
-        sectionVisibility = visibility
-        sectionBlockX = bx
-        sectionBlockY = by
-        sectionBlockZ = bz
+        captured.clear()
     }
 
-    fun batch(offset: Long): Batch? = batches[offset]
+    @Synchronized
+    fun batch(commands: GpuBufferSlice): Batch? =
+        batches[commands.buffer()]?.get(CommandRange(commands.offset(), commands.length()))
 
-    /** 一批 MDI 打完包的两张表（32 B/条，直接上传成 t15/t16 的 RAW SRV）。 */
-    class BatchTables(val sections: ByteArray, val meshlets: ByteArray, val sectionCount: Int,
-                      val meshletCount: Int)
-
-    /**
-     * 打包段表 + meshlet 表（32 B/条）；任一段缺 meshlet / 缺该层即整批返回 null —— 地形无 IMR 回退，
-     * 部分派发只会画出缺块的画面。`baseVertex` 相对 `vertexSliceOffset`，所以 vertexBase 直接写 `baseVertex`。
-     */
-    fun buildTables(batch: Batch, layer: String, vertexSliceOffset: Long): BatchTables? {
-        val blocksX = sectionBlockX
-        val blocksY = sectionBlockY
-        val blocksZ = sectionBlockZ
-        val visibilities = sectionVisibility
-        if (blocksX.size < batch.drawCount) return null
-        val keys = sectionKeys
-
-        val perSection = arrayOfNulls<List<D3D12MeshletBuilder.Meshlet>>(batch.drawCount)
-        var meshletTotal = 0
-        for (i in 0 until batch.drawCount) {
-            val baseInstance = batch.strided[i * 4 + 3]
-            if (baseInstance < 0 || baseInstance >= keys.size) return null
-            val geometry = D3D12SectionGeometry.find(keys[baseInstance]) ?: return null
-            val upload = geometry.layers[layer] ?: return null
-            if (upload.meshlets.isEmpty()) return null
-            perSection[i] = upload.meshlets
-            meshletTotal += upload.meshlets.size
+    fun buildTables(batch: Batch, layer: String, vertexSliceOffset: Long, ctx: Long,
+                    staging: D3D12TransientMemory, residency: D3D12MeshletResidency): BatchTables? {
+        if (vertexSliceOffset < 0L) return null
+        var meshletTotal = 0L
+        for (draw in batch.draws) {
+            val command = draw.command
+            val geometry = draw.geometry
+            if (geometry.layer != layer || geometry.meshlets.isEmpty() || command.instanceCount() != 1 ||
+                command.indexCount() != geometry.indexCount || command.baseVertex() < 0) return null
+            meshletTotal += geometry.meshlets.size
         }
+        if (meshletTotal > (Int.MAX_VALUE - 32L - batch.drawCount * 32L) / 8L ||
+            batch.drawCount > 65535 * 64 || batch.draws.any { it.geometry.meshlets.size > 65535 * 64 }) return null
+        val dynamicBytes = batch.drawCount * 40L
+        if (dynamicBytes > Int.MAX_VALUE) return null
 
-        val sections = ByteBuffer.allocate(batch.drawCount * 32).order(ByteOrder.LITTLE_ENDIAN)
-        val meshlets = ByteBuffer.allocate(meshletTotal * 32).order(ByteOrder.LITTLE_ENDIAN)
-        var meshletBase = 0
-        for (i in 0 until batch.drawCount) {
-            val baseInstance = batch.strided[i * 4 + 3]
-            val baseVertex = batch.strided[i * 4 + 2]
-            val list = perSection[i] ?: return null
-            sections.putInt(baseVertex)          // vertexBase：相对绑定的顶点切片
-            sections.putInt(baseVertex / 4)      // quadBase（调试）
-            sections.putInt(meshletBase)
-            sections.putInt(list.size)
-            sections.putInt(blocksX[baseInstance])
-            sections.putInt(blocksY[baseInstance])
-            sections.putInt(blocksZ[baseInstance])
-            sections.putFloat(visibilities[baseInstance])
-            for (m in list) {
-                m.pack(meshlets, i, m.firstQuad * D3D12MeshletBuilder.VERTICES_PER_QUAD)
+        val staticBuffer = residency.prepare(ctx, staging, batch.draws.map { it.geometry })
+        val sectionsSlice = staging.writeIntoStagingBlock(dynamicBytes, 256L) { destination ->
+            val sections = destination.order(ByteOrder.LITTLE_ENDIAN)
+            for (drawIndex in batch.draws.indices) {
+                val draw = batch.draws[drawIndex]
+                val baseVertex = draw.command.baseVertex()
+                val descriptors = draw.geometry.meshlets
+                sections.putInt(baseVertex)
+                sections.putInt(baseVertex / D3D12MeshletBuilder.VERTICES_PER_QUAD)
+                sections.putInt(residency.offset(draw.geometry))
+                sections.putInt(descriptors.size)
+                sections.putInt(draw.section.x())
+                sections.putInt(draw.section.y())
+                sections.putInt(draw.section.z())
+                sections.putFloat(draw.section.visibility())
+                sections.putInt(drawIndex)
+                sections.putInt(if (draw.geometry.bounded) 1 else 0)
             }
-            meshletBase += list.size
-        }
-        return BatchTables(sections.array(), meshlets.array(), batch.drawCount, meshletTotal)
-    }
-
-    /** `baseInstance` → 该段的 `SectionPos.asLong`；越界返回 0。 */
-    fun sectionKey(baseInstance: Int): Long {
-        val keys = sectionKeys
-        return if (baseInstance in keys.indices) keys[baseInstance] else 0L
+            dynamicBytes
+        }.getOrThrow().first
+        return BatchTables(sectionsSlice, staticBuffer.slice(), batch.drawCount, meshletTotal.toInt())
     }
 }

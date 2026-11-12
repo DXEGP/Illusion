@@ -1,5 +1,8 @@
 package io.github.dxegp.render.antialiasing
 
+import io.github.dxegp.render.frame.vanilla.recordTaaPass
+import io.github.dxegp.render.frame.vanilla.recordVelocityPass
+
 import io.github.dxegp.render.temporal.D3D12Temporal
 import io.github.dxegp.render.temporal.D3D12Velocity
 

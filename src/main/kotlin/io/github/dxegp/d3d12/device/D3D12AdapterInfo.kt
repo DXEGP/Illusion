@@ -33,7 +33,10 @@ class D3D12AdapterInfo private constructor(
 
     val shadingRateTileSize: Int = 0,
 
-    val additionalShadingRates: Boolean = false
+    val additionalShadingRates: Boolean = false,
+    val workGraphsTier: Int = 0,
+    val meshShaderTier: Int = 0,
+    val shaderModelValue: Int = 0,
 ) {
     /** vanilla 风格驱动串：`"<feature level> <driver version>"`。 */
     fun driverInfo(): String {
@@ -72,7 +75,8 @@ class D3D12AdapterInfo private constructor(
     fun summary(): String = "${name} [${vendorName()} ${deviceType}]" +
         " backend=${backendName()} driver=${driverInfo()}" +
         " vram=${vramMiB()}MiB shared=${sharedMiB()}MiB" +
-        " luid=${luid} d3dcore=${d3dcore}"
+        " luid=${luid} d3dcore=${d3dcore}" +
+        " workGraphsTier=$workGraphsTier meshShaderTier=$meshShaderTier shaderModel=$shaderModelValue"
 
     companion object {
         /** 当前活的 D3D12 设备的适配器；GL/Vulkan 渲染时为 null（F3 mixin 读它）。 */
@@ -111,7 +115,10 @@ class D3D12AdapterInfo private constructor(
                 fields["dxcore"] == "true",
                 fields["shading_rate_tier"]?.toIntOrNull() ?: 0,
                 fields["shading_rate_image_tile_size"]?.toIntOrNull() ?: 0,
-                fields["additional_shading_rates"] == "true"
+                fields["additional_shading_rates"] == "true",
+                fields["work_graphs_tier"]?.toIntOrNull() ?: 0,
+                fields["mesh_shader_tier"]?.toIntOrNull() ?: 0,
+                fields["shader_model_value"]?.toIntOrNull() ?: 0,
             )
         }
 

@@ -1,5 +1,7 @@
 package io.github.dxegp.render.antialiasing
 
+import io.github.dxegp.render.frame.vanilla.recordSmaaWorldPass
+
 import io.github.dxegp.Illusion
 import io.github.dxegp.d3d12.device.D3D12Device
 import io.github.dxegp.d3d12.resource.D3D12GpuTexture

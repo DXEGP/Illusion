@@ -14,15 +14,10 @@ import io.github.dxegp.diagnostics.IllusionLogger
 import io.github.dxegp.Illusion
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
 import io.github.dxegp.d3d12.device.D3D12Device
-import io.github.dxegp.render.antialiasing.D3D12TAA
-import io.github.dxegp.render.temporal.D3D12Temporal
-import io.github.dxegp.render.antialiasing.D3D12PostSharpen
-import io.github.dxegp.render.temporal.D3D12Velocity
 import io.github.dxegp.d3d12.resource.*
 import io.github.dxegp.d3d12.command.*
 import io.github.dxegp.d3d12.surface.*
 import org.joml.Vector4fc
-import java.lang.foreign.MemorySegment
 import java.nio.ByteBuffer
 import java.util.*
 import kotlin.math.roundToLong
@@ -34,6 +29,7 @@ import kotlin.math.roundToLong
  */
 class D3D12CommandEncoderBackend : CommandEncoderBackend {
     private val commandLifetimeResources = mutableSetOf<AutoCloseable>()
+    private val meshletResidency = io.github.dxegp.render.terrain.mesh.D3D12MeshletResidency()
     private var commandsDestroyed = false
 
     internal fun retainUntilCommandsClosed(resource: AutoCloseable) {
@@ -43,13 +39,19 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
 
     internal fun destroyCommandsAndReleaseResources() {
         if (commandsDestroyed) return
+        settlePendingSubmit()
+        check(!submissionFailed) { "Failed submission retains its command resources" }
+        if (pendingCallbacks.isNotEmpty() && MCDR_ABI.D3D12IsListOpen(ctx)) submit()
+        settlePendingSubmit()
         if (!MCDR_ABI.D3D12WaitForFence(ctx,
                 MCDR_ABI.D3D12GetFenceValue(ctx), 5_000_000_000L)) {
             IllusionLogger.warnMessage("Device shutdown: GPU fence timed out")
             error("Device shutdown: GPU commands remain active")
         }
+        drainCompletedCallbacks()
         MCDR_ABI.D3D12DestroyCommandEncoder(ctx)
         commandsDestroyed = true
+        this.transientMemory.close()
         while (commandLifetimeResources.isNotEmpty()) {
             val resource = commandLifetimeResources.first()
             resource.close()
@@ -60,45 +62,66 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
     private val ctx: Long
 
     /** GUI 的防御性 `RSSetShadingRate` 复位要用同一条列表的上下文（只给同包调用方）。 */
-    internal fun nativeCtx(): Long = ctx
+    internal fun nativeCtx(): Long = nativeHandle()
+    internal fun <T> recordCommands(action: (Long) -> T): T {
+        ensureListOpen()
+        return action(ctx)
+    }
+
+    internal fun commandDevice(): D3D12Device? = device
+    internal fun <T> contextControl(action: (Long) -> T): T {
+        check(!commandsDestroyed) { "Command context is destroyed" }
+        settlePendingSubmit()
+        return action(ctx)
+    }
     private val device: D3D12Device?
+    private val uploadTransform: (GpuBufferSlice, ByteBuffer) -> ByteBuffer?
     private val transientMemory: D3D12TransientMemory
-    // 拷贝完成回调是**设备级全局队列**：vanilla 的 Screenshot 只在一个从不 submit 的一次性 encoder 上登记回调，
-    // 回调若存在 encoder 自己身上则永不执行 → 截图缓冲永不 close（每秒 1.6MB READBACK 泄漏）。
-    private val pendingCallbacks: MutableList<Runnable> get() = GLOBAL_CALLBACKS
+    private val pendingCallbacks = mutableListOf<Runnable>()
+    private val submittedCallbacks = ArrayDeque<Pair<Long, List<Runnable>>>()
     private var currentRenderPass: D3D12RenderPassBackend? = null
-    /** 当前 submit() 走 ASYNC 路径：begin/allocator reset 由主线程在 [ensureListOpen] 里做，渲染线程只 Close+Execute+Present。 */
-    private var inAsyncSubmit = false
     /**
      * 本帧提交已交给渲染线程、尚未结算。改由 [ensureListOpen] 结算 —— 中间隔着 MC 的 extract，
      * 渲染线程早已提交，主线程基本不阻塞（原先在 submit() 末尾阻塞 0.09-0.11ms/帧）。
      */
     private var pendingSubmit = false
+    private var pendingFenceBefore = 0L
+    private var submissionFailed = false
+    private var closing = false
 
     constructor() : this(null)
 
-    constructor(device: D3D12Device?) {
+    constructor(device: D3D12Device?, uploadTransform: (GpuBufferSlice, ByteBuffer) -> ByteBuffer? = { _, _ -> null }) {
         this.device = device
+        this.uploadTransform = uploadTransform
         this.ctx = MCDR_ABI.D3D12CreateCommandEncoder()
         if (this.ctx == 0L) throw IllegalStateException("dx12CreateCommandEncoder returned a null handle")
 
         this.transientMemory = D3D12TransientMemory(this.ctx, Runnable { this.ensureListOpen() })
+        retainUntilCommandsClosed(meshletResidency)
         // 构造时打开命令列表：beginCommandList 幂等（C++ 侧 listOpen=1 则跳过 allocator Reset），
         // 自检等一次性路径才能直接录制。
         MCDR_ABI.D3D12BeginCommandList(this.ctx)
     }
 
     /** Native CommandContext* handle (used by surface blit + render pass). */
-    fun nativeHandle(): Long = this.ctx
+    fun nativeHandle(): Long {
+        ensureListOpen()
+        return this.ctx
+    }
 
     /**
      * 懒加载打开命令列表（幂等）。列表未打开时会 allocator reset —— 内部按 fenceValue-2 等 GPU 释放该 allocator。
      */
     private fun ensureListOpen() {
+        check(!commandsDestroyed && !closing) { "Command encoder is closed" }
         // 结算上一帧挂起的提交必须早于读 listOpen：渲染线程的 submitCommandList 会 Close 旧列表（1→0），
         // 先读可能读到中间态而跳过 begin，主线程随即写进一条正在被关闭/提交的列表（数据竞争）。
         settlePendingSubmit()
+        check(!submissionFailed) { "Command submission failed; context remains retained" }
+        drainCompletedCallbacks()
         if (!MCDR_ABI.D3D12IsListOpen(this.ctx)) MCDR_ABI.D3D12BeginCommandList(this.ctx)
+        check(MCDR_ABI.D3D12IsListOpen(this.ctx)) { "Command list could not be opened" }
     }
 
     /**
@@ -108,7 +131,6 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
      */
     private fun settlePendingSubmit() {
         if (!this.pendingSubmit) return
-        this.pendingSubmit = false
         val prof = MCDR_ABI.PROF
         val t0 = if (prof) System.nanoTime() else 0L
         val completed = MCDR_ABI.D3D12AsyncRenderWaitComplete(this.ctx, 10_000L)
@@ -116,6 +138,36 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
         if (!completed) {
             IllusionLogger.warnMessage("asyncRenderWaitComplete timeout! ctx=0x${this.ctx.toULong().toString(16)}")
             System.err.flush()
+            error("Async submission ownership remains pending")
+        }
+        val submittedFence = MCDR_ABI.D3D12GetFenceValue(this.ctx)
+        check(submittedFence > pendingFenceBefore) { "Async submission did not publish its fence" }
+        this.pendingSubmit = false
+        acceptSubmission(submittedFence)
+    }
+
+    private fun acceptSubmission(submittedFence: Long) {
+        if (pendingCallbacks.isNotEmpty()) {
+            submittedCallbacks.addLast(submittedFence to pendingCallbacks.toList())
+            pendingCallbacks.clear()
+        }
+        this.transientMemory.rotate(submittedFence)
+        drainCompletedCallbacks()
+    }
+
+    private fun drainCompletedCallbacks() {
+        while (submittedCallbacks.isNotEmpty()) {
+            val submission = submittedCallbacks.first()
+            if (!MCDR_ABI.D3D12WaitForFence(ctx, submission.first, 0L)) return
+            submittedCallbacks.removeFirst()
+            for (callback in submission.second) {
+                try {
+                    callback.run()
+                } catch (failure: Throwable) {
+                    IllusionLogger.warnMessage("GPU completion callback failed: $failure")
+                    failure.printStackTrace()
+                }
+            }
         }
     }
 
@@ -218,66 +270,10 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
             this.device, this.ctx,
             area, w, h, hasDepth, if (colorCount > 0) colorTextures[0] else 0L, flipY,
             this.transientMemory,
+            this.meshletResidency,
         )
         this.currentRenderPass = pass
         return pass
-    }
-
-    /**
-     * 把独立的全屏速度 pass 录进当前命令列表。调用点是 blit 之前：那时本帧渲染已完成、主深度仍有效。
-     * 未启用 / 首帧无历史 / 任何失败都只是 no-op 或一次性自我关闭，绝不影响本帧渲染。
-     */
-    fun recordVelocityPass() {
-        if (!D3D12Velocity.isActive()) {
-            return
-        }
-        this.ensureListOpen()
-        D3D12Velocity.record(this.ctx, this.device)
-    }
-
-    /** 后置锐化（TAA / DLAA / DLSS 共用）。`src == dst`、锐化关闭、旧 DLL 都返回 false，调用方应回退普通 blit。 */
-    fun recordSharpen(src: Long, dst: Long): Boolean {
-        if (!D3D12PostSharpen.isEnabled()) {
-            return false
-        }
-        this.ensureListOpen()
-        return D3D12PostSharpen.record(this.ctx, src, dst)
-    }
-
-    /**
-     * 对主渲染目标**就地**做 SMAA（世界画完、GUI 未画）。往本帧已打开的那条命令列表追加命令，
-     * 不新建不提交；是否真做由 native 判断（`aaMode == SMAA`），未启用只花一次 downcall。
-     */
-    fun recordSmaaWorldPass(texture: D3D12GpuTexture): Boolean {
-        this.ensureListOpen()
-        return MCDR_ABI.dx12ApplySmaaToTexture(this.ctx, texture.handle())
-    }
-
-    /**
-     * 把本帧的 TAA resolve 交给 native（历史乒乓与两趟 pass 都在 native）。与 [recordSmaaWorldPass] 同挂点、
-     * 互斥（TAA 与 SMAA 是同一个抗锯齿选项的两个取值）；只往已打开的列表追加，不新建不提交。
-     */
-    fun recordTaaPass(world: D3D12GpuTexture): Boolean {
-        this.ensureListOpen()
-        return D3D12TAA.record(this.ctx, this.device, world)
-    }
-
-    /**
-     * 把一帧 DLSS 参数包交给 native（Create 与 Evaluate 是同一个入口，每帧只走这一条）。
-     * 返回值原样透传：1 = 真的评价了，0 = native 跳过，-1 = 参数非法，[Int.MIN_VALUE] = 没有该导出。
-     */
-    fun recordDlssEvaluate(input: MemorySegment): Int {
-        this.ensureListOpen()
-        return MCDR_ABI.D3D12EvaluateDlss(this.ctx, input)
-    }
-
-    /**
-     * 把**世界层深度**在当前列表上快照给 native，供稍后的 [recordDlssEvaluate] 使用。调用点必须在 vanilla
-     * 的 `clearDepthTexture` **之前** —— 清空后拷贝到的是 0.0。返回值：1 就位 / 0 跳过 / -1 失败 / INT_MIN 无导出。
-     */
-    fun recordDlssDepthSnapshot(depth: D3D12GpuTexture): Int {
-        this.ensureListOpen()
-        return MCDR_ABI.D3D12SnapshotDlssDepth(this.ctx, depth.handle())
     }
 
     /**
@@ -339,7 +335,7 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
         // 时间性渲染的写出拦截点：关卡投影矩阵（label "Camera projection matrix UBO level"，64B）注入亚像素
         // jitter，相机 UBO（"Global Settings UBO"，56B）捕获 CameraBlockPos/CameraOffset。两者 usage 136 不可映射、
         // 每帧都被重写，所以这是唯一能拿到逐帧新鲜字节的地方。未开启/不是这两个缓冲时返回 null。
-        val jittered = D3D12Temporal.interceptWrite(destination, data)
+        val jittered = uploadTransform(destination, data)
         val payload = jittered ?: data
         this.ensureListOpen()
         // 与官方一致：直接上传，不做 NaN 检测/替换。数据有问题应在源头修；暴力替换会覆写整块顶点数据导致黑屏。
@@ -390,15 +386,16 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
         this.ensureListOpen()
         MCDR_ABI.D3D12CopyTextureToBuffer(this.ctx, textureHandle(source), mipLevel, 0,
             x, y, width, height, bufferHandle(destination), offset)
-        if (destination.size() > 1000000L) {
-        }
-        // 回调在下次 submit 后跑（镜像 destroyQueue 的 rotate）。
-        synchronized(this.pendingCallbacks) { this.pendingCallbacks.add(callback) }
+        this.pendingCallbacks.add(callback)
         // vanilla 契约：Screenshot.takeScreenshot 只在一个**从不 submit** 的一次性 encoder 上登记回调，期望回调
         // 在该帧提交时触发。一次性 encoder（device == null）必须在这里立刻提交并同步跑回调，否则每秒一次的
         // 自动截图都留下一个 1.6MB READBACK 缓冲（vanilla 回调里的 buffer.close() 永不执行）。
         if (this.device == null) {
             this.submit()
+            check(MCDR_ABI.D3D12WaitForFence(ctx, MCDR_ABI.D3D12GetFenceValue(ctx), 5_000_000_000L)) {
+                "Readback submission remains active"
+            }
+            drainCompletedCallbacks()
         }
     }
 
@@ -412,6 +409,7 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
     // ---- fences & timestamps ----
 
     override fun createFence(): GpuFence {
+        this.ensureListOpen()
         // token = 本 encoder 当前序号 + 1，只有本 encoder 的下一次 submit 推进它。**不能**退回设备级
         // queueFenceValue：一次性 encoder（createBuffer(data) 的上传）提交时也会推进全局序列，而 vanilla 在
         // 帧中间取 token，会让 StagedVertexBuffer / MappableRingBuffer 的缓冲在帧提交前就被提前回收。
@@ -440,11 +438,12 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
     // ---- submit lifecycle ----
 
     override fun submit() {
+        check(!commandsDestroyed && !closing) { "Command encoder is closed" }
         // ASYNC 路径：主线程录制完 → 通知渲染线程 → 等 RECORDING_READY → 通知命令就绪 → 渲染线程
         // Close+Execute+Present；结算推迟到下一帧（[settlePendingSubmit]）。
         // allocator Reset + begin 必须只由**主线程**做（[ensureListOpen]）：渲染线程若 Reset 会丢掉整帧
         // 已录制的命令，back buffer 永远不被写入 → Present 只能显示未初始化内容（花屏根因）。
-        settlePendingSubmit()
+        ensureListOpen()
 
         val fenceBefore = MCDR_ABI.D3D12GetFenceValue(this.ctx)
 
@@ -454,29 +453,16 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
         // encoder 的 fence token 一起推走。它们一律走下面的同步路径。
         val asyncStarted = this.device != null && MCDR_ABI.D3D12AsyncRenderBeginFrame(this.ctx)
         if (!asyncStarted) {
-            // 无 active surface（初始化阶段 / 窗口未创建）：走同步路径，提交立即完成。
-            MCDR_ABI.D3D12BeginCommandList(this.ctx)
-            MCDR_ABI.D3D12Submit(this.ctx)
-            this.transientMemory.rotate()
-            val run: List<Runnable> = synchronized(this.pendingCallbacks) {
-                ArrayList(this.pendingCallbacks).also { this.pendingCallbacks.clear() }
-            }
-            if (run.isNotEmpty()) {
-            }
-            for (callback in run) {
-                // 回调里抛异常会被吞掉，外层的截图缓冲就不会 close —— 必须打出来。
-                try {
-                    callback.run()
-                } catch (t: Throwable) {
-                    IllusionLogger.warnMessage("post-submit callback failed: " + t)
-                    t.printStackTrace()
-                }
-            }
+            submissionFailed = true
+            val submittedFence = MCDR_ABI.D3D12Submit(this.ctx)
+            check(submittedFence > fenceBefore) { "Command submission failed to publish its fence" }
+            submissionFailed = false
+            acceptSubmission(submittedFence)
             return
         }
 
-        // 异步路径：命令已录完，渲染线程只 Close+Execute+Present；这里不能再调 begin（列表已打开）。
-        this.inAsyncSubmit = true
+        this.pendingFenceBefore = fenceBefore
+        this.pendingSubmit = true
 
         // 记录本帧起点与相对上一帧的间隔（仅 PROF=1 生效）。
         val prof = MCDR_ABI.PROF
@@ -490,57 +476,19 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
         // 等渲染线程到 RECORDING_READY：必须用 native 阻塞等待（WaitForSingleObject），
         // sleep(1) 轮询每帧在关键路径上多引入约 1ms 调度开销。超时保护不变。
         val profT0 = if (prof) System.nanoTime() else 0L
+        MCDR_ABI.D3D12AsyncSendCommandsReady(this.ctx)
         val recordingReady = MCDR_ABI.D3D12AsyncRenderWaitRecordingReady(this.ctx, 5_000L)
         if (prof) gProfRecordingReadyNs += System.nanoTime() - profT0
         if (!recordingReady) {
-            // 渲染线程卡死：降级到 SYNC，避免整个游戏崩溃。
-            IllusionLogger.warnMessage("asyncRenderWaitRecordingReady timeout after 5000ms — falling back to SYNC, ctx=0x"
+            IllusionLogger.warnMessage("asyncRenderWaitRecordingReady timeout after 5000ms; ownership retained, ctx=0x"
                 + this.ctx.toULong().toString(16))
             System.err.flush()
-            // 清除 gAsyncRenderCtx，否则下一个 asyncBeginFrame 会被 "previous frame not complete" 拒绝。
-            MCDR_ABI.D3D12ClearAsyncRenderCtx()
-            MCDR_ABI.D3D12BeginCommandList(this.ctx)
-            MCDR_ABI.D3D12Submit(this.ctx)
-            this.transientMemory.rotate()
-            val run: List<Runnable> = synchronized(this.pendingCallbacks) {
-                ArrayList(this.pendingCallbacks).also { this.pendingCallbacks.clear() }
-            }
-            if (run.isNotEmpty()) {
-            }
-            for (callback in run) {
-                // 回调里抛异常会被吞掉，外层的截图缓冲就不会 close —— 必须打出来。
-                try {
-                    callback.run()
-                } catch (t: Throwable) {
-                    IllusionLogger.warnMessage("post-submit callback failed: " + t)
-                    t.printStackTrace()
-                }
-            }
-            return
+            error("Async recording handoff remains pending")
         }
-
-        // 通知渲染线程：所有命令已入队。
-        MCDR_ABI.D3D12AsyncSendCommandsReady(this.ctx)
 
         // 本帧**不再**阻塞等待提交完成：渲染线程此刻 Close+Execute+Signal+Present，主线程直接返回，
         // 结算推迟到下一帧开头（仍早于下一次 beginCommandList，见 [settlePendingSubmit]）。
-        this.pendingSubmit = true
 
-        // post-submit 清理。
-        this.transientMemory.rotate()
-        // 跑上一帧 copyTextureToBuffer 排队的回调。
-        val run: List<Runnable> = synchronized(this.pendingCallbacks) {
-            ArrayList(this.pendingCallbacks).also { this.pendingCallbacks.clear() }
-        }
-        for (callback in run) {
-            // 回调里抛异常会被吞掉，外层的截图缓冲就不会 close —— 必须打出来。
-            try {
-                callback.run()
-            } catch (t: Throwable) {
-                IllusionLogger.warnMessage("post-submit callback failed: " + t)
-                t.printStackTrace()
-            }
-        }
         // 每 PROF_INTERVAL 帧输出一次各阶段耗时均值（ms）。
         if (prof) {
             ++gProfAsyncFrames
@@ -558,66 +506,26 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
                     + " batchPath=${profMs(D3D12RenderPassBackend.gProfMultiPathNs * inv)}ms"
                     + " drawIndexedCalls/frame=${D3D12RenderPassBackend.gProfDrawIndexedCalls * inv}"
                     + " drawIndexed=${profMs(D3D12RenderPassBackend.gProfDrawIndexedNs * inv)}ms")
-                // 并行批量路径四段拆分（主线程串行 vs worker 并行）。
-                IllusionLogger.debugMessage("batch: build=${profMs(D3D12RenderPassBackend.gProfBuildNs * inv)}"
-                    + "ms prepare=${profMs(D3D12RenderPassBackend.gProfPrepareNs * inv)}"
-                    + "ms workers=${profMs(D3D12RenderPassBackend.gProfWorkersNs * inv)}"
-                    + "ms execute=${profMs(D3D12RenderPassBackend.gProfExecuteNs * inv)}"
-                    + "ms fallbacks=${D3D12RenderPassBackend.gProfFallbacks * inv}"
-                    + " | batchDraws=${D3D12RenderPassBackend.gProfSharedBatchDraws}"
-                    + " vbSame=${D3D12RenderPassBackend.gProfSameVbBuf}"
-                    + " vbSameOff=${D3D12RenderPassBackend.gProfSameVbOff}"
-                    + " ibSame=${D3D12RenderPassBackend.gProfSameIbBuf}"
-                    + " ibSameType=${D3D12RenderPassBackend.gProfSameIdxType}"
-                    + " | batches=${D3D12RenderPassBackend.gProfBatches}"
-                    + " sharedDesc=${D3D12RenderPassBackend.gProfSharedDescBatches}"
-                    + " singleBundle=${D3D12RenderPassBackend.gProfSingleBundles}"
-                    + " srvVaryFallback=${D3D12RenderPassBackend.gProfSrvVaryFallbacks}"
-                    + " slots=${D3D12RenderPassBackend.gProfSlotsTotal}"
-                    + " | bc=${D3D12RenderPassBackend.gProfBcTotal}"
-                    + " cbvVary=${D3D12RenderPassBackend.gProfCbvVary}"
-                    + " cbvSame=${D3D12RenderPassBackend.gProfCbvSame}"
-                    + " srvVary=${D3D12RenderPassBackend.gProfSrvVary}"
-                    + " srvSame=${D3D12RenderPassBackend.gProfSrvSame}"
-                    + " vbSlotSame=${D3D12RenderPassBackend.gProfVbSlotSame}")
                 System.err.flush()
                 D3D12RenderPassBackend.gProfMultiBatches = 0L
                 D3D12RenderPassBackend.gProfMultiDraws = 0L
                 D3D12RenderPassBackend.gProfMultiPathNs = 0L
                 D3D12RenderPassBackend.gProfDrawIndexedCalls = 0L
                 D3D12RenderPassBackend.gProfDrawIndexedNs = 0L
-                D3D12RenderPassBackend.gProfBuildNs = 0L
-                D3D12RenderPassBackend.gProfPrepareNs = 0L
-                D3D12RenderPassBackend.gProfWorkersNs = 0L
-                D3D12RenderPassBackend.gProfExecuteNs = 0L
-                D3D12RenderPassBackend.gProfFallbacks = 0L
-                D3D12RenderPassBackend.gProfSharedBatchDraws = 0L
-                D3D12RenderPassBackend.gProfSameVbBuf = 0L
-                D3D12RenderPassBackend.gProfSameVbOff = 0L
-                D3D12RenderPassBackend.gProfSameIbBuf = 0L
-                D3D12RenderPassBackend.gProfSameIdxType = 0L
-                D3D12RenderPassBackend.gProfBatches = 0L
-                D3D12RenderPassBackend.gProfSharedDescBatches = 0L
-                D3D12RenderPassBackend.gProfSingleBundles = 0L
-                D3D12RenderPassBackend.gProfSrvVaryFallbacks = 0L
-                D3D12RenderPassBackend.gProfSlotsTotal = 0L
-                D3D12RenderPassBackend.gProfBcTotal = 0L
-                D3D12RenderPassBackend.gProfCbvVary = 0L
-                D3D12RenderPassBackend.gProfCbvSame = 0L
-                D3D12RenderPassBackend.gProfSrvVary = 0L
-                D3D12RenderPassBackend.gProfSrvSame = 0L
-                D3D12RenderPassBackend.gProfVbSlotSame = 0L
                 gProfIntervalNs = 0L; gProfRecordingReadyNs = 0L
                 gProfWaitSubmitNs = 0L; gProfTotalNs = 0L
             }
         }
-        this.inAsyncSubmit = false
     }
     fun close() {
         if (commandsDestroyed) return
         // close 前必须结算挂起的异步提交：两条路径都会在 close 之后立刻 dx12DestroyCommandEncoder，
         // 若渲染线程仍在 Close+Execute+Signal 该 ctx，销毁会与之竞争 → 悬空/崩溃。结算后渲染线程不再触碰本 ctx。
         settlePendingSubmit()
+        check(!submissionFailed) { "Failed submission retains its command resources" }
+        if (pendingCallbacks.isNotEmpty()) submit()
+        settlePendingSubmit()
+        if (this.device == null) this.closing = true
         if (this.currentRenderPass != null) {
             MCDR_ABI.D3D12EndRenderPass(this.ctx)
             this.currentRenderPass = null
@@ -627,13 +535,12 @@ class D3D12CommandEncoderBackend : CommandEncoderBackend {
         // dx12DestroyCommandEncoder（CubeMap.render() 等内部 close 会顺手销毁共享 ctx）；一次性 encoder 仍要销毁。
         if (this.device == null) {
             destroyCommandsAndReleaseResources()
+        } else {
+            drainCompletedCallbacks()
         }
-        this.transientMemory.close()
     }
 
     companion object {
-        private val GLOBAL_CALLBACKS: MutableList<Runnable> = ArrayList()
-
         // 帧时间插桩（PROF=1 才启用，正常游玩零开销）：量化 submit() 内部各同步阶段耗时。
         private const val PROF_INTERVAL = 300
         private var gProfAsyncFrames = 0L

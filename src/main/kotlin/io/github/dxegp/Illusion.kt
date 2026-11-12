@@ -5,7 +5,6 @@ import io.github.dxegp.config.IllusionConfig
 import com.mojang.logging.LogUtils
 import io.github.dxegp.Illusion.Companion.OPTIONS_KEY_PREFERRED_GRAPHICS
 import io.github.dxegp.config.D3D12Settings
-import io.github.dxegp.bootstrap.earlywindow.EarlyWindowJarInstaller
 import io.github.dxegp.d3d12.backend.D3D12GraphicsApi
 import io.github.dxegp.diagnostics.D3D12VrsDebugEntry
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
@@ -42,8 +41,6 @@ class Illusion(modEventBus: IEventBus, modContainer: ModContainer) {
         D3D12VariableShadingRate.register()
         // Construct log level before initialize the logger.
         IllusionLogger.applyDefaults()
-        // early-window provider 以 jar-in-jar 形式随模组发布，启动时解到 mods/ 并改好 fml.toml。
-        EarlyWindowJarInstaller.ensureInstalled()
         modEventBus.addListener<ModConfigEvent.Loading> {
             IllusionLogger.applyFromConfig()
             D3D12Settings.reload()

@@ -20,13 +20,13 @@ SuperResolution（门面）── DLSS 开关变化时只做「认领后端 + �
         ▼
 DeepLearningSuperSampling（本篇主角，render/reconstruction/dlss/DLSS.kt）
   ├─ 开关 / 档位 / preset 的持久化与推送
-  ├─ 每帧数据面：速度 pass、深度快照、相机矩阵、jitter
+  ├─ 每帧数据面：速度 pass、共享深度输入、相机矩阵、jitter
   ├─ 抗锯齿互斥与 DLAA 的锁定/释放
   └─ 输出纹理交接（经 DLSSOutput）
         │  FFM
         ▼
 MCDR_ABI（mcdr_dx12EvaluateDlss / SetDlssEnabled / SetDlssQuality /
-          SetDlssRenderPreset / SnapshotDlssDepth / SetDlssOutput / QueryDlss）
+          SetDlssRenderPreset / SetDlssOutput / QueryDlss）
         ▼
 MCDR\src/render/reconstruction/d3d12_dlss.cpp ── Streamline（sl.interposer + sl.dlss_g）── NGX
 ```
@@ -118,8 +118,8 @@ Performance 时打出一条「DLSS 无法运行」的假警告。
 | `alphaUpscaling` | `0` |
 | `nearZ` / `farZ` | 载荷里填 `0.0`（JVM 侧拿不到关卡 `Projection` 对象）；native 只用它们写自己的诊断行与变化检测，不作为 NGX 参数 |
 | `depthInverted` | `1`：MC 是 reverse-Z，native 要求 1 |
-| `reset` | `resetReason(...)` 非空时置 1 |
-| `depthFormatOrdinal` | 主目标深度附件的 `GpuFormat.ordinal`（诊断） |
+| `reset` | 输入尺寸/窗口/比例变化，或共享历史检测到世界/世代/帧序号/相机跳变时置 1 |
+| `depthFormatOrdinal` | 共享深度快照的 `GpuFormat.ordinal`（与主深度同格式） |
 | `pInColor` / `pInDepth` / `pInMotionVectors` / `pInOutput` | 四张纹理的 `ID3D12Resource*` 句柄 |
 
 ### 5.2 三个数据依赖
@@ -128,7 +128,7 @@ Performance 时打出一条「DLSS 无法运行」的假警告。
 | --- | --- | --- |
 | 亚像素 jitter | `D3D12Temporal`（注入到关卡投影） | 没有子像素样本，时间性累积退化，DLSS 只做空间放大 |
 | 运动矢量 | `D3D12Velocity` 的速度 pass | native 在 `pInMotionVectors == nullptr` 时立刻返回 0，DLSS 一帧都不评价 |
-| 本帧世界深度 | 主目标深度 + native 私有 D32 快照 | 用被清过 0 的深度，重投影全错（移动时拖影） |
+| 本帧世界深度 | `ReconstructionFrameInputs` 的同格式深度快照 | 快照无效时跳过评价，不使用已清空的主深度 |
 
 这三样都由**构建期属性**（`dxrmc.temporal` / `dxrmc.temporal.velocity`，默认 `false`）只做**初始播种**，
 运行期由 `D3D12Temporal.enabled` / `D3D12Velocity.enabled` 控制。选中 DLSS 时必须把两者都打开，
@@ -144,14 +144,13 @@ Performance 时打出一条「DLSS 无法运行」的假警告。
 颜色只有到「世界层画完、GUI 未画」那一刻才完整，但深度在那之前已经被清过。JVM 侧没有任何**单一**
 挂点能同时满足两者，所以拆成两步：
 
-1. main pass 的 RETURN（世界几何刚画完、所有清深度之前）：`mcdr_dx12SnapshotDlssDepth(ctx, depth)`，
-   native 把深度拷进自己的 D32 快照，并**自己负责把调用方深度状态恢复**；
-2. evaluate 时（`GuiRenderer.render` 之前）：优先用快照，而不是载荷里的 `pInDepth`。
+1. main pass 的 RETURN：`SuperResolution.captureFrameInputs()` 先录速度，再由
+   `ReconstructionFrameInputs` 复制主深度；快照同时记录世界、帧序号、时域世代与相机位姿。
+2. evaluate 时：校验快照属于本帧且 MV 成功录制，将共享深度句柄写入 `pInDepth`。
+   NGX 与 Streamline 都消费该输入；当前 JVM 路径不调用私有 DLSS 深度快照导出。
 
-快照与 `pInDepth` 取自**同一个表达式**（`mainRenderTarget().depthTexture`），否则「快照」和「输入」不是一回事。
-
-旧 DLL 没有这个导出时返回 `Int.MIN_VALUE`，JVM 静默退回被清过的深度，只记一行说明——
-不会因此拒绝运行，只是画质降级。
+快照与 FSR/XeSS 共用，生命周期、相机跳变阈值及失败历史处理见总览第 3.1 节。
+Streamline tag 前显式转换输入到 `NON_PIXEL_SHADER_RESOURCE`，SDK 返回后恢复调用方描述符 heap。
 
 ### 5.4 相机常量（`DLSS_CONSTANTS`）
 
@@ -192,7 +191,7 @@ reverse-Z 的投影在构造时 near/far 是互换的。
 
 停滞状态的危险不是「没超分」，而是**jitter 还在注入却没人消费**——整幅画面每帧 ±0.5 像素地晃，
 用户看到的就是「DLSS 抖动」。所以 `D3D12Temporal.hasJitterConsumer()` 在「DLSS 开启且未停滞」之前
-不注入 jitter；TAA（含 DLAA）是另一个合法消费者。
+不注入 jitter；TAA 与可用的 FSR/XeSS 也是合法消费者，DLAA 由 DLSS 路径消费。
 
 ### 6.3 依赖的 DLL 与发行版差异
 
@@ -249,9 +248,8 @@ DLAA = 「DLSS 在原生分辨率」：`renderScale == 100%`、NGX 档位固定�
   反复推只会每帧触发重建。
 - 离开：推回用户自己的档位，再 `bindRenderScaleToDlss()`。少了这一步，DLAA 的 100% 会留在
   当前模式的记忆键里，退出后比例停在 100%。
-- DLAA 期间输出目标：`targetForFrame()` 返回 null（没有独立的窗口尺寸目标），
-  输出回落到主目标颜色本身；native 把结果重定向到交接纹理（同尺寸同格式），再拷回来。
-  这条路径上 `prepareForGui` 不做世界层 blit。
+- DLAA 期间 `ensureTargetForDlss()` 创建独立窗口尺寸 GUI 目标；native 写交接 UAV 后将结果复制到该目标。
+  `markWorldLayerDone()` 保证 `prepareForGui` 在 100% 下继续使用它，GUI 与最终呈现都选中重建结果。
 
 ### 7.3 让位（standDown）
 
@@ -318,7 +316,9 @@ recreate）后进程直接消失、没有任何 Java 异常**，与「设备移�
 
 | 文件 | 职责 |
 | --- | --- |
-| `render/reconstruction/dlss/DLSS.kt` | 本篇主体：开关/档位/preset、数据面、深度快照、相机常量、DLAA、抗锯齿互斥、旧 DLL 兼容桥 |
+| `render/reconstruction/dlss/DLSS.kt` | 本篇主体：开关/档位/preset、数据面、相机常量、DLAA、抗锯齿互斥、旧 DLL 兼容桥 |
+| `render/reconstruction/ReconstructionFrameInputs.kt` | 三家 SR 共用的世界深度/MV 快照与帧有效性 |
+| `render/reconstruction/ReconstructionHistory.kt` | 成功历史提交与世界、帧序号、时域世代、相机跳变检测 |
 | `render/reconstruction/dlss/DLSSOutput.kt` | 输出纹理的创建、交接、释放顺序与失败降级 |
 | `render/reconstruction/SuperResolution.kt` | 门面：DLSS 与 FSR/XeSS 的分流、让位、后端认领 |
 | `render/presentation/framegen/FrameGenerationConstants.kt` | 帧生成常量（与 DLSS 常量是两条独立通路） |

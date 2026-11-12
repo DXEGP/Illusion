@@ -1,9 +1,11 @@
 package io.github.dxegp.render.temporal
 
 import io.github.dxegp.render.antialiasing.D3D12TAA
+import io.github.dxegp.render.frameprep.MotionCoverage
 
 import com.mojang.renderpearl.api.GpuFormat
 import com.mojang.renderpearl.api.buffers.GpuBuffer
+import com.mojang.renderpearl.api.buffers.GpuBufferSlice
 import com.mojang.renderpearl.api.textures.GpuTexture
 import io.github.dxegp.config.D3D12Settings
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
@@ -20,7 +22,7 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
 /**
- * Full-screen velocity pass: camera reprojection plus per-object correction.
+ * Full-screen velocity pass: camera reprojection plus approximate entity translation in AABBs.
  *
  * Raw ABI pipeline (`MCDRPipelineDesc` takes HLSL directly; SM 6.9 / DXIL required, no SM 5.1
  * fallback). Bindings: entry 0 = CBV `register(b0)`, 256 B; entry 1 = depth SRV + static sampler
@@ -89,6 +91,8 @@ object D3D12Velocity {
     /** Ping-pong textures: `current` is written this frame, `previous` is the last frame's result. */
     private var current: D3D12GpuTexture? = null
     private var previous: D3D12GpuTexture? = null
+    private var previousReady = false
+    private var uploadOwner: io.github.dxegp.d3d12.command.D3D12CommandEncoderBackend? = null
     private var width: Int = 0
     private var height: Int = 0
 
@@ -105,10 +109,10 @@ object D3D12Velocity {
     private var pipelineError: String? = null
 
     /** Parameter block (own buffer; the label shows up in native diagnostics). */
-    private var uniform: D3D12GpuBuffer? = null
+    private var uniform: GpuBufferSlice? = null
 
     /** Object row buffer (UPLOAD heap, bound as `t2` every frame). */
-    private var objects: D3D12GpuBuffer? = null
+    private var objects: GpuBufferSlice? = null
 
     /** Reused array so the per-frame row write allocates nothing. */
     private val objectScratch: FloatArray = FloatArray(D3D12ObjectMotion.MAX_OBJECTS * D3D12ObjectMotion.ROW_FLOATS)
@@ -149,13 +153,17 @@ object D3D12Velocity {
         reset()
         abandonedSteps = 0
         pipelineError = null
+        if (pipeline != 0L) MCDR_ABI.ID3D12DestroyResource(pipeline)
         pipeline = 0L
         return hadLatch
     }
 
     /** This frame's velocity texture handle (0 = not built). */
     @Synchronized
-    fun currentHandle(): Long = this.current?.handle() ?: 0L
+    fun currentHandle(): Long = if (recordedFrame == frameIndex) this.current?.handle() ?: 0L else 0L
+
+    internal fun motionCoverage(): MotionCoverage = if (objectCount > 0)
+        MotionCoverage.CAMERA_WITH_ENTITY_TRANSLATION_APPROXIMATION else MotionCoverage.CAMERA_REPROJECTION
 
     /** Diagnostic one-liner for "why is there no motion texture" (the caller rate-limits it). */
     @Synchronized
@@ -167,15 +175,15 @@ object D3D12Velocity {
 
     /** This frame's motion SRV for the TAA resolve; null = no data yet. */
     @Synchronized
-    fun currentMotionView(): D3D12GpuTextureView? = if (this.current == null) null else this.currentView
+    fun currentMotionView(): D3D12GpuTextureView? = if (recordedFrame != frameIndex || this.current == null) null else this.currentView
 
     /** Previous frame's velocity texture handle (0 = no history). */
     @Synchronized
-    fun previousHandle(): Long = this.previous?.handle() ?: 0L
+    fun previousHandle(): Long = if (previousReady) this.previous?.handle() ?: 0L else 0L
 
     /** Previous frame's motion SRV (the VRS motion test); null = no history, the caller skips this frame. */
     @Synchronized
-    fun previousMotionView(): D3D12GpuTextureView? = if (this.previous == null) null else this.previousView
+    fun previousMotionView(): D3D12GpuTextureView? = if (!previousReady || this.previous == null) null else this.previousView
 
     /** Releases everything (device shutdown / world exit / self-check). */
     @Synchronized
@@ -190,8 +198,10 @@ object D3D12Velocity {
     @Synchronized
     fun beginFrame() {
         if (!isActive()) {
+            previousReady = false
             return
         }
+        previousReady = recordedFrame == frameIndex && current != null
         val swap = this.previous
         this.previous = this.current
         this.current = swap
@@ -245,6 +255,23 @@ object D3D12Velocity {
         if (!ensureResources(device, w, h)) {
             return false
         }
+        val encoder = D3D12Device.sharedCommandEncoder() ?: return false
+        check(encoder.nativeHandle() == ctx) { "Velocity upload owner differs from recording context" }
+        if (uploadOwner == null) {
+            encoder.retainUntilCommandsClosed(AutoCloseable {
+                reset()
+                if (pipeline != 0L) MCDR_ABI.ID3D12DestroyResource(pipeline)
+                pipeline = 0L
+                pipelineError = null
+                uploadOwner = null
+            })
+            uploadOwner = encoder
+        }
+        check(uploadOwner === encoder) { "Velocity resources changed command owner" }
+        val memory = encoder.transientMemory()
+        uniform = memory.allocateGpuMapped(CBV_SIZE, 256L, GpuBuffer.USAGE_UNIFORM, 0L, 1L).use { it.slice() }
+        objects = memory.allocateGpuMapped(OBJECT_BYTES, 256L,
+            GpuBuffer.USAGE_UNIFORM_TEXEL_BUFFER, 0L, 4L).use { it.slice() }
         val uniformBuffer = this.uniform ?: return false
         val color = this.current ?: return false
         if (!ensureDepthView(depth)) {
@@ -261,8 +288,8 @@ object D3D12Velocity {
         // Object rows: the pass answers "where was this pixel last frame", and the snapshot taken by this
         // frame's extract is exactly that "previous frame" (which is why the roll happens in writeWorldRows).
         val rows = uploadObjects()
-        // History holds the *jittered* previous image, so the motion needs -currentJitter + previousJitter;
-        // dropping either term leaves half a pixel behind, most visible on distant grazing ground.
+        // The shader emits an unjittered vector: it compensates the current projection jitter and does
+        // not add previous jitter. The previous value remains in the ABI block for diagnostics/consumers.
         val jitter = D3D12Temporal.jitter()
         val prevJitter = D3D12Temporal.previousJitter()
         // Camera-translation term: the reprojected position is relative to this frame's camera while
@@ -290,8 +317,9 @@ object D3D12Velocity {
         val objectBuffer = this.objects
         val pushed = MCDR_ABI.D3D12PushDescriptors(ctx,
             intArrayOf(0, 1, 2),
-            longArrayOf(uniformBuffer.handle(), 0L, if (objectBuffer == null) 0L else objectBuffer.handle()),
-            longArrayOf(0L, 0L, 0L),
+            longArrayOf((uniformBuffer.buffer() as D3D12GpuBuffer).handle(), 0L,
+                if (objectBuffer == null) 0L else (objectBuffer.buffer() as D3D12GpuBuffer).handle()),
+            longArrayOf(uniformBuffer.offset(), 0L, objectBuffer?.offset() ?: 0L),
             longArrayOf(CBV_SIZE, 0L, OBJECT_BYTES),
             intArrayOf(0, 0, OBJECT_FORMAT.ordinal),
             longArrayOf(0L, depthSrv.handle(), 0L))
@@ -302,6 +330,8 @@ object D3D12Velocity {
         }
         if (!MCDR_ABI.D3D12Draw(ctx, 3, 1, 0, 0)) {
             disable("dx12Draw failed: ${MCDR_ABI.D3D12LastError()}", STEP_PIPELINE)
+            MCDR_ABI.D3D12EndRenderPass(ctx)
+            return false
         }
         MCDR_ABI.D3D12EndRenderPass(ctx)
         // Remember the recording so the second call in the same frame short-circuits (see [recordedFrame]).
@@ -321,12 +351,6 @@ object D3D12Velocity {
             this.currentView = D3D12GpuTextureView(this.current!!, 0, 1)
             this.previousView = D3D12GpuTextureView(this.previous!!, 0, 1)
             // Declared as returning `GpuBuffer`; cast back to the implementation for the native handle.
-            this.uniform = device.createBuffer({ "DXRMC velocity params" },
-                GpuBuffer.USAGE_UNIFORM or GpuBuffer.USAGE_MAP_WRITE, CBV_SIZE) as D3D12GpuBuffer
-            // `USAGE_UNIFORM_TEXEL_BUFFER` (value 256) marks it as a texel buffer; with MAP_WRITE it lands in the UPLOAD heap.
-            this.objects = device.createBuffer({ "DXRMC velocity objects" },
-                GpuBuffer.USAGE_UNIFORM_TEXEL_BUFFER or GpuBuffer.USAGE_MAP_WRITE,
-                OBJECT_BYTES) as D3D12GpuBuffer
             this.width = w
             this.height = h
             // Success: clear the "given up" bit, or it would short-circuit every later frame.
@@ -402,13 +426,9 @@ object D3D12Velocity {
             return 0
         }
         // Rows are world-space: subtract *this* frame's camera (another frame's would bake camera motion in).
-        val camera = D3D12Temporal.currentCameraPosition()
-        if (camera == null) {
-            this.objectCount = 0
-            return 0
-        }
+        val camera = Minecraft.getInstance().gameRenderer.mainCamera().position()
         val rows = try {
-            D3D12ObjectMotion.writeWorldRows(this.objectScratch, camera[0], camera[1], camera[2])
+            D3D12ObjectMotion.writeWorldRows(this.objectScratch, camera.x, camera.y, camera.z)
         } catch (t: Throwable) {
             LOGGER.warn("velocity: object row read failed — {}", t.toString())
             0
@@ -418,7 +438,7 @@ object D3D12Velocity {
             return 0
         }
         return try {
-            buffer.map(0L, OBJECT_BYTES, false, true).use { view ->
+            buffer.map(false, true).use { view ->
                 val fb: FloatBuffer = view.data().order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
                 // Only the real rows are written; HLSL iterates `ObjectParams.x - 1` rows anyway.
                 fb.put(this.objectScratch, 0, rows * D3D12ObjectMotion.ROW_FLOATS)
@@ -437,18 +457,18 @@ object D3D12Velocity {
      * 40..42 `CameraDelta`; 172 B used, padded to 256. Mapped write, not `writeToBuffer` (it detours
      * through [D3D12Temporal.interceptWrite]).
      */
-    private fun writeParameters(buffer: D3D12GpuBuffer, prevViewProj: FloatArray,
+    private fun writeParameters(buffer: GpuBufferSlice, prevViewProj: FloatArray,
         invCurrViewProj: FloatArray, w: Int, h: Int, rows: Int,
         jitterX: Float, jitterY: Float, prevJitterX: Float, prevJitterY: Float,
         camDeltaX: Float, camDeltaY: Float, camDeltaZ: Float): Boolean {
         return try {
-            buffer.map(0L, CBV_SIZE, false, true).use { view ->
+            buffer.map(false, true).use { view ->
                 val fb: FloatBuffer = view.data().order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
                 fb.put(prevViewProj, 0, 16)
                 fb.put(invCurrViewProj, 0, 16)
                 fb.put(w.toFloat())
                 fb.put(h.toFloat())
-                fb.put((rows + 1).toFloat())
+                fb.put(rows.toFloat())
                 fb.put(OBJECT_MAX_MOTION_PIXELS)
                 fb.put(jitterX)
                 fb.put(jitterY)
@@ -554,6 +574,7 @@ object D3D12Velocity {
     }
 
     private fun releaseResources() {
+        previousReady = false
         this.currentView?.close()
         this.currentView = null
         this.previousView?.close()
@@ -562,9 +583,7 @@ object D3D12Velocity {
         this.current = null
         this.previous?.close()
         this.previous = null
-        this.uniform?.close()
         this.uniform = null
-        this.objects?.close()
         this.objects = null
         this.objectCount = 0
         this.depthView?.close()
@@ -604,13 +623,12 @@ object D3D12Velocity {
             float4x4 PrevViewProj;
             float4x4 InvCurrViewProj;
             float2 ScreenSize;
-            // x = 物体行数 + 1（0 表示没有物体，循环一次都不进），y = 位移像素上限。
+                // x = 物体行数（0 表示没有物体），y = 位移像素上限。
             float2 ObjectParams;
             // 本帧抖动带来的像素偏移。uv 是抖动后的屏幕位置，PrevViewProj 是未抖动的
             // 上一帧投影，所以位移里混着这份 jitter，必须减掉才是去抖动空间的位移。
             float2 JitterPixels;
-            // 上一帧的抖动。历史缓冲是上一帧**抖动后**的画面：同一个表面点在上一帧里
-            // 落在 prevUv + 上一帧jitter 的像素上，所以采样点还得再补回这一项。
+            // 上一帧的抖动保留在共享参数块，供 resolve 侧按自身历史约定使用；本 pass 的运动输出不加入它。
             float2 PrevJitterPixels;
             // 两帧之间相机平移的增量（本帧 − 上一帧）。深度反投影出的是**相对本帧相机**的
             // 位置，而 PrevViewProj 的视图矩阵只有旋转，所以必须补上这段平移，否则相机自己

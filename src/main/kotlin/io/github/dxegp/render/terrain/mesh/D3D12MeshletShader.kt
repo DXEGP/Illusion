@@ -20,11 +20,20 @@ object D3D12MeshletShader {
 
     const val VERTEX_STRIDE = 28
 
+    const val DISPATCH_ROW_WIDTH = 256
+
     fun build(shader: D3D12CompiledShader, format: VertexFormat?, stride: Int = VERTEX_STRIDE,
-              cull: Boolean = false): String? {
+              cull: Boolean = false, backfaceCull: Boolean = true, quadsPerMeshlet: Int = 16,
+              visibleWork: Boolean = false): String? {
+        require(!visibleWork || !cull)
+        require(quadsPerMeshlet in listOf(16, 32, 64))
+        val threads = minOf(quadsPerMeshlet * 4, 128)
+        val maxVertices = quadsPerMeshlet * 4
+        val maxPrimitives = quadsPerMeshlet * 2
         val vertex = NagaVertexAdapter.adapt(shader) ?: return null
         if (vertex.inputs.isEmpty()) return null
         val renamed = vertex.source
+        val camera = resolveCameraUniforms(vertex.uniforms)
         val cu = if (cull) resolveCullUniforms(vertex.uniforms) ?: return null else null
 
         val decode = buildString {
@@ -63,7 +72,7 @@ void as_main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
     if (tid.x == 0u) { gPayloadCount = 0u; }
     GroupMemoryBarrierWithGroupSync();
 
-    uint local = gid.x * 32u + tid.x;
+    uint local = (gid.x + gid.y * ${DISPATCH_ROW_WIDTH}u) * 32u + tid.x;
     bool visible = false;
     // gCullEnabled=0 时全放行（仍走 payload 压缩，只跳过两级剔除）。
     bool cullOn = gCullEnabled != 0u;
@@ -71,6 +80,7 @@ void as_main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
         MeshletDesc m = loadMeshlet(local);
         SectionDesc s = loadSection(m.sectionId);
         uint dirMask = (m.packedMax >> 24) & 0xFFu;
+        bool bounded = (dirMask & 128u) == 0u;
         float3 localMin = float3(m.packedMin & 0xFFu, (m.packedMin >> 8) & 0xFFu,
                                  (m.packedMin >> 16) & 0xFFu) / 15.9375;
         float3 localMax = float3(m.packedMax & 0xFFu, (m.packedMax >> 8) & 0xFFu,
@@ -83,8 +93,7 @@ void as_main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
 
         // 1) 6 向背面：相机在原点附近，AABB 落在哪个半空间就只可能看到对应朝向的面；留 1 方块
         //    余量抵消 CameraOffset 的小数部分。**bit 6（DIR_NON_AXIS）必须单独放行**：交叉模型
-        //    （矮草、花）的面在 XZ 上转 45°，主轴 0.707 < AXIS_DOMINANCE(0.85)，只置
-        //    DIR_NON_AXIS；不放行则平原草/花整片消失。
+        //    （矮草、花）与斜面只置 DIR_NON_AXIS；不放行则平原草/花整片消失。
         const uint DIR_NON_AXIS = 64u;  // = D3D12MeshletBuilder.DIR_NON_AXIS (1 shl 6)
         uint visibleDirs = 0u;
         if (mn.x < 1.0) { visibleDirs |= 1u; }
@@ -93,12 +102,12 @@ void as_main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
         if (mx.y > -1.0) { visibleDirs |= 8u; }
         if (mn.z < 1.0) { visibleDirs |= 16u; }
         if (mx.z > -1.0) { visibleDirs |= 32u; }
-        visible = !cullOn || ((dirMask & DIR_NON_AXIS) != 0u) || ((dirMask & visibleDirs) != 0u);
+        visible = !cullOn || !${backfaceCull} || !bounded || ((dirMask & DIR_NON_AXIS) != 0u) || ((dirMask & visibleDirs) != 0u);
 
         // 2) 视锥：中心点进视空间再进裁剪空间，半径按投影的**列向量**换算。reversed-Z（近=1、远=0），
         //    JOML 的 m23 恒为 -1 ⇒ `clip.w = -z_view`，相机前方为**正**：W 只能取 clip.w，写成
         //    -clip.w 会把 64 格以外全部剔掉（§2.5.4）。
-        if (visible && cullOn) {
+        if (visible && cullOn && bounded) {
             float3 centerRel = (mn + mx) * 0.5f;
             float radius = length((mx - mn) * 0.5f);
             float4 viewPos = mul(float4(centerRel, 1.0), ${cu.modelViewMat});
@@ -131,17 +140,22 @@ void as_main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
 }
 """
         val msPayloadParam = if (cu == null) "" else ",\n             in payload MeshPayload payload"
-        val msMeshletId = if (cu == null) "gid.x" else "payload.slot[gid.x]"
+        val msMeshletId = if (visibleWork) "gVisibleBase + gid.x + gid.y * ${DISPATCH_ROW_WIDTH}u"
+            else if (cu == null) "gid.x + gid.y * ${DISPATCH_ROW_WIDTH}u" else "payload.slot[gid.x]"
+        val sectionOffset = if (visibleWork) "32u + " else ""
+        val workOffset = if (visibleWork) "32u + " else ""
+        val globalsExtra = if (visibleWork) "cbuffer TerrainDrawSlice : register(b9) { uint gVisibleBase; };" else ""
+        val meshletLimit = if (visibleWork) "gSections.Load(0u)" else "gMeshletCount"
 
         // 逐图元着色率只在解析出 CameraBlockPos/CameraOffset 时生成（距离用相机相对坐标）；不写 SV_ShadingRate 时组合器的 MIN 会把粗档位压回 1X1（安全失败）。
-        val vrsPrimStruct = if (cu == null) "" else
+        val vrsPrimStruct = if (camera == null) "" else
             "struct D3D12MeshPrimitive { uint shadingRate : SV_ShadingRate; };\n"
-        val vrsPrimParam = if (cu == null) "" else
-            ",\n             out primitives D3D12MeshPrimitive prims[$MAX_PRIMITIVES]"
-        val vrsRate = if (cu == null) "" else """
+        val vrsPrimParam = if (camera == null) "" else
+            ",\n             out primitives D3D12MeshPrimitive prims[$maxPrimitives]"
+        val vrsRate = if (camera == null) "" else """
     // 按"段的盒子"而不是"meshlet 的盒子"定档：同段跨阈值会同屏出现 1X2/2X2，TAA 夹紧后细碎闪烁。
-    float3 vrsBase = (float3(s.chunkX, s.chunkY, s.chunkZ) - float3(${cu.cameraBlockPos}))
-                   + ${cu.cameraOffset};
+    float3 vrsBase = (float3(s.chunkX, s.chunkY, s.chunkZ) - float3(${camera.cameraBlockPos}))
+                   + ${camera.cameraOffset};
     float3 vrsMin = vrsBase;
     float3 vrsMax = vrsBase + float3(16.0, 16.0, 16.0);
     // 用 AABB 的"近点"而不是中心：大块近处地形的中心可能很远，但它就在脚边。
@@ -153,22 +167,18 @@ void as_main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
         primRate = vrsDistance < gVrsBand.x ? 0u : (vrsDistance < gVrsBand.y ? 1u : farRate);
     }
         """
-        val vrsStore = if (cu == null) "" else
+        val vrsStore = if (camera == null) "" else
             "        prims[vid * 2u].shadingRate = primRate;\n" +
                 "        prims[vid * 2u + 1u].shadingRate = primRate;\n"
 
         return renamed + """
 
-// ===== meshlet 包装（无索引缓冲）：32 B/条，与 D3D12MeshletBuilder.Meshlet.pack 一一对应，见 docs/mesh&vrs/README.md §2.5.3 =====
+// ===== meshlet 包装：静态表 16 B/条，动态 work 表 8 B/条 =====
 struct MeshletDesc {
     uint packedMin;          // R8 minXYZ + quadCount<<24
     uint packedMax;          // R8 maxXYZ + directionMask<<24（AS 用，MS 不读）
     uint sectionId;
     uint localVertexOffset;  // 段内顶点号（= firstQuad * 4）
-    uint firstQuad;          // 段内 quad 号（调试）
-    uint pad0;
-    uint pad1;
-    uint pad2;
 };
 // 26.3 的逐段数据（slot1 CHUNK_DATA_INSTANCED 的内容）由 CPU 抄进段表，MS 不必再绑 slot1。
 struct SectionDesc {
@@ -181,13 +191,12 @@ struct SectionDesc {
     int  chunkZ;
     float visibility;
 };
-// 段表 / meshlet 表都是 RAW SRV（ByteAddressBuffer，配 native 的 writeRawBufferSRV）：步长固定 32 B、由下面的 load* 手动解析（SRV 无 StructureByteStride）。
+// t15 包含 32 B 实例表与后接的 8 B work 表；t16 是 DEFAULT heap 的 16 B 静态描述符。
 ByteAddressBuffer gSections : register(t15, space0);
 ByteAddressBuffer gMeshlets : register(t16, space0);
 ByteAddressBuffer meshVertices : register(t14, space0);
 cbuffer MeshletGlobals : register(b8, space0) {
     uint gMeshletCount;
-    // 0 = 关闭剔除（AS 全放行），1 = 开剔除。只改常量、不换 PSO。
     uint gCullEnabled;
     uint gMeshletGlobalsPad1;
     uint gMeshletGlobalsPad2;
@@ -197,7 +206,7 @@ cbuffer MeshletGlobals : register(b8, space0) {
 };
 
 SectionDesc loadSection(uint id) {
-    uint b = id * 32u;
+    uint b = ${sectionOffset}id * 32u;
     SectionDesc s;
     s.vertexBase = gSections.Load(b + 0u);
     s.quadBase = gSections.Load(b + 4u);
@@ -210,19 +219,17 @@ SectionDesc loadSection(uint id) {
     return s;
 }
 MeshletDesc loadMeshlet(uint id) {
-    uint b = id * 32u;
+    uint2 work = gSections.Load2(${workOffset}gMeshletGlobalsPad1 * 32u + id * 8u);
+    uint b = work.x * 16u;
     MeshletDesc m;
     m.packedMin = gMeshlets.Load(b + 0u);
     m.packedMax = gMeshlets.Load(b + 4u);
-    m.sectionId = gMeshlets.Load(b + 8u);
-    m.localVertexOffset = gMeshlets.Load(b + 12u);
-    m.firstQuad = gMeshlets.Load(b + 16u);
-    m.pad0 = gMeshlets.Load(b + 20u);
-    m.pad1 = gMeshlets.Load(b + 24u);
-    m.pad2 = gMeshlets.Load(b + 28u);
+    m.sectionId = work.y;
+    m.localVertexOffset = gMeshlets.Load(b + 8u);
     return m;
 }
 
+$globalsExtra
 float4 meshReadF32(uint a) { return asfloat(meshVertices.Load4(a)); }
 float4 meshReadUNorm8(uint a) {
     uint w = meshVertices.Load(a);
@@ -263,25 +270,32 @@ uint4 meshReadUInt16(uint a) {
 uint4 meshReadUInt32(uint a) { return meshVertices.Load4(a); }
 $asBlock$vrsPrimStruct
 // 线程组 = 一个 meshlet：前 quadCount*4 线程各解一个顶点，前 quadCount 线程算术写出一个 quad 的两个三角形；不读索引，带 AS 时 meshlet 号来自 payload。
-[numthreads($THREADS, 1, 1)]
+[numthreads($threads, 1, 1)]
 [outputtopology("triangle")]
 void ms_main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID$msPayloadParam,
-             out vertices D3D12VertexOutput verts[$THREADS]$vrsPrimParam,
-             out indices uint3 tris[$MAX_PRIMITIVES])
+             out vertices D3D12VertexOutput verts[$maxVertices]$vrsPrimParam,
+             out indices uint3 tris[$maxPrimitives])
 {
-    MeshletDesc m = loadMeshlet($msMeshletId);
-    SectionDesc s = loadSection(m.sectionId);
-    uint quadCount = (m.packedMin >> 24) & 0xFFu;
+    uint meshletId = $msMeshletId;
+    MeshletDesc m = (MeshletDesc)0;
+    SectionDesc s = (SectionDesc)0;
+    uint quadCount = 0u;
+    if (meshletId < $meshletLimit) {
+        m = loadMeshlet(meshletId);
+        s = loadSection(m.sectionId);
+        quadCount = (m.packedMin >> 24) & 0xFFu;
+    }
     uint vertexCount = quadCount * 4u;
     uint primCount = quadCount * 2u;
     // 必须在统一控制流里调用（所有线程同一个值）。
     SetMeshOutputCounts(vertexCount, primCount);
+    if (quadCount == 0u) return;
 $vrsRate
     uint vid = tid.x;
-    if (vid < vertexCount) {
-        uint vertexIndex = s.vertexBase + m.localVertexOffset + vid;
+    for (uint outputVertex = vid; outputVertex < vertexCount; outputVertex += ${threads}u) {
+        uint vertexIndex = s.vertexBase + m.localVertexOffset + outputVertex;
         D3D12VertexInput vin = (D3D12VertexInput)0;
-$decode        verts[vid] = vs_main(vin);
+$decode        verts[outputVertex] = vs_main(vin);
     }
 
     // 算术索引：MC 的每个 quad 固定 4 个顶点、绕序 (0,1,2) / (0,2,3)。
@@ -296,6 +310,14 @@ $vrsStore    }
 
     private data class CullUniforms(val cameraBlockPos: String, val cameraOffset: String,
                                     val modelViewMat: String, val projMat: String)
+
+    private data class CameraUniforms(val cameraBlockPos: String, val cameraOffset: String)
+
+    private fun resolveCameraUniforms(uniforms: Map<String, String>): CameraUniforms? {
+        val cameraBlockPos = uniforms["CameraBlockPos"] ?: return null
+        val cameraOffset = uniforms["CameraOffset"] ?: return null
+        return CameraUniforms(cameraBlockPos, cameraOffset)
+    }
 
     /**
      * 从 VS 源码解析 AS 需要的 uniform；缺任何一个返回 null（判据全 0 的 AS 会把地形成片剔掉）。

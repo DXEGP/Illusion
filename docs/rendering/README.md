@@ -2,6 +2,8 @@
 
 这是新渲染器的目标接口设计，尚未实现。当前源码提供 D3D12/Blaze3D 基础；本页不将设计描述为已可用功能。
 
+当前原版光栅路径的架构优化按 [Work Graph 优化方案](vanilla-work-graph-plan.md) 实施：统一提交/资源寿命、真实 SPI 批量 ABI、native 帧调度、地形 GPU 工作分发及 AA/SR/呈现边界。该方案暂不涉及光追，与本页的完整世界渲染目标分开界定范围。
+
 ## 1. JVM 的职责
 
 JVM 用 Kotlin 采集世界、方块模型、材质、实体和相机输入，经 FFM 提交到 native RenderPipeline。
@@ -41,6 +43,7 @@ mixin 只采集必要事实并转交业务入口；材质解码、全局注册�
 
 native RenderPipeline 统一组装调度；场景、几何、材质、大气、输运、重建和呈现模块分别封装业务状态。
 重建模式固定为 `NRD + DLSS SR / FSR SR / XeSS SR` 或 `DLSS RR`；RR 不重复经过 NRD/另一家 SR。
+Redstone 扩展方案见 [redstone plan.md](<redstone plan.md>)：新增候选 `FSR RR + SR` 模式，FSR RC 归属输运域；该方案尚未实现，FSR RR 与此处的联合重建 DLSS RR 语义不同。
 pipeline 返回显示分辨率线性 HDR 世界颜色、guide/透明度语义和完成 fence，统一呈现模块再处理 UI/FG/Present。
 UI 不经过世界 jitter、降噪和超分；各配置页不能分别偷偷启用多条后处理链。
 表面/透射/体积/Kerr 的 guides 和历史在 native 按信号定义，JVM 不将它们预先压成唯一首表面深度或运动。

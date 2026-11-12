@@ -180,6 +180,7 @@ object D3D12VariableShadingRate {
         if (location.contains("shadow") || !location.contains("solid_terrain")) {
             return -1
         }
+        if (D3D12ShadingRateImage.requiresFine()) return -1
         return terrainRateCap()
     }
 
@@ -197,14 +198,15 @@ object D3D12VariableShadingRate {
         // 组合器按"图像是否在场"切换：图像在场时 stage0 用 PASSTHROUGH（否则远处那圈基率会压在
         // 图像之上，实测表现为地平线闪烁），stage1 用 MIN 让图像只能保住更细的 tile、不能反向变粗；
         // 图像不在场则回到 MIN / PASSTHROUGH。
-        val sriReady = D3D12ShadingRateImage.isReady()
-        setCombiners(if (sriReady) COMBINER_PASSTHROUGH else COMBINER_MIN, COMBINER_MIN)
+        val imageBound = D3D12ShadingRateImage.isReady() && D3D12ShadingRateImage.bind(ctx)
+        setCombiners(
+            if (imageBound) COMBINER_PASSTHROUGH else COMBINER_MIN,
+            if (imageBound) COMBINER_MIN else COMBINER_PASSTHROUGH,
+        )
         val issued = MCDR_ABI.D3D12SetShadingRateNow(ctx, rate) == 1
         if (issued) {
             scopedBatches += 1
         }
-        // `RSSetShadingRateImage` 是每条命令列表的状态，必须与 `RSSetShadingRate` 同列表。
-        val imageBound = issued && D3D12ShadingRateImage.bind(ctx)
         if (imageBound) {
             scopedImages += 1
         }

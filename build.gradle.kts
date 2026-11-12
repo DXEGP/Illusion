@@ -14,7 +14,7 @@ plugins {
     id("maven-publish")
     id("net.neoforged.moddev") version "2.0.148"
     id("idea")
-    id("org.jetbrains.kotlin.jvm") version "2.5.0-Beta2"
+    id("org.jetbrains.kotlin.jvm") version "2.5.0-RC"
 }
 
 // 为 Gradle 10 做的修改
@@ -55,6 +55,28 @@ java {
 
 kotlin {
     
+}
+
+val earlyService = sourceSets.create("earlyService") {
+    java.srcDir("src/main/java")
+    java.include("io/github/dxegp/bootstrap/earlywindow/service/**")
+    compileClasspath += configurations.getByName("compileClasspath")
+}
+sourceSets.main {
+    java.exclude("io/github/dxegp/bootstrap/earlywindow/service/**")
+    compileClasspath += earlyService.output
+}
+kotlin.sourceSets.named("earlyService") {
+    kotlin.srcDir("src/main/kotlin")
+    kotlin.include("io/github/dxegp/bootstrap/earlywindow/service/**")
+}
+kotlin.sourceSets.named("main") {
+    kotlin.exclude("io/github/dxegp/bootstrap/earlywindow/service/**")
+}
+tasks.named<KotlinCompile>("compileEarlyServiceKotlin") {
+    compilerOptions.freeCompilerArgs.addAll(
+        "-Xno-param-assertions", "-Xno-call-assertions", "-Xno-receiver-assertions"
+    )
 }
 
 // DXRMC 自检开关：用 providers API 读取（可被配置缓存追踪），`-P` 与 `-D` 两种写法都接受。
@@ -322,6 +344,7 @@ dependencies {
 // ProcessResources task feeding an extra resource srcDir fails with
 // "Entry META-INF/neoforge.mods.toml is a duplicate" as soon as both directories carry it.
 tasks.named<ProcessResources>("processResources") {
+    exclude("META-INF/services/net.neoforged.neoforgespi.earlywindow.*")
     val replaceProperties = mapOf(
         "minecraft_version" to providers.gradleProperty("minecraft_version").get(),
         "minecraft_version_range" to providers.gradleProperty("minecraft_version_range").get(),
@@ -864,25 +887,18 @@ val stageVendorLibsAll = tasks.register("stageVendorLibsAll") {
 }
 
 // ---------------------------------------------------------------------------
-// P269: early-window companion jar
+// Early-service container and ordinary JarInJar core
 // ---------------------------------------------------------------------------
-// FML's early-service discovery claims any jar that carries one of the early `META-INF/services`
-// entries and EXCLUDES it from mod discovery (verified in `FMLLoader.loadEarlyServices` ->
-// `ModDiscoverer.discoverMods(earlyServiceJars)`). Shipping the provider inside the mod jar
-// therefore made the mod itself disappear from the mod list.
-//
-// So the provider + its bridge live in their own tiny jar that FML is allowed to claim, and the
-// mod jar stays a normal mod. Both files go into `mods/`.
 val earlyWindowJar = tasks.register<Jar>("earlyWindowJar") {
     group = "build"
-    description = "Companion jar holding the P268/P269 ImmediateWindowProvider (claimed by FML as an early service)."
+    description = "Service-only container used by development runs and the release container."
     archiveBaseName.set("dxrmc-earlywindow")
     archiveClassifier.set("")
     archiveVersion.set("")
     destinationDirectory.set(layout.buildDirectory.dir("libs"))
-    from(sourceSets.main.get().output) {
-        include("io/github/dxegp/bootstrap/earlywindow/service/**")
-        include("META-INF/services/net.neoforged.neoforgespi.earlywindow.ImmediateWindowProvider")
+    from(earlyService.output)
+    from("src/main/resources") {
+        include("META-INF/services/net.neoforged.neoforgespi.earlywindow.*")
     }
     // P271: artwork for the loading screen, decoded with AWT inside the provider.
     from(layout.projectDirectory.file("assets/logo_flat_dark.jpg")) {
@@ -895,18 +911,71 @@ val earlyWindowJar = tasks.register<Jar>("earlyWindowJar") {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
-tasks.named<Jar>("jar") {
-    // The early-window classes must exist exactly once, in the companion jar: a second copy on the
-    // mod class path would give the bridge class two separate sets of static state.
+val stageDevelopmentEarlyService = tasks.register<Copy>("stageDevelopmentEarlyService") {
+    from(earlyWindowJar.flatMap { it.archiveFile })
+    into(layout.projectDirectory.dir("run/mods"))
+    rename { "dxrmc-dev-earlyservice.jar" }
+}
+tasks.matching { it.name == "runClient" }.configureEach {
+    dependsOn(stageDevelopmentEarlyService)
+}
+
+val coreJar = tasks.register<Jar>("coreJar") {
+    archiveBaseName.set("illusion-core")
+    archiveVersion.set("")
+    destinationDirectory.set(layout.buildDirectory.dir("intermediates"))
+    from(sourceSets.main.get().output)
     exclude("io/github/dxegp/bootstrap/earlywindow/service/**")
     exclude("META-INF/services/net.neoforged.neoforgespi.earlywindow.ImmediateWindowProvider")
-    // P270: ship the companion jar *inside* the mod jar so a release is a single download. FML only
-    // recognises early services in top-level jars under mods/, so the mod extracts this resource into
-    // mods/ on first launch (see EarlyWindowJarInstaller) and points fml.toml at our provider.
-    from(earlyWindowJar.map { it.archiveFile }) {
-        into("META-INF/dxrmc")
-        rename { "earlywindow.jar" }
+    exclude("META-INF/services/net.neoforged.neoforgespi.earlywindow.GraphicsBootstrapper")
+}
+
+val coreJarAll = tasks.register<Jar>("coreJarAll") {
+    archiveBaseName.set("illusion-core")
+    archiveClassifier.set("ALL")
+    archiveVersion.set("")
+    destinationDirectory.set(layout.buildDirectory.dir("intermediates"))
+    from(coreJar.map { it.source }) {
+        exclude("vendor/**", "MANIFEST.MF")
     }
+    from(stageVendorLibsAll) { into("vendor") }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+val jarJarMetadata = tasks.register("generateEarlyServiceMetadata") {
+    val metadata = layout.buildDirectory.file("generated/earlyService/META-INF/jarjar/metadata.json")
+    val moduleGroup = project.group.toString()
+    val moduleVersion = project.version.toString()
+    inputs.property("group", moduleGroup)
+    inputs.property("version", moduleVersion)
+    outputs.file(metadata)
+    doLast {
+        val target = metadata.get().asFile
+        target.parentFile.mkdirs()
+        target.writeText("""{"jars":[{"identifier":{"group":"$moduleGroup","artifact":"illusion-core"},"version":{"range":"[$moduleVersion]","artifactVersion":"$moduleVersion"},"path":"META-INF/jarjar/illusion-core.jar"}]}""")
+    }
+}
+
+tasks.named<Jar>("jar") {
+    includeEmptyDirs = false
+    eachFile {
+        if (!path.startsWith("io/github/dxegp/bootstrap/earlywindow/service/") &&
+            !path.startsWith("META-INF/services/net.neoforged.neoforgespi.earlywindow.") &&
+            !path.startsWith("META-INF/jarjar/") &&
+            path != "assets/dxrmc/logo_flat_dark.jpg" &&
+            path != "assets/dxrmc/mojangles_ascii.png") {
+            exclude()
+        }
+    }
+    from(earlyWindowJar.map { zipTree(it.archiveFile.get().asFile) }) {
+        exclude("META-INF/MANIFEST.MF")
+    }
+    from(coreJar.flatMap { it.archiveFile }) {
+        into("META-INF/jarjar")
+        rename { "illusion-core.jar" }
+    }
+    from(jarJarMetadata) { into("META-INF/jarjar") }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
 val jarALL = tasks.register<Jar>("jarALL") {
@@ -914,16 +983,24 @@ val jarALL = tasks.register<Jar>("jarALL") {
     description = "TEST ONLY: same content as `jar` plus every runtime DLL (DLSS / FidelityFX / " +
         "Streamline / NRC). Never publish; the extra binaries are not redistributable."
     archiveClassifier.set("ALL")
-    val base = tasks.named<Jar>("jar")
-    // Reuse the plain jar's input tree rather than unzipping its output: zipTree would drop
-    // the manifest `jar` itself writes. Only the vendor/ subtree is swapped out.
-    // `MANIFEST.MF` shows up in `jar.source` at the archive root: the real manifest is the one
-    // the Jar task generates as `META-INF/MANIFEST.MF`, so the stray copy is dropped.
-    from(base.map { it.source }) {
-        exclude("vendor/**")
-        exclude("MANIFEST.MF")
+    includeEmptyDirs = false
+    eachFile {
+        if (!path.startsWith("io/github/dxegp/bootstrap/earlywindow/service/") &&
+            !path.startsWith("META-INF/services/net.neoforged.neoforgespi.earlywindow.") &&
+            !path.startsWith("META-INF/jarjar/") &&
+            path != "assets/dxrmc/logo_flat_dark.jpg" &&
+            path != "assets/dxrmc/mojangles_ascii.png") {
+            exclude()
+        }
     }
-    from(stageVendorLibsAll) { into("vendor") }
+    from(earlyWindowJar.map { zipTree(it.archiveFile.get().asFile) }) {
+        exclude("META-INF/MANIFEST.MF")
+    }
+    from(jarJarMetadata) { into("META-INF/jarjar") }
+    from(coreJarAll.flatMap { it.archiveFile }) {
+        into("META-INF/jarjar")
+        rename { "illusion-core.jar" }
+    }
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 

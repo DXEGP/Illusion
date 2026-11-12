@@ -1,5 +1,7 @@
 package io.github.dxegp.d3d12.surface
 
+import io.github.dxegp.render.frame.vanilla.recordVelocityPass
+
 import io.github.dxegp.d3d12.resource.D3D12GpuTexture
 import io.github.dxegp.d3d12.resource.D3D12GpuTextureView
 
@@ -13,6 +15,7 @@ import com.mojang.renderpearl.api.textures.GpuTextureView
 import io.github.dxegp.diagnostics.D3D12FrameStats
 import io.github.dxegp.diagnostics.D3D12RenderProf
 import io.github.dxegp.render.presentation.D3D12GUISplit
+import io.github.dxegp.render.frame.vanilla.VanillaFrameCoordinator
 import io.github.dxegp.render.temporal.D3D12Temporal
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
 import io.github.dxegp.d3d12.command.D3D12CommandEncoderBackend
@@ -129,6 +132,14 @@ class D3D12GpuSurface(hwnd: Long) : GpuSurfaceBackend {
     }
 
     override fun present() {
+        try {
+            presentFrame()
+        } finally {
+            VanillaFrameCoordinator.framePresented()
+        }
+    }
+
+    private fun presentFrame() {
         // 必须在任何"本帧"判断之前递增：即便本帧跳过 blit，下一帧仍算新一帧（时间性 jitter/历史只在帧首滚动）。
         D3D12Temporal.onFramePresented()
         // 本帧跳过过 blit 就绝不 present：present 一张没写过的 back buffer 正是「上一帧叠在本帧上 / OSD 重影」；
@@ -160,11 +171,11 @@ class D3D12GpuSurface(hwnd: Long) : GpuSurfaceBackend {
         if (this.closed) {
             return
         }
-        this.closed = true
         // 关闭会等 pending present / deviceWaitIdle；慢在这里表现为「窗口先灰几秒才消失」。
         val started = System.nanoTime()
         IllusionLogger.debugMessage("destroySurface begin")
-        MCDR_ABI.D3D12DestroySurface(this.handle)
+        check(MCDR_ABI.D3D12DestroySurface(this.handle)) { "Surface still owns pending work: ${MCDR_ABI.D3D12LastError()}" }
+        this.closed = true
         IllusionLogger.debugMessage("destroySurface took ${(System.nanoTime() - started) / 1_000_000} ms")
     }
 }

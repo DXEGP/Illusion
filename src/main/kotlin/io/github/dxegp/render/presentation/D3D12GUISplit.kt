@@ -81,9 +81,8 @@ object D3D12GUISplit {
     @JvmStatic
     fun isWorldLayerDoneThisFrame(): Boolean = worldLayerDoneThisFrame
 
-    /** Only needed away from 100 % scale; at 100 % the split is off and nothing changes. */
     @JvmStatic
-    fun isActive(): Boolean = D3D12RenderScale.isEnabled() || hudlessArmed
+    fun isActive(): Boolean = D3D12RenderScale.isEnabled() || hudlessArmed || preparedThisFrame
 
     /**
      * Records this frame's upscaled world layer (= presentation source). Must run after SR wrote it
@@ -110,6 +109,9 @@ object D3D12GUISplit {
     fun armUiComposition() {
         // This frame's world layer has been presented; SR may not run next frame, so drop the reference.
         worldLayerThisFrame = null
+        worldLayerDoneThisFrame = false
+        preparedThisFrame = false
+        frameTarget = null
         // DLSS writes its upscaled result straight into the GUI target (pInOutput): there is no separate
         // world layer to hand over, and it is also DLSS-FG's hudless source, so the two must not mix.
         val want = target != null &&
@@ -174,8 +176,7 @@ object D3D12GUISplit {
         return try {
             val window = minecraft.window
             if (gui.width != window.width || gui.height != window.height) {
-                gui.resize(window.width, window.height)
-                logGeometry(minecraft, gui, "resized (late)")
+                return ensureTarget()
             }
             gui
         } catch (t: Throwable) {
@@ -230,6 +231,12 @@ object D3D12GUISplit {
                 created
             } else {
                 if (existing.width != width || existing.height != height) {
+                    if (pushedUiHandle != 0L) {
+                        check(MCDR_ABI.D3D12FgSetUiTexture(0L) == 1) {
+                            "Frame generation still borrows the previous UI target"
+                        }
+                        pushedUiHandle = 0L
+                    }
                     existing.resize(width, height)
                     logGeometry(minecraft, existing, "resized")
                     // A resize must be re-registered with native: FFX caches the resource description at registration.
@@ -302,7 +309,6 @@ object D3D12GUISplit {
         // Recomputed every frame: only a blit that really happened this frame may switch the presented source.
         preparedThisFrame = false
         frameTarget = null
-        // DLSS already wrote the world layer into this target before the depth clear; read and reset the flag here.
         val worldLayerAlreadyInTarget = worldLayerDoneThisFrame
         worldLayerDoneThisFrame = false
         if (givenUp) {
@@ -311,7 +317,7 @@ object D3D12GUISplit {
         val minecraft = Minecraft.getInstance()
         // hudless: this target is the UI layer, so the split stays on even at 100 % scale.
         val hudless = hudlessArmed
-        if (!hudless && mainTargetMatchesWindow(minecraft)) {
+        if (!hudless && !worldLayerAlreadyInTarget && mainTargetMatchesWindow(minecraft)) {
             // The main target is already window-sized: no split needed, the GUI stays on it.
             return
         }

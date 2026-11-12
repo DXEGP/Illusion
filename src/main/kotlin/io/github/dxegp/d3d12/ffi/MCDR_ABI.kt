@@ -130,6 +130,7 @@ object MCDR_ABI {
     private var MH_gettimestampnow: MethodHandle? = null
     private var MH_islistopen: MethodHandle? = null
     private var MH_copybuffer: MethodHandle? = null
+    private var MH_copybufferchecked: MethodHandle? = null
     private var MH_writetotexture: MethodHandle? = null
     private var MH_copybuffertotexture: MethodHandle? = null
     private var MH_copytexturetobuffer: MethodHandle? = null
@@ -161,9 +162,34 @@ object MCDR_ABI {
     // TAA resolve, held entirely by native.
     private var MH_applytaatotexture: MethodHandle? = null
     private var MH_creategraphicspipeline: MethodHandle? = null
+    private var MH_creategraphicsconstants: MethodHandle? = null
+    private var MH_pushgraphicsconstants: MethodHandle? = null
+    private var MH_ensuregraphicsstate: MethodHandle? = null
+    private var MH_createmeshconstants: MethodHandle? = null
+    private var MH_createmeshrootconstants: MethodHandle? = null
+    private var MH_meshrootsigconstants: MethodHandle? = null
     private var MH_destroypipeline: MethodHandle? = null
     // Mesh shaders: DXC compile + AS/MS pipeline + DispatchMesh.
     private var MH_compileshaderdxc: MethodHandle? = null
+    private var MH_createworkgraph: MethodHandle? = null
+    private var MH_vanillabegin: MethodHandle? = null
+    private var MH_vanillaworld: MethodHandle? = null
+    private var MH_vanillagui: MethodHandle? = null
+    private var MH_vanillareset: MethodHandle? = null
+    private var MH_invalidatereconstructioninputs: MethodHandle? = null
+    private var MH_producereactivemask: MethodHandle? = null
+    private var MH_resetframeprep: MethodHandle? = null
+    private var MH_createterrainworkgraph: MethodHandle? = null
+    private var MH_destroyterrainworkgraph: MethodHandle? = null
+    private var MH_prepareterrainworkgraph: MethodHandle? = null
+    private var MH_drawterrainworkgraph: MethodHandle? = null
+    private var MH_destroyterrainbatch: MethodHandle? = null
+    private var MH_destroyworkgraph: MethodHandle? = null
+    private var MH_dispatchworkgraph: MethodHandle? = null
+    private var MH_multiDrawIndexedPacked: MethodHandle? = null
+    private var MH_multiDrawIndexedSeparate: MethodHandle? = null
+    private var MH_multiDrawPacked: MethodHandle? = null
+    private var MH_multiDrawSeparate: MethodHandle? = null
     private var MH_createmeshpipeline: MethodHandle? = null
     private var MH_createmeshpipelineroot: MethodHandle? = null
     private var MH_meshrootsig: MethodHandle? = null
@@ -373,7 +399,7 @@ object MCDR_ABI {
      * This constant, the Kotlin mirrors and the native `layoutTable()` must agree — [verifyABI]
      * aborts before device creation otherwise.
      */
-    const val MCDR_ABI_VERSION: Int = 4
+    const val MCDR_ABI_VERSION: Int = 5
     /** `MCDR_FG_BACKEND_*`, value for value with `mcdr_abi.h`. */
     const val FG_BACKEND_NONE: Int = 0
     const val FG_BACKEND_DLSSG: Int = 1
@@ -1576,6 +1602,17 @@ object MCDR_ABI {
             throw unexpected(t)
         }
     }
+    fun D3D12CopyBufferChecked(ctx: Long, src: Long, srcOffset: Long,
+                             dst: Long, dstOffset: Long, size: Long): Boolean {
+        requireLoaded()
+        return try {
+            (MH_copybufferchecked!!.invokeExact(ptr(ctx), ptr(src), srcOffset,
+                ptr(dst), dstOffset, size) as Int) != 0
+        } catch (failure: Throwable) {
+            throw unexpected(failure)
+        }
+    }
+
     /** Staging -> texture sub-region, tightly packed width*height texels. */
     fun D3D12WriteToTexture(ctx: Long, stagingBuf: Long, stagingOffset: Long,
                             width: Int, height: Int, dstTex: Long, mip: Int, layer: Int, dstX: Int, dstY: Int) {
@@ -1860,19 +1897,19 @@ object MCDR_ABI {
             throw unexpected(t)
         }
     }
-    fun D3D12DestroyAsyncRenderer() {
+    fun D3D12DestroyAsyncRenderer(): Boolean {
         requireLoaded()
         try {
-            MH_destroyasyncrenderer!!.invokeExact()
+            return MH_destroyasyncrenderer!!.invokeExact() as Int == 1
         } catch (t: Throwable) {
             throw unexpected(t)
         }
     }
     /** Must run before process exit: releasing the ComPtrs in DLL_PROCESS_DETACH jumps into a dead dxgi vtable (exit code 0x87A); idempotent. */
-    fun D3D12DestroyDevice() {
+    fun D3D12DestroyDevice(): Boolean {
         requireLoaded()
         try {
-            MH_destroydevice!!.invokeExact()
+            return ok(MH_destroydevice!!.invokeExact() as Int)
         } catch (t: Throwable) {
             throw unexpected(t)
         }
@@ -1933,12 +1970,30 @@ object MCDR_ABI {
     }
     // ---- Pipeline ----
     /** Compile the HLSL pair and build the pipeline; 0 on failure (see [D3D12LastError]). */
-    fun D3D12CreateGraphicsPipeline(desc: MCDRPipelineDesc): Long {
+    fun D3D12CreateGraphicsPipeline(desc: MCDRPipelineDesc, pushConstantBytes: Int = 0): Long {
         requireLoaded()
+        require(pushConstantBytes in 0..128 && pushConstantBytes % 4 == 0)
         Arena.ofConfined().use { arena ->
             val packed = desc.pack(arena)
-            return addr(MH_creategraphicspipeline!!.invokeExact(packed) as MemorySegment)
+            return addr(MH_creategraphicsconstants!!.invokeExact(packed, pushConstantBytes) as MemorySegment)
         }
+    }
+
+    fun D3D12PushGraphicsConstants(ctx: Long, data: ByteBuffer): Boolean {
+        requireLoaded()
+        val size = data.remaining()
+        require(size in 1..128 && size % 4 == 0)
+        val source = MemorySegment.ofBuffer(data)
+        val packed = scratch(0, size.toLong())
+        MemorySegment.copy(source, 0, packed, 0, size.toLong())
+        return ok(MH_pushgraphicsconstants!!.invokeExact(ptr(ctx), packed, size) as Int)
+    }
+
+    fun D3D12EnsureGraphicsState(ctx: Long): Boolean {
+        requireLoaded()
+        val result = MH_ensuregraphicsstate!!.invokeExact(ptr(ctx)) as Int
+        check(result > 0) { "Cannot restore graphics state: ${D3D12LastError()}" }
+        return result == 2
     }
     fun D3D12DestroyPipeline(pipeline: Long) {
         requireLoaded()
@@ -1977,27 +2032,180 @@ object MCDR_ABI {
         }
     }
     /** Build an AS/MS pipeline from DXIL; 0 on failure. */
-    fun D3D12CreateMeshPipeline(desc: MCDRMeshPipelineDesc): Long {
+    fun D3D12CreateMeshPipeline(desc: MCDRMeshPipelineDesc, pushConstantBytes: Int = 0): Long {
         requireLoaded()
+        require(pushConstantBytes in 0..128 && pushConstantBytes % 4 == 0)
         Arena.ofConfined().use { arena ->
             val packed = desc.pack(arena)
-            return addr(MH_createmeshpipeline!!.invokeExact(packed) as MemorySegment)
+            return addr(MH_createmeshconstants!!.invokeExact(packed, pushConstantBytes) as MemorySegment)
+        }
+    }
+    fun D3D12CreateTerrainWorkGraph(nodes: ByteArray, initialize: ByteArray, finalize: ByteArray,
+                                    uniformRegisters: IntArray, budget: Long): Long {
+        requireLoaded()
+        require(nodes.isNotEmpty() && initialize.isNotEmpty() && finalize.isNotEmpty() && budget >= 0L)
+        require(uniformRegisters.size <= 28 && uniformRegisters.all { it >= 0 })
+        Arena.ofConfined().use { arena ->
+            val nodeCode = arena.allocateFrom(ValueLayout.JAVA_BYTE, *nodes)
+            val initCode = arena.allocateFrom(ValueLayout.JAVA_BYTE, *initialize)
+            val finalCode = arena.allocateFrom(ValueLayout.JAVA_BYTE, *finalize)
+            val registers = if (uniformRegisters.isEmpty()) MemorySegment.NULL else
+                arena.allocateFrom(ValueLayout.JAVA_INT, *uniformRegisters)
+            return addr(MH_createterrainworkgraph!!.invokeExact(nodeCode, nodes.size, initCode,
+                initialize.size, finalCode, finalize.size, registers, uniformRegisters.size, budget) as MemorySegment)
+        }
+    }
+
+    fun D3D12VanillaBeginFrame(ctx: Long, width: Int, height: Int, worldEpoch: Long,
+                              realFrameId: Long, configVersion: Long, resourceVersion: Long): Int =
+        vanillaFrameCall(MH_vanillabegin, ctx, width, height, worldEpoch, realFrameId, configVersion, resourceVersion)
+
+    fun D3D12VanillaWorldReady(ctx: Long, width: Int, height: Int, worldEpoch: Long,
+                              realFrameId: Long, configVersion: Long, resourceVersion: Long): Int =
+        vanillaFrameCall(MH_vanillaworld, ctx, width, height, worldEpoch, realFrameId, configVersion, resourceVersion)
+
+    fun D3D12VanillaGuiReady(ctx: Long, width: Int, height: Int, worldEpoch: Long,
+                            realFrameId: Long, configVersion: Long, resourceVersion: Long): Int =
+        vanillaFrameCall(MH_vanillagui, ctx, width, height, worldEpoch, realFrameId, configVersion, resourceVersion)
+
+    fun D3D12VanillaResetFrame(ctx: Long): Int {
+        requireLoaded()
+        return MH_vanillareset!!.invokeExact(ptr(ctx)) as Int
+    }
+
+    fun D3D12InvalidateReconstructionInputs(ctx: Long): Boolean {
+        requireLoaded()
+        return ok(MH_invalidatereconstructioninputs!!.invokeExact(ptr(ctx)) as Int)
+    }
+
+    fun D3D12ProduceReactiveMask(ctx: Long, source0: Long, source1: Long, output: Long,
+                                 width: Int, height: Int, worldEpoch: Long, realFrameId: Long,
+                                 sourceVersion: Long, viewportVersion: Long): Boolean {
+        requireLoaded()
+        require(ctx != 0L && width > 0 && height > 0)
+        require(worldEpoch > 0 && realFrameId > 0 && sourceVersion > 0 && viewportVersion > 0)
+        val result = MH_producereactivemask!!.invokeExact(ptr(ctx), ptr(source0), ptr(source1), ptr(output),
+            width, height, worldEpoch, realFrameId, sourceVersion, viewportVersion) as Int
+        check(result >= 0) { "Native reactive mask production failed" }
+        return result > 0
+    }
+
+    fun D3D12ResetFrameprep(ctx: Long) {
+        requireLoaded()
+        MH_resetframeprep!!.invokeExact(ptr(ctx))
+    }
+
+    private fun vanillaFrameCall(handle: MethodHandle?, ctx: Long, width: Int, height: Int,
+                                 worldEpoch: Long, realFrameId: Long, configVersion: Long, resourceVersion: Long): Int {
+        requireLoaded()
+        require(width > 0 && height > 0 && worldEpoch > 0 && realFrameId > 0 && configVersion > 0 && resourceVersion > 0)
+        val layout = MCDRLayout.VANILLA_FRAME_INPUT
+        val input = scratch(0, layout.byteSize())
+        input.fill(0)
+        input.set(MCDRLayout.I32, MCDRLayout.VANILLA_FRAME_SCHEMA, 1)
+        input.set(MCDRLayout.I32, MCDRLayout.VANILLA_FRAME_WIDTH, width)
+        input.set(MCDRLayout.I32, MCDRLayout.VANILLA_FRAME_HEIGHT, height)
+        input.set(MCDRLayout.I64, MCDRLayout.VANILLA_FRAME_WORLD, worldEpoch)
+        input.set(MCDRLayout.I64, MCDRLayout.VANILLA_FRAME_ID, realFrameId)
+        input.set(MCDRLayout.I64, MCDRLayout.VANILLA_FRAME_CONFIG, configVersion)
+        input.set(MCDRLayout.I64, MCDRLayout.VANILLA_FRAME_RESOURCE, resourceVersion)
+        return handle!!.invokeExact(ptr(ctx), input) as Int
+    }
+
+    fun D3D12DestroyTerrainWorkGraph(program: Long) {
+        requireLoaded()
+        MH_destroyterrainworkgraph!!.invokeExact(ptr(program))
+    }
+
+    fun D3D12PrepareTerrainWorkGraph(ctx: Long, program: Long, buffers: LongArray,
+                                     offsets: LongArray, lengths: LongArray,
+                                     sectionCount: Int, meshletCapacity: Int): Long {
+        requireLoaded()
+        require(sectionCount > 0 && meshletCapacity > 0)
+        require(buffers.isNotEmpty() && buffers.size <= 32 && buffers.size == offsets.size && offsets.size == lengths.size)
+        Arena.ofConfined().use { arena ->
+            val handles = arena.allocate(buffers.size * 8L, 8)
+            val starts = arena.allocateFrom(ValueLayout.JAVA_LONG, *offsets)
+            val sizes = arena.allocateFrom(ValueLayout.JAVA_LONG, *lengths)
+            for (index in buffers.indices) {
+                require(buffers[index] != 0L && offsets[index] >= 0L && lengths[index] > 0L)
+                handles.set(ValueLayout.ADDRESS, index * 8L, ptr(buffers[index]))
+            }
+            return addr(MH_prepareterrainworkgraph!!.invokeExact(ptr(ctx), ptr(program), handles,
+                starts, sizes, buffers.size, sectionCount, meshletCapacity) as MemorySegment)
+        }
+    }
+
+    fun D3D12DrawTerrainWorkGraph(ctx: Long, batch: Long, vertexBuffer: Long, vertexOffset: Long): Boolean {
+        requireLoaded()
+        require(vertexOffset >= 0L)
+        return ok(MH_drawterrainworkgraph!!.invokeExact(ptr(ctx), ptr(batch), ptr(vertexBuffer), vertexOffset) as Int)
+    }
+
+    fun D3D12DestroyTerrainBatch(batch: Long) {
+        requireLoaded()
+        MH_destroyterrainbatch!!.invokeExact(ptr(batch))
+    }
+
+    fun D3D12CreateWorkGraph(dxil: ByteArray, programName: String, entryName: String,
+                            recordSize: Int, bindingTriples: IntArray, backingBudget: Long): Long {
+        requireLoaded()
+        require(dxil.isNotEmpty() && recordSize > 0 && backingBudget >= 0)
+        require(bindingTriples.size % 3 == 0 && bindingTriples.size <= 96)
+        require(programName.matches(Regex("[A-Za-z_][A-Za-z_0-9]*")))
+        require(entryName.matches(Regex("[A-Za-z_][A-Za-z_0-9]*")))
+        Arena.ofConfined().use { arena ->
+            val code = arena.allocateFrom(ValueLayout.JAVA_BYTE, *dxil)
+            val bindings = if (bindingTriples.isEmpty()) MemorySegment.NULL else
+                arena.allocateFrom(ValueLayout.JAVA_INT, *bindingTriples)
+            return addr(MH_createworkgraph!!.invokeExact(1, code, dxil.size,
+                cstringUtf8(arena, programName), cstringUtf8(arena, entryName), recordSize,
+                bindings, bindingTriples.size / 3, backingBudget) as MemorySegment)
+        }
+    }
+
+    fun D3D12DestroyWorkGraph(program: Long) {
+        requireLoaded()
+        MH_destroyworkgraph!!.invokeExact(ptr(program))
+    }
+
+    fun D3D12DispatchWorkGraph(ctx: Long, program: Long, records: MemorySegment,
+                              recordCount: Int, recordStride: Int, buffers: LongArray,
+                              offsets: LongArray, lengths: LongArray): Boolean {
+        requireLoaded()
+        require(recordCount >= 0 && recordStride > 0)
+        require(buffers.size <= 32 && buffers.size == offsets.size && offsets.size == lengths.size)
+        require(records.isNative && records.byteSize() >= recordCount.toLong() * recordStride)
+        Arena.ofConfined().use { arena ->
+            val handles = arena.allocate((buffers.size * 8L).coerceAtLeast(8), 8)
+            val starts = arena.allocate((buffers.size * 8L).coerceAtLeast(8), 8)
+            val sizes = arena.allocate((buffers.size * 8L).coerceAtLeast(8), 8)
+            for (index in buffers.indices) {
+                require(offsets[index] >= 0 && lengths[index] > 0)
+                handles.set(ValueLayout.ADDRESS, index * 8L, ptr(buffers[index]))
+                starts.set(ValueLayout.JAVA_LONG, index * 8L, offsets[index])
+                sizes.set(ValueLayout.JAVA_LONG, index * 8L, lengths[index])
+            }
+            return ok(MH_dispatchworkgraph!!.invokeExact(ptr(ctx), ptr(program), records,
+                recordCount, recordStride, handles, starts, sizes, buffers.size) as Int)
         }
     }
     /** Same as [D3D12CreateMeshPipeline], but reusing the caller-supplied `ID3D12RootSignature*` address (0 = create one). */
     /** Build a root signature from a binding layout; `meshExtras` != 0 appends b8 + t14/t15. */
-    fun D3D12CreateMeshRootSignature(bindings: MemorySegment?, count: Int, meshExtras: Int): Long {
+    fun D3D12CreateMeshRootSignature(bindings: MemorySegment?, count: Int, meshExtras: Int, pushConstantBytes: Int = 0): Long {
         requireLoaded()
-        val handle = MH_meshrootsig ?: return 0L
+        require(pushConstantBytes in 0..128 && pushConstantBytes % 4 == 0)
+        val handle = MH_meshrootsigconstants!!
         val ptr = bindings ?: MemorySegment.NULL
-        return handle.invokeExact(ptr, count, meshExtras) as Long
+        return handle.invokeExact(ptr, count, meshExtras, pushConstantBytes) as Long
     }
     /** Same, from a JVM (type, reg) list: type 0=CBV 1=SRV+sampler 2=SRV, reg = b#/t#. */
-    fun D3D12CreateMeshRootSignature(bindings: List<Pair<Int, Int>>, meshExtras: Int = 1): Long {
+    fun D3D12CreateMeshRootSignature(bindings: List<Pair<Int, Int>>, meshExtras: Int = 1, pushConstantBytes: Int = 0): Long {
         requireLoaded()
-        val handle = MH_meshrootsig ?: return 0L
+        require(pushConstantBytes in 0..128 && pushConstantBytes % 4 == 0)
+        val handle = MH_meshrootsigconstants!!
         if (bindings.isEmpty()) {
-            return handle.invokeExact(MemorySegment.NULL, 0, meshExtras) as Long
+            return handle.invokeExact(MemorySegment.NULL, 0, meshExtras, pushConstantBytes) as Long
         }
         Arena.ofConfined().use { arena ->
             val segment = arena.allocate(2L * bindings.size)
@@ -2005,7 +2213,7 @@ object MCDR_ABI {
                 segment.set(ValueLayout.JAVA_BYTE, index * 2L, type.toByte())
                 segment.set(ValueLayout.JAVA_BYTE, index * 2L + 1, reg.toByte())
             }
-            return handle.invokeExact(segment, bindings.size, meshExtras) as Long
+            return handle.invokeExact(segment, bindings.size, meshExtras, pushConstantBytes) as Long
         }
     }
     /** Release a root signature from [D3D12CreateMeshRootSignature]; 0 is safe. */
@@ -2013,12 +2221,13 @@ object MCDR_ABI {
         if (handle == 0L) return
         MH_meshrootsigrelease?.invokeExact(handle)
     }
-    fun D3D12CreateMeshPipelineWithRootSignature(desc: MCDRMeshPipelineDesc, rootSignature: Long): Long {
+    fun D3D12CreateMeshPipelineWithRootSignature(desc: MCDRMeshPipelineDesc, rootSignature: Long, pushConstantBytes: Int = 0): Long {
         requireLoaded()
-        val handle = MH_createmeshpipelineroot ?: return 0L
+        require(pushConstantBytes in 0..128 && pushConstantBytes % 4 == 0)
+        val handle = MH_createmeshrootconstants!!
         Arena.ofConfined().use { arena ->
             val packed = desc.pack(arena)
-            return addr(handle.invokeExact(packed, rootSignature) as MemorySegment)
+            return addr(handle.invokeExact(packed, rootSignature, pushConstantBytes) as MemorySegment)
         }
     }
     /** `DispatchMesh(x,y,z)`; needs a mesh pipeline bound and an open render pass. */
@@ -2320,10 +2529,10 @@ object MCDR_ABI {
             throw unexpected(t)
         }
     }
-    fun D3D12DestroySurface(surface: Long) {
+    fun D3D12DestroySurface(surface: Long): Boolean {
         requireLoaded()
         try {
-            MH_destroysurface!!.invokeExact(ptr(surface))
+            return ok(MH_destroysurface!!.invokeExact(ptr(surface)) as Int)
         } catch (t: Throwable) {
             throw unexpected(t)
         }
@@ -2410,6 +2619,45 @@ object MCDR_ABI {
         } catch (t: Throwable) {
             throw unexpected(t)
         }
+    }
+
+    private fun drawInts(slot: Int, values: IntArray, count: Int): MemorySegment {
+        require(count >= 0 && count <= values.size)
+        val encoded = scratch(slot, (count * 4L).coerceAtLeast(4))
+        MemorySegment.copy(values, 0, encoded, MCDRLayout.I32, 0, count)
+        return encoded
+    }
+
+    fun D3D12MultiDrawIndexedPacked(ctx: Long, parameters: IntArray, instanceCount: Int,
+                                    firstInstance: Int, drawCount: Int): Boolean {
+        requireLoaded()
+        require(drawCount >= 0 && drawCount <= parameters.size / 3)
+        return ok(MH_multiDrawIndexedPacked!!.invokeExact(ptr(ctx), drawInts(0, parameters, drawCount * 3),
+            instanceCount, firstInstance, drawCount) as Int)
+    }
+
+    fun D3D12MultiDrawIndexedSeparate(ctx: Long, firstIndices: IntArray, indexCounts: IntArray,
+                                      baseVertices: IntArray, instanceCount: Int,
+                                      firstInstance: Int, drawCount: Int): Boolean {
+        requireLoaded()
+        return ok(MH_multiDrawIndexedSeparate!!.invokeExact(ptr(ctx), drawInts(0, firstIndices, drawCount),
+            drawInts(1, indexCounts, drawCount), drawInts(2, baseVertices, drawCount),
+            instanceCount, firstInstance, drawCount) as Int)
+    }
+
+    fun D3D12MultiDrawPacked(ctx: Long, parameters: IntArray, instanceCount: Int,
+                             firstInstance: Int, drawCount: Int): Boolean {
+        requireLoaded()
+        require(drawCount >= 0 && drawCount <= parameters.size / 2)
+        return ok(MH_multiDrawPacked!!.invokeExact(ptr(ctx), drawInts(0, parameters, drawCount * 2),
+            instanceCount, firstInstance, drawCount) as Int)
+    }
+
+    fun D3D12MultiDrawSeparate(ctx: Long, firstVertices: IntArray, vertexCounts: IntArray,
+                               drawCount: Int): Boolean {
+        requireLoaded()
+        return ok(MH_multiDrawSeparate!!.invokeExact(ptr(ctx), drawInts(0, firstVertices, drawCount),
+            drawInts(1, vertexCounts, drawCount), drawCount) as Int)
     }
     /** DrawInstanced on the open pass. */
     fun D3D12Draw(ctx: Long, vertexCount: Int, instanceCount: Int,
@@ -3051,7 +3299,7 @@ object MCDR_ABI {
         MH_setdlssoutput = skipOptional("mcdr_dx12SetDlssOutput",
             fd(MCDRLayout.I32, MCDRLayout.PTR))
         MH_createdevice = skip("mcdr_dx12CreateDevice", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32))
-        MH_destroydevice = skip("mcdr_dx12DestroyDevice", fdv())
+        MH_destroydevice = skip("mcdr_dx12DestroyDeviceChecked", fd(MCDRLayout.I32))
         MH_createtexture = skip("mcdr_dx12CreateTexture", fd(
             MCDRLayout.PTR,
             MCDRLayout.I32,
@@ -3126,6 +3374,9 @@ object MCDR_ABI {
             MCDRLayout.I64,
             MCDRLayout.I64
         ))
+        MH_copybufferchecked = skip("mcdr_dx12CopyBufferChecked", fd(MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I64,
+            MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.I64))
         MH_writetotexture = skip("mcdr_dx12WriteToTexture", fdv(
             MCDRLayout.PTR,
             MCDRLayout.PTR,
@@ -3243,7 +3494,7 @@ object MCDR_ABI {
             MCDRLayout.PTR
         ))
         MH_initasyncrenderer = skip("mcdr_dx12InitAsyncRenderer", fdv(MCDRLayout.I32))
-        MH_destroyasyncrenderer = skip("mcdr_dx12DestroyAsyncRenderer", fdv())
+        MH_destroyasyncrenderer = skip("mcdr_dx12DestroyAsyncRenderer", fd(MCDRLayout.I32))
         MH_asyncrenderbeginframe = skip("mcdr_dx12AsyncRenderBeginFrame", fd(MCDRLayout.I32, MCDRLayout.PTR))
         MH_asyncrenderwaitcomplete = skip("mcdr_dx12AsyncRenderWaitComplete", fd(
             MCDRLayout.I32,
@@ -3274,7 +3525,48 @@ object MCDR_ABI {
                 MCDRLayout.I32, MCDRLayout.F32))
     }
     private fun bindPipelineSurfaceDraw() {
+        MH_multiDrawIndexedPacked = skip("mcdr_dx12MultiDrawIndexedPacked", fd(MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32))
+        MH_multiDrawIndexedSeparate = skip("mcdr_dx12MultiDrawIndexedSeparate", fd(MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR,
+            MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32))
+        MH_multiDrawPacked = skip("mcdr_dx12MultiDrawPacked", fd(MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32))
+        MH_multiDrawSeparate = skip("mcdr_dx12MultiDrawSeparate", fd(MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
+        MH_createterrainworkgraph = skip("mcdr_dx12CreateTerrainWorkGraph", fd(MCDRLayout.PTR,
+            MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.I64))
+        MH_destroyterrainworkgraph = skip("mcdr_dx12DestroyTerrainWorkGraph", fdv(MCDRLayout.PTR))
+        MH_prepareterrainworkgraph = skip("mcdr_dx12PrepareTerrainWorkGraph", fd(MCDRLayout.PTR,
+            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR,
+            MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32))
+        MH_drawterrainworkgraph = skip("mcdr_dx12DrawTerrainWorkGraph", fd(MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I64))
+        MH_destroyterrainbatch = skip("mcdr_dx12DestroyTerrainBatch", fdv(MCDRLayout.PTR))
+        MH_vanillabegin = skip("mcdr_dx12VanillaBeginFrame", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
+        MH_vanillaworld = skip("mcdr_dx12VanillaWorldReady", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
+        MH_vanillagui = skip("mcdr_dx12VanillaGuiReady", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
+        MH_vanillareset = skip("mcdr_dx12VanillaResetFrame", fd(MCDRLayout.I32, MCDRLayout.PTR))
+        MH_invalidatereconstructioninputs = skip("mcdr_dx12InvalidateReconstructionInputs", fd(MCDRLayout.I32, MCDRLayout.PTR))
+        MH_producereactivemask = skip("mcdr_dx12ProduceReactiveMask", fd(MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR,
+            MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I64, MCDRLayout.I64, MCDRLayout.I64, MCDRLayout.I64))
+        MH_resetframeprep = skip("mcdr_dx12ResetFrameprep", fdv(MCDRLayout.PTR))
+        MH_createworkgraph = skip("mcdr_dx12CreateWorkGraph", fd(MCDRLayout.PTR,
+            MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR,
+            MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.I64))
+        MH_destroyworkgraph = skip("mcdr_dx12DestroyWorkGraph", fdv(MCDRLayout.PTR))
+        MH_dispatchworkgraph = skip("mcdr_dx12DispatchWorkGraph", fd(MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
         MH_creategraphicspipeline = skip("mcdr_dx12CreateGraphicsPipeline", fd(MCDRLayout.PTR, MCDRLayout.PTR))
+        MH_creategraphicsconstants = skip("mcdr_dx12CreateGraphicsPipelineWithConstants", fd(MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
+        MH_meshrootsigconstants = skip("mcdr_dx12CreateMeshRootSignatureWithConstants", fd(MCDRLayout.I64, MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32))
+        MH_pushgraphicsconstants = skip("mcdr_dx12PushGraphicsConstants", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
+        MH_ensuregraphicsstate = skip("mcdr_dx12EnsureGraphicsState", fd(MCDRLayout.I32, MCDRLayout.PTR))
+        MH_createmeshconstants = skip("mcdr_dx12CreateMeshPipelineWithConstants", fd(MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
+        MH_createmeshrootconstants = skip("mcdr_dx12CreateMeshPipelineWithRootConstants", fd(MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.I32))
         MH_destroypipeline = skip("mcdr_dx12DestroyPipeline", fdv(MCDRLayout.PTR))
         // TAA resolve; no export => TAA disables itself with a logged reason.
         MH_compileshaderdxc = skip("mcdr_dx12CompileShaderDxc", fd(
@@ -3382,7 +3674,7 @@ object MCDR_ABI {
             MCDRLayout.PTR
         ))
         MH_dlssoutputstate = skipOptional("mcdr_dx12DlssOutputState", fd(MCDRLayout.I32))
-        MH_destroysurface = skip("mcdr_dx12DestroySurface", fdv(MCDRLayout.PTR))
+        MH_destroysurface = skip("mcdr_dx12DestroySurfaceChecked", fd(MCDRLayout.I32, MCDRLayout.PTR))
         MH_setpipeline = skip("mcdr_dx12SetPipeline", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
         MH_setscissor = skip("mcdr_dx12SetScissor", fd(
             MCDRLayout.I32,
