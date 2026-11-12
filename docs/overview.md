@@ -16,20 +16,51 @@ Illusion（幻光影现）是 Minecraft NeoForge 模组，把渲染后端换成�
 - 高级特性：DLSS / FSR / XeSS 超分，DLSS-G / FSR-FG / XeSS-FG 帧生成，NVIDIA Reflex，
   TAA / SMAA，mesh shader（meshlet），VRS 与渲染比例；光线追踪**尚未实现**。
 
+## 当前源码组织
+
+现有代码使用 `io.github.dxegp` 包根；`RenderPipeline`、场景增量和集中式 RTX 管线尚未实现。
+以下业务目录对应当前可编译的 main 功能，未来接线契约见 `rendering/README.md`。
+
+当前完成包职责分类与资源所有者拆分，尚未形成无环的渲染领域契约。
+`config.D3D12Settings` 推送 native 配置，`d3d12.ffi.MCDR_ABI.PROF` 仍读取该配置；这条现有双向依赖仍需在未来接线中处理。
+
+| 包 | 当前职责 |
+| --- | --- |
+| `bootstrap.earlywindow.service` | 早期服务、窗口租约与加载屏；外层服务容器通过标准 Jar-in-Jar 携带普通核心模组 |
+| `config`、`client.settings`、`client.compat` | NeoForge 配置快照、设置界面与原版选项兼容 |
+| `diagnostics` | 日志、崩溃、性能统计、PIX 与 `BackendSelfTests` 自检资源 |
+| `d3d12.ffi` | 唯一 FFM 门面、ABI 布局与 `NativeLibraryResources` 解包支持 |
+| `d3d12.backend/device/command/resource/surface/shader` | Blaze3D 适配、设备与 GPU 资源生命周期 |
+| `render.antialiasing/temporal/resolution/vrs` | AA、时间数据、比例与 VRS |
+| `render.terrain`、`.terrain.mesh` | 当前地形采集、采样器与 meshlet 路线 |
+| `render.reconstruction`、`.reconstruction.dlss` | 超分与独立 GPU/CPU 计时所有者 |
+| `render.presentation`、`.framegen`、`.latency` | HDR、GUI 分层、帧生成与 Reflex |
+| `mixin.<domain>` | 原版注入与 accessor，转交对应业务 |
+
+early-service 独立 source set 与核心模组分开编译，窗口共享类型只定义在早期服务层。
+单文件发布采用外层 early-service + 内层普通核心模组，不再首启解包伴随模组并要求重启；详见打包文档。
+构建可用 `-PmcdrDependencyRoot=<MCDR 绝对路径>` 只读复用 SDK/runtime；`copyNative` 仍取相邻 MCDR 的构建产物。
+原版 GLSL 使用随 JAR 打包的 naga 转换库，再由 DXC 生成 DXIL；`-PshaderProcessorRoot` 仅指定构建源码位置，详见着色器文档。
+
 ## 文档地图
 
 | 文档 | 主题 | 什么时候看 |
 | --- | --- | --- |
+| [`rendering/README.md`](rendering/README.md) | 集中渲染器目标契约：业务封装、世界增量、Kotlin mixin、FFM、能力/资产/生命周期；尚未实现 | 实施新渲染器的 JVM 接线 |
+| [`rendering/vanilla-work-graph-plan.md`](rendering/vanilla-work-graph-plan.md) | 原版光栅 Work Graph 架构方案：提交寿命、批量 ABI、GPU 地形工作分发、AA/SR 与呈现 | 实施当前光栅路径优化，不涉及光追 |
+| [rendering/redstone plan.md](<rendering/redstone plan.md>) | FSR RR/RC/SR/FG 调查、业务边界、输入契约与接入计划 | 接入 Redstone 与统一神经缓存 |
 | [`superresolution/README.md`](superresolution/README.md) | 超分总览：后端抽象、渲染比例、超分掩码 | 改升采样、加新超分后端 |
 | [`superresolution/dlss.md`](superresolution/dlss.md) | DLSS / DLAA 专项：NGX、preset、输出纹理 | 动 DLSS 路径、排查 NGX 初始化 |
 | [`framegen/README.md`](framegen/README.md) | 帧生成与 Reflex：hudless 捕获、UI 合成、限帧 | 改插帧、改呈现时序 |
 | [`antialiasing/README.md`](antialiasing/README.md) | TAA / SMAA / 后期锐化：历史缓冲、速度缓冲 | 残影、抖动、GUI 拆分问题 |
 | [`mesh&vrs/README.md`](mesh&vrs/README.md) | mesh shader（meshlet）与 VRS / 渲染比例 | 地形管线、性能取舍 |
-| [`shaders/README.md`](shaders/README.md) | 着色器管线：原版管线 → HLSL → DXC → PSO | 编译失败、绑定错位 |
+| [`shaders/README.md`](shaders/README.md) | naga 编译链、manifest 绑定、阶段链接、RAW buffer 与 mesh 入口 | 构建编译器、编译失败、绑定错位 |
 | [`misc/backend-and-device.md`](misc/backend-and-device.md) | D3D12 后端、设备、资源与内存管理 | 加资源类型、改每帧流程 |
+| [`misc/vanilla-d3d12-architecture.md`](misc/vanilla-d3d12-architecture.md) | 当前原版帧路径、实际 SPI、生命周期缺口及业务封装改进顺序 | 审查 D3D12 架构、安排重构与性能工作 |
 | [`misc/ffm-abi.md`](misc/ffm-abi.md) | JVM ↔ native 的 FFM ABI | 新增或修改 native 导出 |
 | [`misc/debug-and-crash.md`](misc/debug-and-crash.md) | 崩溃处理、诊断与日志体系 | 崩溃、黑屏、日志看不懂 |
 | [`misc/mixins-and-earlywindow.md`](misc/mixins-and-earlywindow.md) | Mixin 注入点地图、早期窗口与 FML 兼容 | 找注入点、窗口创建失败 |
+| [`misc/earlywindow-packaging.md`](misc/earlywindow-packaging.md) | 单文件早期服务容器、内嵌核心模组与开发启动 | 构建发布包、升级旧安装 |
 | [`misc/settingscreen/README.md`](misc/settingscreen/README.md) | 配置系统与设置界面 | 加开关、改界面 |
 
 ## 文档写作约定
@@ -41,7 +72,7 @@ Illusion（幻光影现）是 Minecraft NeoForge 模组，把渲染后端换成�
   代码里没写清的地方标注「代码中未明确」，不要替它补脑。
 - **只写当下**：不写设计史、方案对比与"当初为什么这样"；必须遵守的写法写成祈使句，
   已经发现的缺陷单独列成警告清单。
-- **源码导航**：每篇结尾的表格用相对 `Illusion\src\main\kotlin\dev\nts\expdxr\` 的路径。
+- **源码导航**：每篇结尾的表格用相对 `Illusion\src\main\kotlin\io\github\dxegp\` 的路径。
 - **文档维护**：改了对应子系统的行为，同一次改动里更新文档；文档与代码冲突时以代码为准，
   并顺手把文档改对。
 - **注释与文档的分工**：源码注释只写"违反就会出错"的约束（一两行），解释性内容放这里，
@@ -49,5 +80,5 @@ Illusion（幻光影现）是 Minecraft NeoForge 模组，把渲染后端换成�
 
 ## 相关文档
 
-- `MCDR\docs\` —— native 库 MCDR 的设计文档（C++ 侧，另行编写）。
+- 相邻 MCDR 工程的 `docs/overview.md` —— native 库的文档入口。
 - `Illusion\README.md` / `Illusion\README_ZH.md` —— 面向玩家的功能介绍与使用说明。

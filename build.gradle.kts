@@ -14,7 +14,7 @@ plugins {
     id("maven-publish")
     id("net.neoforged.moddev") version "2.0.148"
     id("idea")
-    id("org.jetbrains.kotlin.jvm") version "2.5.0-Beta2"
+    id("org.jetbrains.kotlin.jvm") version "2.5.0-RC"
 }
 
 // 为 Gradle 10 做的修改
@@ -55,6 +55,28 @@ java {
 
 kotlin {
     
+}
+
+val earlyService = sourceSets.create("earlyService") {
+    java.srcDir("src/main/java")
+    java.include("io/github/dxegp/bootstrap/earlywindow/service/**")
+    compileClasspath += configurations.getByName("compileClasspath")
+}
+sourceSets.main {
+    java.exclude("io/github/dxegp/bootstrap/earlywindow/service/**")
+    compileClasspath += earlyService.output
+}
+kotlin.sourceSets.named("earlyService") {
+    kotlin.srcDir("src/main/kotlin")
+    kotlin.include("io/github/dxegp/bootstrap/earlywindow/service/**")
+}
+kotlin.sourceSets.named("main") {
+    kotlin.exclude("io/github/dxegp/bootstrap/earlywindow/service/**")
+}
+tasks.named<KotlinCompile>("compileEarlyServiceKotlin") {
+    compilerOptions.freeCompilerArgs.addAll(
+        "-Xno-param-assertions", "-Xno-call-assertions", "-Xno-receiver-assertions"
+    )
 }
 
 // DXRMC 自检开关：用 providers API 读取（可被配置缓存追踪），`-P` 与 `-D` 两种写法都接受。
@@ -322,6 +344,7 @@ dependencies {
 // ProcessResources task feeding an extra resource srcDir fails with
 // "Entry META-INF/neoforge.mods.toml is a duplicate" as soon as both directories carry it.
 tasks.named<ProcessResources>("processResources") {
+    exclude("META-INF/services/net.neoforged.neoforgespi.earlywindow.*")
     val replaceProperties = mapOf(
         "minecraft_version" to providers.gradleProperty("minecraft_version").get(),
         "minecraft_version_range" to providers.gradleProperty("minecraft_version_range").get(),
@@ -348,7 +371,7 @@ tasks.named<ProcessResources>("processResources") {
 // the build -- it stages MCDR.dll when it can find one, and logs a warning and
 // skips when it cannot.
 //
-// The DLL is staged at the RESOURCE ROOT because MCDR_ABI.extractLibrary() looks
+// The DLL is staged at the RESOURCE ROOT because NativeLibraryResources.extractLibrary() looks
 // it up as `/MCDR.dll` on the classpath -- which resolves both from the packaged
 // mod JAR and from build/resources/main during `runClient`.
 //
@@ -416,10 +439,39 @@ sourceSets.named("main") {
     resources.srcDir(copyNative)
 }
 
+val shaderProcessorRoot = file(providers.gradleProperty("shaderProcessorRoot").getOrElse(
+    if (file("../Illusion-shaders-extension").isDirectory) "../Illusion-shaders-extension"
+    else "../../Illusion-shaders-extension"))
+val nagaRoot = File(shaderProcessorRoot.parentFile, "naga-for-hlsl")
+val buildShaderProcessor = tasks.register<Exec>("buildShaderProcessor") {
+    group = "build"
+    description = "Builds the required naga shader compiler library."
+    workingDir(shaderProcessorRoot)
+    commandLine("cargo", "build", "--release", "--locked", "--lib")
+    inputs.files(fileTree(shaderProcessorRoot) {
+        include("Cargo.toml", "Cargo.lock", "src/**", ".cargo/**", "cli/Cargo.toml")
+    }, fileTree(nagaRoot) {
+        include("Cargo.toml", "Cargo.lock", "naga/**", "naga-types/**")
+        exclude("**/target/**")
+    })
+    outputs.file(File(shaderProcessorRoot, "target/release/illusion_shader.dll"))
+}
+val stageShaderProcessor = tasks.register<Sync>("stageShaderProcessor") {
+    dependsOn(buildShaderProcessor)
+    into(layout.buildDirectory.dir("generated/shader-processor"))
+    from(File(shaderProcessorRoot, "target/release/illusion_shader.dll"))
+    from(File(shaderProcessorRoot, "LICENSE")) { rename { "LICENSE-illusion-shader.txt" } }
+    from(File(nagaRoot, "LICENSE.MIT")) { rename { "LICENSE-naga-MIT.txt" } }
+    from(File(nagaRoot, "LICENSE.APACHE")) { rename { "LICENSE-naga-APACHE.txt" } }
+}
+sourceSets.named("main") {
+    resources.srcDir(stageShaderProcessor)
+}
+
 // ---------------------------------------------------------------------------
 // Third-party SDK runtimes: what ships inside the JAR, and what does not
 // ---------------------------------------------------------------------------
-// MCDR_ABI.extractLibrary() writes MCDR.dll into `<user.dir>/dxrmc/`, and the
+// NativeLibraryResources.extractLibrary() writes MCDR.dll into `<user.dir>/dxrmc/`, and the
 // Windows loader resolves a native library's LoadLibrary calls from the
 // *application* directory first -- so anything MCDR.dll loads at run time has to
 // sit in that same `dxrmc/` folder. PATH is not enough: the application directory
@@ -431,7 +483,7 @@ sourceSets.named("main") {
 //
 //   vendorJarLibs  -- REDISTRIBUTABLE and SHIPPED: these ride inside the released
 //                     mod JAR as resources and are extracted to `dxrmc/` at startup
-//                     by MCDR_ABI.extractVendorResources(). Each entry ships its own
+//                     by NativeLibraryResources.extractVendorResources(). Each entry ships its own
 //                     licence text as `LICENSE-<licenseName>.txt`:
 //                       * XeSS      -- Intel Simplified Software License (permits
 //                                      binary redistribution with the notice);
@@ -461,15 +513,16 @@ data class VendorJarLib(val dir: File, val files: List<String>, val license: Fil
 // 所以这三个 DLL 从 P216 起**必须随发行包走**，否则用户机上图形管线一条都建不出来。
 // 来源是 native 的 vcpkg manifest（`MCDR\vcpkg_installed\x64-windows\`），与开发目录里那份同一版本；
 // 许可证文件分别来自 vcpkg 的 `share\<port>\copyright`（Microsoft DirectX / LLVM-NCSA）。
-val vcpkgBinDir = file("../MCDR/vcpkg_installed/x64-windows/bin")
-val vcpkgShareDir = file("../MCDR/vcpkg_installed/x64-windows/share")
+val mcdrDependencyRoot = file(providers.gradleProperty("mcdrDependencyRoot").getOrElse("../MCDR"))
+val vcpkgBinDir = mcdrDependencyRoot.resolve("vcpkg_installed/x64-windows/bin")
+val vcpkgShareDir = mcdrDependencyRoot.resolve("vcpkg_installed/x64-windows/share")
 
 val vendorJarLibs = listOf(
     // XeSS 运行时仍在子模块里（上游 intel/xess 的 bin/ 自带这些 DLL，Intel 许可证允许再分发）。
     VendorJarLib(
-        dir = file("../MCDR/external/xess/bin"),
+        dir = mcdrDependencyRoot.resolve("external/xess/bin"),
         files = listOf("libxess.dll", "libxess_fg.dll", "libxell.dll"),
-        license = file("../MCDR/external/xess/LICENSE.txt"),
+        license = mcdrDependencyRoot.resolve("external/xess/LICENSE.txt"),
         licenseName = "xess",
     ),
     // P216：SM 6.9 的运行时来源。`D3D12Core.dll` 必须与 MCDR.dll 同目录（native 的
@@ -497,23 +550,23 @@ data class VendorDevLib(val dir: File, val pattern: String)
 
 val vendorDevLibs = listOf(
     // DLSS 运行时在 MCDR\lib\dlss\（上游 NVIDIA/DLSS 仓库不含运行时 DLL，且不可再分发）。
-    VendorDevLib(dir = file("../MCDR/lib/dlss"), pattern = "nvngx_*.dll"),
+    VendorDevLib(dir = mcdrDependencyRoot.resolve("lib/dlss"), pattern = "nvngx_*.dll"),
     // FidelityFX 运行时在 MCDR\lib\fidelityfx\（git 不记录，见 MCDR\.gitignore 的 /lib/；
     // 由 MCDR\scripts\sync-external.ps1 的第 4 步从 external\fidelityfx\Kits\FidelityFX\signedbin
     // 同步，目录名与 lib\dlss、lib\xess、lib\streamline 保持一致，旧名 lib\fsr 已不存在）。
     // 发行 JAR 不再包含它，开发目录仍然要有，否则 dev 侧无法试 FSR。
-    VendorDevLib(dir = file("../MCDR/lib/fidelityfx"), pattern = "amd_fidelityfx_*.dll"),
+    VendorDevLib(dir = mcdrDependencyRoot.resolve("lib/fidelityfx"), pattern = "amd_fidelityfx_*.dll"),
     // P213：Streamline 的插件与拦截面。sl.interposer 会按 `<module 目录>\sl.<feature>.dll`
     // 去找插件，所以它们必须和 MCDR.dll 并排落在 run/dxrmc/ 下；缺 sl.dlss_g.dll 时
     // DLSS-G 只会“支持但加载不了”，P213 的支持性探针就是用来抓这个的。
-    VendorDevLib(dir = file("../MCDR/lib/streamline"), pattern = "sl.*.dll"),
+    VendorDevLib(dir = mcdrDependencyRoot.resolve("lib/streamline"), pattern = "sl.*.dll"),
     // Reflex 的低延迟后端（sl.reflex.dll 会去加载它）。
-    VendorDevLib(dir = file("../MCDR/lib/streamline"), pattern = "NvLowLatencyVk.dll"),
+    VendorDevLib(dir = mcdrDependencyRoot.resolve("lib/streamline"), pattern = "NvLowLatencyVk.dll"),
     // NVIDIA NRC（神经辐照缓存）运行期。NRC_D3D12.dll 在加载期就要 cudart64_13.dll /
     // nvrtc64_130_0.dll / nvrtc-builtins64_134.dll（NVRTC 在 Configure 时 JIT 网络），
     // 四个必须与 MCDR.dll 同目录。由 `MCDR\scripts\sync-external.ps1` 从
     // external\nrc\Bin\x64 搬到 MCDR\lib\nrc\（git 不记录）。dev-only：发行版让用户自取。
-    VendorDevLib(dir = file("../MCDR/lib/nrc"), pattern = "*.dll"),
+    VendorDevLib(dir = mcdrDependencyRoot.resolve("lib/nrc"), pattern = "*.dll"),
 )
 
 
@@ -723,7 +776,7 @@ tasks.matching { it.name == "runClient" }.configureEach {
 //
 // `jarALL` collapses that into one artifact: identical to `jar`, except that the
 // `vendor/` tree also gets every dev-only DLL under `MCDR/lib/*`, and the manifest
-// `MCDR_ABI.extractVendorResources()` reads lists all of them -- so launching that
+// `NativeLibraryResources.extractVendorResources()` reads lists all of them -- so launching that
 // JAR unpacks the whole set next to MCDR.dll on its own.
 //
 // TEST ONLY, never publish: it redistributes binaries whose licences forbid it.
@@ -738,7 +791,7 @@ val stageVendorLibsAll = tasks.register("stageVendorLibsAll") {
     // Captured by value for the configuration cache, same as the other staging tasks.
     val root = vendorAllDir.get().asFile
     val jarLibs: List<VendorJarLib> = vendorJarLibs
-    val devLibRoot: File = file("../MCDR/lib")
+    val devLibRoot: File = mcdrDependencyRoot.resolve("lib")
     outputs.dir(root)
     outputs.upToDateWhen { false }
 
@@ -834,25 +887,18 @@ val stageVendorLibsAll = tasks.register("stageVendorLibsAll") {
 }
 
 // ---------------------------------------------------------------------------
-// P269: early-window companion jar
+// Early-service container and ordinary JarInJar core
 // ---------------------------------------------------------------------------
-// FML's early-service discovery claims any jar that carries one of the early `META-INF/services`
-// entries and EXCLUDES it from mod discovery (verified in `FMLLoader.loadEarlyServices` ->
-// `ModDiscoverer.discoverMods(earlyServiceJars)`). Shipping the provider inside the mod jar
-// therefore made the mod itself disappear from the mod list.
-//
-// So the provider + its bridge live in their own tiny jar that FML is allowed to claim, and the
-// mod jar stays a normal mod. Both files go into `mods/`.
 val earlyWindowJar = tasks.register<Jar>("earlyWindowJar") {
     group = "build"
-    description = "Companion jar holding the P268/P269 ImmediateWindowProvider (claimed by FML as an early service)."
+    description = "Service-only container used by development runs and the release container."
     archiveBaseName.set("dxrmc-earlywindow")
     archiveClassifier.set("")
     archiveVersion.set("")
     destinationDirectory.set(layout.buildDirectory.dir("libs"))
-    from(sourceSets.main.get().output) {
-        include("dev/nts/expdxr/earlywindow/**")
-        include("META-INF/services/net.neoforged.neoforgespi.earlywindow.ImmediateWindowProvider")
+    from(earlyService.output)
+    from("src/main/resources") {
+        include("META-INF/services/net.neoforged.neoforgespi.earlywindow.*")
     }
     // P271: artwork for the loading screen, decoded with AWT inside the provider.
     from(layout.projectDirectory.file("assets/logo_flat_dark.jpg")) {
@@ -865,18 +911,71 @@ val earlyWindowJar = tasks.register<Jar>("earlyWindowJar") {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
-tasks.named<Jar>("jar") {
-    // The early-window classes must exist exactly once, in the companion jar: a second copy on the
-    // mod class path would give the bridge class two separate sets of static state.
-    exclude("dev/nts/expdxr/earlywindow/**")
+val stageDevelopmentEarlyService = tasks.register<Copy>("stageDevelopmentEarlyService") {
+    from(earlyWindowJar.flatMap { it.archiveFile })
+    into(layout.projectDirectory.dir("run/mods"))
+    rename { "dxrmc-dev-earlyservice.jar" }
+}
+tasks.matching { it.name == "runClient" }.configureEach {
+    dependsOn(stageDevelopmentEarlyService)
+}
+
+val coreJar = tasks.register<Jar>("coreJar") {
+    archiveBaseName.set("illusion-core")
+    archiveVersion.set("")
+    destinationDirectory.set(layout.buildDirectory.dir("intermediates"))
+    from(sourceSets.main.get().output)
+    exclude("io/github/dxegp/bootstrap/earlywindow/service/**")
     exclude("META-INF/services/net.neoforged.neoforgespi.earlywindow.ImmediateWindowProvider")
-    // P270: ship the companion jar *inside* the mod jar so a release is a single download. FML only
-    // recognises early services in top-level jars under mods/, so the mod extracts this resource into
-    // mods/ on first launch (see EarlyWindowJarInstaller) and points fml.toml at our provider.
-    from(earlyWindowJar.map { it.archiveFile }) {
-        into("META-INF/dxrmc")
-        rename { "earlywindow.jar" }
+    exclude("META-INF/services/net.neoforged.neoforgespi.earlywindow.GraphicsBootstrapper")
+}
+
+val coreJarAll = tasks.register<Jar>("coreJarAll") {
+    archiveBaseName.set("illusion-core")
+    archiveClassifier.set("ALL")
+    archiveVersion.set("")
+    destinationDirectory.set(layout.buildDirectory.dir("intermediates"))
+    from(coreJar.map { it.source }) {
+        exclude("vendor/**", "MANIFEST.MF")
     }
+    from(stageVendorLibsAll) { into("vendor") }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+val jarJarMetadata = tasks.register("generateEarlyServiceMetadata") {
+    val metadata = layout.buildDirectory.file("generated/earlyService/META-INF/jarjar/metadata.json")
+    val moduleGroup = project.group.toString()
+    val moduleVersion = project.version.toString()
+    inputs.property("group", moduleGroup)
+    inputs.property("version", moduleVersion)
+    outputs.file(metadata)
+    doLast {
+        val target = metadata.get().asFile
+        target.parentFile.mkdirs()
+        target.writeText("""{"jars":[{"identifier":{"group":"$moduleGroup","artifact":"illusion-core"},"version":{"range":"[$moduleVersion]","artifactVersion":"$moduleVersion"},"path":"META-INF/jarjar/illusion-core.jar"}]}""")
+    }
+}
+
+tasks.named<Jar>("jar") {
+    includeEmptyDirs = false
+    eachFile {
+        if (!path.startsWith("io/github/dxegp/bootstrap/earlywindow/service/") &&
+            !path.startsWith("META-INF/services/net.neoforged.neoforgespi.earlywindow.") &&
+            !path.startsWith("META-INF/jarjar/") &&
+            path != "assets/dxrmc/logo_flat_dark.jpg" &&
+            path != "assets/dxrmc/mojangles_ascii.png") {
+            exclude()
+        }
+    }
+    from(earlyWindowJar.map { zipTree(it.archiveFile.get().asFile) }) {
+        exclude("META-INF/MANIFEST.MF")
+    }
+    from(coreJar.flatMap { it.archiveFile }) {
+        into("META-INF/jarjar")
+        rename { "illusion-core.jar" }
+    }
+    from(jarJarMetadata) { into("META-INF/jarjar") }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
 val jarALL = tasks.register<Jar>("jarALL") {
@@ -884,16 +983,24 @@ val jarALL = tasks.register<Jar>("jarALL") {
     description = "TEST ONLY: same content as `jar` plus every runtime DLL (DLSS / FidelityFX / " +
         "Streamline / NRC). Never publish; the extra binaries are not redistributable."
     archiveClassifier.set("ALL")
-    val base = tasks.named<Jar>("jar")
-    // Reuse the plain jar's input tree rather than unzipping its output: zipTree would drop
-    // the manifest `jar` itself writes. Only the vendor/ subtree is swapped out.
-    // `MANIFEST.MF` shows up in `jar.source` at the archive root: the real manifest is the one
-    // the Jar task generates as `META-INF/MANIFEST.MF`, so the stray copy is dropped.
-    from(base.map { it.source }) {
-        exclude("vendor/**")
-        exclude("MANIFEST.MF")
+    includeEmptyDirs = false
+    eachFile {
+        if (!path.startsWith("io/github/dxegp/bootstrap/earlywindow/service/") &&
+            !path.startsWith("META-INF/services/net.neoforged.neoforgespi.earlywindow.") &&
+            !path.startsWith("META-INF/jarjar/") &&
+            path != "assets/dxrmc/logo_flat_dark.jpg" &&
+            path != "assets/dxrmc/mojangles_ascii.png") {
+            exclude()
+        }
     }
-    from(stageVendorLibsAll) { into("vendor") }
+    from(earlyWindowJar.map { zipTree(it.archiveFile.get().asFile) }) {
+        exclude("META-INF/MANIFEST.MF")
+    }
+    from(jarJarMetadata) { into("META-INF/jarjar") }
+    from(coreJarAll.flatMap { it.archiveFile }) {
+        into("META-INF/jarjar")
+        rename { "illusion-core.jar" }
+    }
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 

@@ -2,26 +2,21 @@
 
 本文只讲一件事：**JVM 侧怎么安全地调用 MCDR 这个 C++ DLL**，以及调用时必须遵守的用法与边界约束。
 
+编译器另外使用 `illusion_shader.dll` 的三函数 C ABI，由 `MCDR_ABI.D3D12ConvertShader` 经内部 `NagaLibrary` 调用；
+JSON/manifest 归 shader 业务适配层所有，FFM 只传输数据。必需资源解包、版本和内存所有权见 [着色器接口](../shaders/README.md#4-资源绑定)。
+该库不属于 MCDR 导出计数，也不修改 `MCDR_Layout` 的结构体布局；`mcdr_binding_slot.texelFormat=-1` 表示 RAW SRV。
+
 三个参与者：
 
 | 层 | 文件 | 角色 |
 | --- | --- | --- |
 | 契约 | `MCDR\include\mcdr_abi.h` | 唯一真相：`extern "C"` 导出、结构体定义、错误码约定 |
-| 布局 | `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\extern\MCDR_Layout.kt` | 结构体的 `MemoryLayout` 镜像 + 自检 |
-| 句柄 | `Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\extern\MCDR_ABI.kt` | 195 个 `downcallHandle` + 每个导出的调用封装 |
+| 布局 | `Illusion/src/main/kotlin/io/github/dxegp/d3d12/ffi/MCDR_Layout.kt` | 结构体的 `MemoryLayout` 镜像 + 自检 |
+| 句柄 | `Illusion/src/main/kotlin/io/github/dxegp/d3d12/ffi/MCDR_ABI.kt` | `downcallHandle` 绑定与每个导出的调用封装 |
 
 适用范围：Java 25 / Minecraft release-26.1 起 FFM 已退出预览。**本项目禁止 JNI**（`System.loadLibrary`、`external fun`、`RegisterNatives` 一律不许出现），native 侧也不许再提供 `JNIEXPORT` 入口。
 
-先把当前的体量摆出来（`_port\abi_check.py` 的实际输出）：
-
-| 项 | 数值 |
-| --- | --- |
-| native 导出 | 200 |
-| Kotlin 绑定 | 195 |
-| 其中"允许缺失"的可选导出 | 61 |
-| 头文件有、Kotlin 未绑定 | 5（回读 / 落盘 / 诊断辅助） |
-| 签名不匹配 | 0 |
-| 双方镜像的结构体 | 16，尺寸与字段偏移全部一致 |
+导出数量随实现变化，不以历史计数作为 ABI 一致性的证据。校验对象是当前头文件、JVM 绑定与运行中 DLL 的版本和布局。
 
 ## 1 三层结构
 
@@ -35,7 +30,7 @@ MCDR\include\mcdr_abi.h            契约：extern "C" 平铺导出 / 结构体 
 MCDR_Layout.kt                     布局：MemoryLayout 镜像 + byteSize 断言 + 偏移比对
         │
         ▼
-MCDR_ABI.kt                        句柄：195 个 downcallHandle + 每导出的封装
+MCDR_ABI.kt                        句柄：downcallHandle + 每导出的封装
         │
         ▼
 MCDR_PipelineDesc.kt               打包器：把 Kotlin 对象铺进 arena
@@ -48,7 +43,7 @@ MCDR_MeshPipelineDesc.kt
 
 | 规则 | 含义 | 落地位置 |
 | --- | --- | --- |
-| 只有 C 链接 | `extern "C"`，无名字修饰，无生成的头文件 | 全部 200 个导出 |
+| 只有 C 链接 | `extern "C"`，无名字修饰，无生成的头文件 | 全部公共导出 |
 | 每个聚合体只有一份定义 | Java 侧 1:1 `MemoryLayout`，不手写偏移、不 packed blob | `MCDR_Layout.kt` |
 | 句柄是不透明指针 | `mcdr_object*` 等，不是"让 Java 猜含义的整数" | §2.1 |
 | 字符串由调用方分配 | UTF-8 缓冲，被调方返回所需字节数（含 NUL） | §2.3 |
@@ -61,7 +56,7 @@ MCDR_MeshPipelineDesc.kt
 - **调用约定是 `__cdecl`**。`MCDR_CALL` 在 Windows 上展开成 `__cdecl`；`MCDR_API` 在 native 编译时是 `__declspec(dllexport)`，在消费方是 `dllimport`。x64 上只有一种调用约定，但这个宏让头文件在 32 位下也不会错。
 - **MSVC 的 `long` 是 32 位**。头文件为此专门写了一条注释：凡是写成 `int32_t` 的参数，Java 侧必须是 `JAVA_INT`；只有 `int64_t` / `size_t` / 指针才是 `JAVA_LONG` / `JAVA_ADDRESS`。这一条是 §5 里"类型不逐字匹配"坑的根源。
 
-版本号是双份的：宏 `MCDR_ABI_VERSION 4u`，以及运行时函数 `mcdrABIVersion()`。两者相等才算握手成功，防止"Java 常量被编译器内联、DLL 却是旧的"。
+当前 ABI 为 5：native 宏 `MCDR_ABI_VERSION 5u`、运行时 `mcdrABIVersion()` 与 JVM 期望版本必须一致。此次异步渲染器关闭改为返回 `int32_t` 成功状态，同时新增 Work Graph 与批量 draw 入口；JVM 与 DLL 必须配套部署。关闭失败不得释放仍在消费的资源。
 
 ### 1.2 布局层：`MCDR_Layout.kt`
 
@@ -109,7 +104,7 @@ arrayOf<Any>("mcdr_binding_slot", BINDING_SLOT, 40L),
 
 ### 1.3 句柄层：`MCDR_ABI.kt`
 
-一个 Kotlin `object`，内部 195 个方法句柄字段：
+一个 Kotlin `object`，内部保存方法句柄字段：
 
 ```kotlin
 private var MH_createdevice: MethodHandle? = null
@@ -128,7 +123,7 @@ private var MH_createdevice: MethodHandle? = null
 | `skip(name, desc)` | 抛 `IllegalStateException("MCDR export not found: ...")` | 没有它整个库没有意义：版本、布局报告、错误串、日志开关 |
 | `skipOptional(name, desc)` | 返回 `null`，连 `Throwable` 也吞 | 单个功能（SR / FG / DLSS / PIX / VRS…），旧 DLL 上只是那个功能不可用 |
 
-目前 134 个必需、61 个可选。**可选不等于不重要**：帧生成那批入口是 ABI v4 契约的一部分，之所以仍按可选绑定，只是为了让"JVM 新、DLL 旧"退化成"帧生成面板显示不可用"，而不是整个后端起不来。
+**可选绑定不能绕过 ABI 版本握手**。只有版本兼容的 DLL 才进入功能查询；版本不匹配首先拒绝初始化。必需的 Work Graph 与批量 draw 入口按强制绑定处理，具体 SDK 是否可用仍由能力查询判断。
 
 描述符助手两个：
 
@@ -139,7 +134,7 @@ private fun fdv(vararg args: MemoryLayout) = FunctionDescriptor.ofVoid(*args)
 
 ### 1.4 封装层：每个导出的四种形态
 
-`MCDR_ABI` 的 200 个公开函数不是风格统一的 API，而是**四种刻意区分的失败语义**：
+`MCDR_ABI` 的公开函数具有**四种明确区分的失败语义**：
 
 | 形态 | 返回 | 缺句柄时 | 抛异常时 | 例 |
 | --- | --- | --- | --- | --- |
@@ -339,7 +334,7 @@ fun unavailableReason(): String? = LOAD_FAILURE?.toString()
 
 `LOAD_FAILURE == null` 意味着**三件事都成立**：DLL 找到了、必需句柄全绑上了、`mcdrABIVersion()` 与 `MCDR_ABI_VERSION` 相等且布局逐字段一致。它不等价于"显卡能用" —— 设备创建失败是另一层的事。
 
-版本不匹配直接抛 `MCDR ABI version mismatch: java=4, native=3`。这是**故意做成硬失败**的：版本不同意味着结构体可能不同，继续调用就是按错误布局读写内存。
+版本不匹配直接抛 `MCDR ABI version mismatch: java=5, native=4`。这是硬失败：版本不同意味着结构体或函数签名可能不同，继续调用无法保证内存安全。
 
 ### 3.4 线程约束
 
@@ -376,7 +371,7 @@ upcall 这条要单独说：`onFenceComplete` 在 native 线程上执行，异�
 
 - 绑定失败：`MCDR export not found: mcdr_dx12CreateSurface`
 - 库缺失：`MCDR.dll is neither packaged in the JAR nor present at ... — build the MCDR native project first`
-- 版本：`MCDR ABI version mismatch: java=4, native=3`
+- 版本：`MCDR ABI version mismatch: java=5, native=4`
 - 布局：`MCDR ABI layout mismatch (N field(s)); ...` 后面逐行列出
 - 尺寸：`MCDR ABI struct size mismatch for mcdr_fg_dispatch: java=92 c=96 — fix the mirror ...`
 - 调用：`MCDR native call failed: <原始异常>`
@@ -406,17 +401,17 @@ upcall 这条要单独说：`onFenceComplete` 在 native 线程上执行，异�
 
 ## 6 文件导航
 
-相对 `Illusion\src\main\kotlin\dev\nts\expdxr\`：
+相对 `Illusion\src\main\kotlin\io\github\dxegp\`：
 
 | 文件 | 职责 |
 | --- | --- |
-| `d3d12\extern\MCDR_ABI.kt` | 唯一入口：解包 DLL、绑定 195 个方法句柄、封装每个导出、维护 `isAvailable()` |
-| `d3d12\extern\MCDR_Layout.kt` | 结构体的 `MemoryLayout` 镜像、尺寸断言、与运行中 DLL 的字段偏移比对 |
-| `d3d12\extern\MCDR_PipelineDesc.kt` | 图形管线描述符 → `mcdr_pipeline_desc` 的 arena 打包 |
-| `d3d12\extern\MCDR_MeshPipelineDesc.kt` | mesh 管线描述符（DXIL）→ `mcdr_mesh_pipeline_desc` 的 arena 打包 |
-| `misc\IllusionLogger.kt` | FFM 调用失败时的唯一日志出口（`infoMessage` / `warnMessage`） |
-| `misc\settings\D3D12Settings.kt` | 配置 → 启动期快照，再经 `MCDR_ABI` 的 `Set*` 入口推给 native |
-| `IllusionConfig.kt` | 所有开关的定义处（本层不读环境变量，只读这里） |
+| `d3d12/ffi/MCDR_ABI.kt` | 唯一入口：绑定方法句柄、封装每个导出、维护 `isAvailable()`；资源解包由 NativeLibraryResources 承担 |
+| `d3d12/ffi/MCDR_Layout.kt` | 结构体的 `MemoryLayout` 镜像、尺寸断言、与运行中 DLL 的字段偏移比对 |
+| `d3d12/ffi/MCDR_PipelineDesc.kt` | 图形管线描述符 → `mcdr_pipeline_desc` 的 arena 打包 |
+| `d3d12/ffi/MCDR_MeshPipelineDesc.kt` | mesh 管线描述符（DXIL）→ `mcdr_mesh_pipeline_desc` 的 arena 打包 |
+| `diagnostics/IllusionLogger.kt` | FFM 调用失败时的唯一日志出口（`infoMessage` / `warnMessage`） |
+| `config/D3D12Settings.kt` | 配置 → 启动期快照，再经 `MCDR_ABI` 的 `Set*` 入口推给 native |
+| `config/IllusionConfig.kt` | 所有开关的定义处（本层不读环境变量，只读这里） |
 
 本层之外但必须一起看：
 
@@ -432,3 +427,8 @@ upcall 这条要单独说：`onFenceComplete` 在 native 线程上执行，异�
 - **不要在这里复制源码**。要引代码就引签名与一行关键逻辑，实现细节以源码注释为准 —— 两处都写必然会漂移，而漂移的注释比没有注释更贵。
 - **只写当下**。不写设计史与方案对比；必须遵守的写法写成祈使句，已经发现的缺陷单独列成警告清单。
 - **新增坑位就加进 §5**，并尽量给出"触发条件 + 失败形式"，因为这一节的价值在于让人一眼认出自己正踩的是哪一条。
+
+## native 资源所有者
+
+`d3d12.ffi.NativeLibraryResources` 负责读取 vendor 清单、按内容刷新运行库与 MCDR.dll。
+`MCDR_ABI` 先调用解包，再用自身共享 Arena 完成唯一 libraryLookup、绑定与布局校验；资源组件不反向初始化 ABI。

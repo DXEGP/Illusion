@@ -25,8 +25,8 @@ DLSS 的专项细节（NGX 初始化、preset、输出纹理契约）见 [`dlss.
   再由一次带线性采样的 texture→texture blit 铺满界面目标（`D3D12GUISplit`）。
 - 超分做的事就是替代这一次「线性采样 blit」：把低分辨率的世界层重建到窗口尺寸，
   同时消掉锯齿与闪烁。所以超分**成功时**必须跳过那次线性 blit，否则结果会被盖掉。
-- 100% 时没有超分可做：输入与输出是同一张纹理，DLSS/NGX 直接拒绝，FSR/XeSS 也没有独立的输出目标。
-  代码对这个状态有两条处理路径（见第 7 节）。
+- 100% 时 DLAA 与 FSR/XeSS 的 `native_aa` 仍进行时域重建，输入、UAV 输出与 GUI 目标保持独立。
+  成功结果由 GUI 目标呈现；普通升采样档位遇到 100% 时按第 7 节调整比例。
 
 为什么存在：着色成本大致与像素数成正比。把边长降到 59%，像素数只剩约 35%，
 再用时间信息把细节重建回来——这是「分辨率不够但帧率不够更难受」时的标准取舍。
@@ -68,7 +68,7 @@ DeepLearningSuperSampling   打包 SR_DISPATCH      releaseIfCreated()
  mcdr_dx12EvaluateDlss   mcdr_dx12SrEvaluate
         │                     │
         ▼                     ▼
- MCDR\src\advanced\      MCDR\src\advanced\
+ MCDR/src/render/reconstruction/      MCDR/src/render/reconstruction/
    d3d12_dlss.cpp          d3d12_fsr.cpp / d3d12_xess.cpp
 ```
 
@@ -81,7 +81,7 @@ DeepLearningSuperSampling   打包 SR_DISPATCH      releaseIfCreated()
 | 上下文 | NGX feature，由 native / Streamline 持有；JVM 还负责 preset、quality、输出纹理交接 | native 自己管 provider，JVM 只 Create / Evaluate / Destroy |
 | 输出 | 直接写进窗口尺寸的 GUI 目标（`pInOutput`），或 JVM 交接的 UAV 纹理 | 写进 JVM 提供的 `USAGE_STORAGE` 纹理，JVM 再 blit 进 GUI 目标 |
 | 掩码 | NGX 在这条路径上**不吃**掩码（能力面 `takesMasks == 0`） | FSR 吃 reactive、XeSS 吃 responsive |
-| 历史/复位 | JVM 维护 `resetReason`（首帧、换世界、尺寸、比例、窗口） | `createKey` + `percent` 组合成 `frameKey`，变了就 `reset` |
+| 历史/复位 | `resetReason` 检查尺寸/窗口/比例，`ReconstructionHistory` 检查世界、世代、帧连续性和相机跳变 | `ReconstructionHistory` 检查同一组条件，另以 `createKey` + `percent` 区分尺寸/比例 |
 | 失败表现 | 跳过本帧，世界层继续走线性 blit | 跳过本帧并记一条「did not run this frame: 原因」 |
 
 门面刻意不做「顺手统一」：把 DLSS 那条链路的载荷翻译成 `SR_DISPATCH` 或反过来，收益为零而破坏面极大。
@@ -95,8 +95,7 @@ DeepLearningSuperSampling   打包 SR_DISPATCH      releaseIfCreated()
 ```
 ① 帧图 main pass 的 RETURN（LevelRendererMainPassDepthMixin）
    ├─ D3D12TAA.captureTemporalData()                    ← TAA 自己的数据面
-   ├─ DeepLearningSuperSampling.captureMotionVectors()  ← 录速度 pass（此刻深度还有内容）
-   ├─ DeepLearningSuperSampling.captureDepthSnapshot()  ← 把本帧世界深度拷进 native 私有 D32
+   ├─ SuperResolution.captureFrameInputs()             ← 录速度 pass，复制共享世界深度
    └─ D3D12SrMask.captureTransmittance()                ← 记住 OIT 透射率小波系数附件
 
 ② GameRenderer.render：clearDepthTexture 之前（INVOKE，shift = BEFORE）
@@ -119,10 +118,23 @@ DeepLearningSuperSampling   打包 SR_DISPATCH      releaseIfCreated()
 两条路径在这一步之后的行动不同：
 
 - **DLSS**：`markWorldLayerDone()` 让 `prepareForGui` 跳过世界层 blit（前提是本帧交接成功且 native 报
-  evaluate 成功）；DLAA 或 `renderScale == 100%` 时输出就是主目标颜色本身。
+  evaluate 成功）；DLAA 也创建独立 GUI 目标，并在 100% 下保留它作为本帧呈现源。
 - **FSR / XeSS**：`mcdr_dx12SrEvaluate` 成功后，若 `D3D12GUISplit.isHudlessArmed()` 为真则
   `markWorldLayer(output)`（这张 UAV 纹理就是呈现源），否则 `recordTextureBlit(output, guiColor)`
   再 `markWorldLayerDone()`。
+
+### 3.1 共享输入与历史
+
+`ReconstructionFrameInputs` 拥有同格式、同尺寸的世界深度快照。main pass 返回时先录制速度，再复制
+主目标深度；DLSS、FSR、XeSS 都从该快照取得深度与 MV。快照携带帧时间、时域帧序号、世界实例、
+`historyGeneration` 和相机位姿。任一标记不匹配，或者本帧速度 pass 未成功，禁止评价。
+GUI 前不得重新读取被清空的主深度，也不得补录速度 pass。
+
+深度快照尺寸或格式变化时重建，旧纹理走现有延迟退休；停用 SR 时释放，设备销毁由 encoder 的资源
+登记清理。D3D12 深度/MSAA 拷贝必须覆盖完整且匹配的 subresource，`CopyTextureRegion` 的源 box 为 null。
+
+`ReconstructionHistory` 只在 SDK 返回成功后提交历史。换世界、换输入 key、时域世代变化、帧序号不连续、
+相机单帧位移超过 64 格或视线转角超过 90°，下一次评价均带 `reset=1`。失败帧不提交历史。
 
 ---
 
@@ -130,7 +142,7 @@ DeepLearningSuperSampling   打包 SR_DISPATCH      releaseIfCreated()
 
 ### 4.1 枚举与持久化
 
-`dev.nts.expdxr.IllusionConfig` 里的 `SrBackend`（`id` 与 `mcdr_abi.h` 的 `MCDR_SR_BACKEND_*` 逐值对应）：
+`io.github.dxegp.config.IllusionConfig` 里的 `SrBackend`（`id` 与 `mcdr_abi.h` 的 `MCDR_SR_BACKEND_*` 逐值对应）：
 
 | 枚举 | id | 含义 |
 | --- | --- | --- |
@@ -166,18 +178,20 @@ UI 里 FSR / XeSS 是两个互斥开关，共用同一个 `currentBackend`；DLS
 
 ### 4.3 三个动作：选、记、建
 
-1. `requestBackend(requested)` —— 用户意图变化。会把渲染比例调到该档位的标称值（`NATIVE_AA_TIER`
-   除外），并且在 DLAA 生效期间**拒绝** FSR/XeSS（DLAA 把比例锁在 100%，没有可放大的东西），
+1. `requestBackend(requested)` —— 用户意图变化。会把渲染比例调到该档位的标称值（含 Native AA 的
+   100%），并且在 DLAA 生效期间**拒绝** FSR/XeSS（同一帧只能有一个时域重建后端），
    只打一行 WARN。
 2. `pushBackendToNative(selected)` —— `mcdr_dx12SrPick(id)`，纯记录。它推的是**选中**的后端而不是
-   「正在跑」的后端：100% 时 FSR/XeSS 不跑、DLSS 可能已经让位，但「用户选了谁」是意图，
+   「正在跑」的后端：能力缺失或输入未就绪时可能不评价，但「用户选了谁」是意图，
    帧生成的可用性判定（「超分是不是 DLSS」）读的就是这个意图。
 3. `D3D12SrCreate` / `D3D12SrEvaluate` / `D3D12SrDestroy` —— 生命周期。`mcdr_dx12SrCreate` 幂等，
    但仍按 `createdFor`（后端 + 渲染尺寸 + 显示尺寸）去重，避免每帧付一次跨 ABI 往返。
 
 **`requestBackend` 不调 `mcdr_dx12SrDestroy`**：那一刻可能还有打开的命令列表，销毁上下文会踩到
-正在录制的资源。它只清掉 `createdFor` / `lastKey` / `lastState`，由 native 的 `ensureProvider`
-自己释放旧 provider 并保证 GPU 侧已经跟上。
+正在录制的资源。它只清掉创建缓存、历史与诊断状态，保留独立的 provider 所有权。
+切到 NONE/DLSS 时，encoder 先结算异步提交，再通过 `D3D12SrCreate(ctx, NONE, ...)` 等待已提交 fence
+并释放 provider；FSR/XeSS 互切由 `ensureProvider` 做同样的等待。超时保留旧资源并拒绝切换。
+encoder 销毁后再清理其登记的 provider；配置缓存被清空不代表 native 上下文已释放。
 
 ### 4.4 质量档位
 
@@ -270,10 +284,6 @@ DLSS 的选择器只有前 4 档，DLAA 由抗锯齿选项驱动（见 4.6）。
 
 不要和 Streamline 的 `mvecScale` 搞混：那是另一个参数，要求归一化值，所以 DLSS 的
 `DLSS_CONSTANTS` 里写的是 `1.0 / renderWidth`、`1.0 / renderHeight`。
-
-> 注意：`SuperResolution.kt` 与 `DLSS.kt` 的注释把这条位移写成了 `(uv - prevUv) * screenSize`，
-> 与 `D3D12Velocity` 的着色器实现符号相反。着色器是权威（方向必须「本帧 → 上一帧」），
-> 注释待修正；两条路都用 `mvScale = 1.0`，所以这个笔误不影响行为。
 
 ### 5.3 输出纹理契约
 
@@ -382,12 +392,13 @@ absorbance → transmittance = clamp(exp(-absorbance), 0.0001, 1)
 
 ### 7.2 100% 与「比例不够」的自愈
 
-- FSR/XeSS：渲染尺寸 == 显示尺寸时，门面会把比例降到 `DEFAULT_RENDER_PERCENT = 75`
+- FSR/XeSS 的 `native_aa` 要求能力面 `nativeAA=true`，比例为 100%，仍创建独立输出并评价。
+  普通升采样档位在渲染尺寸 == 显示尺寸时，门面会把比例降到 `DEFAULT_RENDER_PERCENT = 75`
   （一次，`autoScaleAdjusted`），并记一行说明。75 是滑条的吸附值（非 DLSS 模式按 25 的倍数吸附，
   67 会被吸附到 75）。
-- DLSS：`renderScale == 100%` 时会话内把比例绑回档位标称值；`0 < percent < 标称值` 时抬到标称值
+- DLSS 的非 DLAA 模式：`renderScale == 100%` 时会话内把比例绑回档位标称值；`0 < percent < 标称值` 时抬到标称值
   并 WARN（否则 NGX 每帧拒绝，世界全黑）。两种都走帧边界。
-- 渲染尺寸低于 **320×180** 时，门面按 `max(ceil(320*100/w), ceil(180*100/h))` 抬比例，
+- 渲染尺寸低于 **320×180** 时，门面按 `max(ceil(320*100/displayWidth), ceil(180*100/displayHeight))` 抬比例，
   夹在 `minimumPercent()..100`。这个下限与 native 能力面的尺寸下限一致。
 - 注意：`DLSS.kt` 里关于「主目标附件尺寸 ≠ 窗口 × 比例就重建」的自愈**只有注释、没有调用点**
   （`D3D12RenderScale.scheduledRebuild()` 在 DLSS 代码里没有被调用）。真正生效的是上面两条比例抬升。
@@ -420,8 +431,7 @@ FG 打开 hudless 时，最终呈现源变成「超分输出的世界层」，UI
 
 1. **超分必须在「世界层画完、GUI 还没画」的那一刻提交**，且排在 SMAA 之后、`prepareForGui` 之前。
 2. **速度 pass 与深度快照必须挂在帧图 main pass 的 RETURN**，不能挂在 `GameRenderer.render` 的清深度之前。
-3. **深度快照与 `pInDepth` 必须是同一张纹理**（`mainRenderTarget().depthTexture`），否则 NGX 的输入
-   与快照内容不是一回事。
+3. **三家 SR 的深度/MV 必须来自当前帧共享快照**；缺失、过期或速度录制失败时不评价。
 4. **运动矢量纹理为 0 时不要期待超分工作**：native 在 `pInMotionVectors == nullptr` 时立刻返回 0。
 5. **改渲染比例只能走帧边界**（`setPercentAtFrameBoundary` / `Minecraft.schedule`），帧中间改会让
    世界层目标尺寸与主目标附件不一致。
@@ -436,11 +446,11 @@ FG 打开 hudless 时，最终呈现源变成「超分输出的世界层」，UI
 13. **失败一律降级，不改变渲染路径**：超分失败只跳过本帧，世界层继续走线性 blit。
 14. **不要每帧读回 GPU 时间戳**：native 的 resolve 会建命令列表并 `flushAndWait`，所以
     `GPU_SAMPLES = 120` 帧才读一次。
-15. **不要手动改纹理状态**：native 在 evaluate 返回 1 后自己保证「颜色/深度/MV 停在
-    `PIXEL_SHADER_RESOURCE`、输出停在 `RENDER_TARGET`」。
+15. **资源状态由 native 跟踪和转换**：FSR/XeSS 的深度/MV 留在 `NON_PIXEL_SHADER_RESOURCE`，
+    FG 标记保持一致；DLSS/Streamline 标记前先转换输入，返回后恢复调用方描述符 heap。
 16. **档位百分比不能手改**：`ultra_performance` 的 34% 是下界，33% 会让 NGX 每帧报
     `Dynamic scaling error … outside of Min … Max` 并交回空纹理（世界全黑、GUI 正常）。
-17. **jitter 只在有消费者时注入**（DLSS 未停滞，或 TAA/DLAA 在跑），上报值固定 `(+Jx, -Jy)`；
+17. **jitter 只在有消费者时注入**（DLSS 未停滞、TAA/DLAA 或可用的 FSR/XeSS），上报值固定 `(+Jx, -Jy)`；
     没有消费者还注入，用户看到的就是整幅 ±0.5 像素的晃动。
 18. **速度通道的闩锁只能用 `D3D12Velocity.forceEnable()` 清**，并按 1 秒限速重试；只把
     `enabled` 置回 true 撤不回失败步骤。
@@ -474,34 +484,36 @@ FG 打开 hudless 时，最终呈现源变成「超分输出的世界层」，UI
 
 ## 10. 文件导航
 
-路径以 `Illusion\src\main\kotlin\dev\nts\expdxr\` 为起点（mixin 在 `Illusion\src\main\java\` 下，已单独标注）。
+路径以 `Illusion\src\main\kotlin\io\github\dxegp\` 为起点（mixin 在 `Illusion\src\main\java\` 下，已单独标注）。
 
 | 文件 | 职责 |
 | --- | --- |
-| `dxrmc/sr/SuperResolution.kt` | 超分门面：后端选择与调度、`SR_DISPATCH` 打包、FSR/XeSS 的 evaluate 与 blit、UI 选项、CPU/GPU 耗时统计 |
-| `dxrmc/sr/D3D12SrMask.kt` | 反应性掩码：OIT 透射率的小波重建 HLSL、PSO、dispatch 与首帧统计 |
-| `dxrmc/sr/FrameGenerationConstants.kt` | 每帧给帧生成后端推 view/projection/jitter/mvScale/reset（与超分后端解耦） |
-| `dxrmc/sr/dlss/DLSS.kt` | DLSS / DLAA 主实现：数据面、NGX 开关与档位、preset、深度快照、输出交接、抗锯齿互斥 |
-| `dxrmc/sr/dlss/DLSSOutput.kt` | DLSS 输出纹理（JVM 侧创建、交给 native）与释放顺序 |
-| `IllusionConfig.kt` | `SrBackend` 枚举（`id` 与 native 宏逐值对应）及 `[sr]` 配置项 |
-| `d3d12/extern/MCDR_ABI.kt` | `mcdr_dx12Sr*` / `mcdr_dx12*Dlss*` 的 FFM 绑定、`SrCaps` 数据类、返回值语义 |
-| `d3d12/render/advanced/vrs/D3D12RenderScale.kt` | 渲染比例：两套取值域、DLAA 锁、帧边界重建主目标 |
-| `d3d12/render/advanced/taa/D3D12Temporal.kt` | Halton(2,3) 亚像素 jitter、相位长度协商、投影 / 相机矩阵捕获 |
-| `d3d12/render/advanced/taa/D3D12Velocity.kt` | 速度 pass：屏幕空间像素位移、自我关闭闩锁 |
-| `d3d12/render/advanced/smaa/D3D12GuiSplit.kt` | 窗口尺寸的 GUI 目标、`markWorldLayerDone` / `markWorldLayer`、hudless 呈现裁决 |
-| `d3d12/render/advanced/D3D12AntiAliasing.kt` | 抗锯齿取值域（OFF/SMAA/TAA/DLAA）与 DLSS 锁 |
-| `d3d12/render/advanced/D3D12PostSharpen.kt` | 升采样之后的后期锐化（两趟：target→scratch→target） |
-| `mixin/render/GameRendererSmaaWorldMixin.java` | 帧内挂点：清深度之前（DLSS 记账）、`GuiRenderer.render` 之前（TAA→SMAA→SR→prepareForGui） |
-| `mixin/render/LevelRendererMainPassDepthMixin.java` | 帧图 main pass RETURN：速度 pass、深度快照、OIT 透射率捕获 |
+| `render/reconstruction/SuperResolution.kt` | 超分门面：后端选择与调度、`SR_DISPATCH` 打包、FSR/XeSS 的 evaluate 与 blit、UI 选项、CPU/GPU 耗时统计 |
+| `render/reconstruction/ReconstructionFrameInputs.kt` | 共享世界深度快照、帧有效性与资源寿命 |
+| `render/reconstruction/ReconstructionHistory.kt` | 成功历史提交、跳帧/世界/世代/相机跳变重置 |
+| `render/reconstruction/D3D12SrMask.kt` | 反应性掩码：OIT 透射率的小波重建 HLSL、PSO、dispatch 与首帧统计 |
+| `render/presentation/framegen/FrameGenerationConstants.kt` | 每帧给帧生成后端推 view/projection/jitter/mvScale/reset（与超分后端解耦） |
+| `render/reconstruction/dlss/DLSS.kt` | DLSS / DLAA 主实现：数据面、NGX 开关与档位、preset、深度快照、输出交接、抗锯齿互斥 |
+| `render/reconstruction/dlss/DLSSOutput.kt` | DLSS 输出纹理（JVM 侧创建、交给 native）与释放顺序 |
+| `config/IllusionConfig.kt` | `SrBackend` 枚举（`id` 与 native 宏逐值对应）及 `[sr]` 配置项 |
+| `d3d12/ffi/MCDR_ABI.kt` | `mcdr_dx12Sr*` / `mcdr_dx12*Dlss*` 的 FFM 绑定、`SrCaps` 数据类、返回值语义 |
+| `render/resolution/D3D12RenderScale.kt` | 渲染比例：两套取值域、DLAA 锁、帧边界重建主目标 |
+| `render/temporal/D3D12Temporal.kt` | Halton(2,3) 亚像素 jitter、相位长度协商、投影 / 相机矩阵捕获 |
+| `render/temporal/D3D12Velocity.kt` | 速度 pass：屏幕空间像素位移、自我关闭闩锁 |
+| `render/presentation/D3D12GUISplit.kt` | 窗口尺寸的 GUI 目标、`markWorldLayerDone` / `markWorldLayer`、hudless 呈现裁决 |
+| `render/antialiasing/D3D12AntiAliasing.kt` | 抗锯齿取值域（OFF/SMAA/TAA/DLAA）与 DLSS 锁 |
+| `render/antialiasing/D3D12PostSharpen.kt` | 升采样之后的后期锐化（两趟：target→scratch→target） |
+| `mixin/antialiasing/GameRendererSmaaWorldMixin.java` | 帧内挂点：清深度之前（DLSS 记账）、`GuiRenderer.render` 之前（TAA→SMAA→SR→prepareForGui） |
+| `mixin/temporal/LevelRendererMainPassDepthMixin.java` | 帧图 main pass RETURN：速度 pass、深度快照、OIT 透射率捕获 |
 
-native 侧对应实现（本仓库 `MCDR\`，不在本文范围内）：`MCDR\src\advanced\d3d12_dlss.cpp`、
+native 侧对应实现（相邻工程 `MCDR/`，不在本文范围内）：`MCDR\src/render/reconstruction/d3d12_dlss.cpp`、
 `d3d12_fsr.cpp`、`d3d12_xess.cpp`，以及 `MCDR\include\mcdr_abi.h` 里的载荷布局。
 
 ---
 
 ## 11. 文档维护
 
-- 本文对应源码目录：`Illusion\src\main\kotlin\dev\nts\expdxr\dxrmc\sr\`（含 `dlss\` 子目录），
+- 本文对应源码目录：`Illusion\src\main\kotlin\io\github\dxegp\render\reconstruction\`（含 `dlss\` 子目录），
   以及上表列出的渲染比例 / jitter / 速度 / GUI 拆分 / mixin 挂点。
 - **改了代码就同步改本文**，尤其是：载荷字段的增删、质量档位的百分比、常量数值、
   帧内挂点顺序、掩码的生产方式、后端互斥规则。这些地方一旦文档与代码不一致，
@@ -509,3 +521,13 @@ native 侧对应实现（本仓库 `MCDR\`，不在本文范围内）：`MCDR\sr
 - 文档与代码冲突时**以代码为准**，并顺手把文档改对；代码里没写清的地方保留
   「代码中未明确」的标注，不要替它补脑。
 - DLSS / DLAA / NGX / 输出纹理的细节写在 [`dlss.md`](dlss.md)，本文只保留总览与跨子系统交互。
+
+## 计时资源生命周期
+
+`render.reconstruction.ReconstructionTiming` 独占 timestamp query pool、GPU 样本与 CPU evaluate/blit 成本采样。
+停止或切换超分仅重置样本，不在打开的 command list 上释放查询堆；池保留到设备关闭。
+计时组件在首次创建查询池前向 encoder 实例登记自身的 `AutoCloseable` 生命周期，并独占绑定到该 encoder；其他 encoder 不参与该池采样。
+`D3D12Device.close()` 先结束 encoder，再调用 encoder 的 `destroyCommandsAndReleaseResources()`；它等待当前已提交 fence、销毁 command context，最后关闭登记资源。
+一次性 encoder 的 `close()` 使用相同退休路径；共享 encoder 的普通 `close()` 保留资源至设备关闭。计时组件 `close()` 清空池、采样与 encoder 所有权。
+fence 等待上限为 5 秒；超时中断设备正常销毁并保留查询池，不把失败路径计作安全释放。
+完整批次仍按 120 帧读回，CPU 保留 128 个样本、每 120 帧报告一次。

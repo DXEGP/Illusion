@@ -3,7 +3,7 @@
 本文说明 Blaze3D 的 GPU 抽象（`GpuBackend` / `GpuDevice` / `CommandEncoder` / `RenderPass` / 资源四件套）
 在 D3D12 上是怎么落地的：对象由谁持有、在哪一刻释放、内存怎么分块复用、哪些数值一旦改动就会立刻出错。
 
-范围：`Illusion\src\main\kotlin\dev\nts\expdxr\d3d12\` 下的 `backend\`、`render\adapter\`、`render\core\`
+范围：`Illusion\src\main\kotlin\io\github\dxegp\d3d12\` 下的 `backend\`、`render\adapter\`、`render\core\`
 三个包，以及它们调用的 C ABI（`MCDR.dll`）。**不展开**：GLSL→SPIR-V→HLSL→DXIL 的编译细节、
 呈现与后处理管线（SMAA/TAA/VRS/DLSS）、meshlet 几何构建算法、配置系统。
 
@@ -250,7 +250,7 @@ destroyObject(obj)     →  gPendingDeletes.push_back({ obj, requiredFence })
 flushPendingDeletes()  →  对每条：requiredFence <= queueFence->GetCompletedValue() 才真正 delete
 ```
 
-细节（`MCDR\src\core\d3d12_device.cpp`）：
+细节（`MCDR\src/backend/device/d3d12_device.cpp`）：
 
 - `requiredFence` 是「最后一次可能引用该对象的提交」的围栏值。**无法确定时**用哨兵
   `kFenceBlockedByOpenList`：等 `gOpenListCount == 0`（没有任何打开的命令列表）后，统一按当前的
@@ -505,39 +505,39 @@ copyBufferToTexture(...)   // 必须先 ensureListOpen()：分配 staging 不录
 
 ## 7. 文件导航
 
-路径相对 `Illusion\src\main\kotlin\dev\nts\expdxr\`。
+路径相对 `Illusion\src\main\kotlin\io\github\dxegp\`。
 
 | 文件 | 一句话职责 |
 | --- | --- |
-| `d3d12\backend\D3D12Backend.kt` | 后端入口：建窗口、建设备、跑自检链、失败即崩 |
-| `d3d12\backend\D3D12CommandEncoderBackend.kt` | 命令列表生命周期、清屏/拷贝、帧提交（同步与异步）、帧中后处理入口 |
-| `d3d12\backend\D3D12RenderPassBackend.kt` | pass 录制：绑定表、顶点/索引缓冲、scissor、绘制、并行 bundle、meshlet 派发 |
-| `d3d12\backend\D3D12CompiledRenderPipeline.kt` | 已编译管线：PSO 句柄、meshlet 与宽线变体、绑定条目推导 |
-| `d3d12\backend\D3D12PipelineBridge.kt` | 按 `pipeline.location` 找回 `RenderPipeline` 与 `ShaderSource` 的旁路表 |
-| `d3d12\backend\D3D12BindGroupEntry.kt` | 绑定条目 → HLSL register 序号的映射（CBV/SRV/texel buffer） |
-| `d3d12\backend\D3D12FenceCallback.kt` | 全库唯一的 FFM upcall 接口（围栏回调） |
-| `d3d12\backend\D3D12GraphicsApi.kt` | 给 `PreferredGraphicsApi` 追加 D3D12 选项 |
-| `d3d12\backend\D3D12PixCaptureController.kt` | F9 触发 PIX 定时捕获 |
-| `d3d12\debug\D3D12Fatal.kt` | 致命错误出口：写报告并抛 `ReportedException`，绕过候选后端回退 |
-| `d3d12\render\advanced\smaa\D3D12GuiSplit.kt` | GUI/世界层拆分：决定 blit 源纹理，present 后重置合成状态 |
-| `d3d12\render\advanced\taa\D3D12Temporal.kt` | 时间性 jitter：拦截 UBO 写入、逐帧滚动偏移 |
-| `d3d12\render\adapter\D3D12Device.kt` | 设备门面：资源工厂、管线缓存、着色器编译、关闭顺序 |
-| `d3d12\render\adapter\D3D12AdapterInfo.kt` | 适配器信息（手写 JSON 解析）与 F3 显示数据源 |
-| `d3d12\render\adapter\D3D12RenderProf.kt` | 阶段计时（每 300 帧一行），供 Java mixin 静态调用 |
-| `d3d12\render\core\D3D12TransientMemory.kt` | 瞬时内存：UBO ring、staging 块分配器、帧列表与回收 |
-| `d3d12\render\core\D3D12GpuBuffer.kt` | 缓冲对象与 `map()`（含字节序修正与设备丢失识别） |
-| `d3d12\render\core\D3D12GpuTexture.kt` | 纹理对象与视图引用计数 |
-| `d3d12\render\core\D3D12GpuTextureView.kt` | 纹理视图（带 `baseMip`） |
-| `d3d12\render\core\D3D12GpuSurface.kt` | 交换链：配置、延迟获取、blit、present |
-| `d3d12\render\core\D3D12GpuQueryPool.kt` | 时间戳查询池（读取是阻塞的） |
-| `d3d12\render\core\D3D12AsyncContext.kt` | 异步录制上下文：分区描述符、bundle 池、worker 池 |
-| `d3d12\render\shader\D3D12GpuSampler.kt` | 采样器对象 |
-| `d3d12\render\shader\D3D12ShaderCompiler.kt` | GLSL→SPIR-V→HLSL→DXIL 的编译入口 |
-| `d3d12\render\shader\D3D12IntermediaryShaderModule.kt` | 中间着色器模块：缓存已翻译的 HLSL 并给顶点属性分配槽位 |
-| `d3d12\extern\MCDR_ABI.kt` | 全部 C ABI 绑定（FFM downcall + 唯一 upcall 存根） |
-| `d3d12\extern\MCDR_PipelineDesc.kt` | 图形/计算管线描述的 native 侧布局 |
-| `d3d12\extern\MCDR_MeshPipelineDesc.kt` | mesh 管线描述的 native 侧布局 |
-| `d3d12\extern\MCDR_Layout.kt` | 结构体字段偏移与 ABI 签名登记 |
+| `d3d12/backend/D3D12Backend.kt` | 后端入口：建窗口、建设备、跑自检链、失败即崩 |
+| `d3d12/command/D3D12CommandEncoderBackend.kt` | 命令列表生命周期、清屏/拷贝、帧提交（同步与异步）、帧中后处理入口 |
+| `d3d12/command/D3D12RenderPassBackend.kt` | pass 录制：绑定表、顶点/索引缓冲、scissor、绘制、并行 bundle、meshlet 派发 |
+| `d3d12/backend/D3D12CompiledRenderPipeline.kt` | 已编译管线：PSO 句柄、meshlet 与宽线变体、绑定条目推导 |
+| `d3d12/backend/D3D12PipelineBridge.kt` | 按 `pipeline.location` 找回 `RenderPipeline` 与 `ShaderSource` 的旁路表 |
+| `d3d12/backend/D3D12BindGroupEntry.kt` | 绑定条目 → HLSL register 序号的映射（CBV/SRV/texel buffer） |
+| `d3d12/command/D3D12FenceCallback.kt` | 全库唯一的 FFM upcall 接口（围栏回调） |
+| `d3d12/backend/D3D12GraphicsApi.kt` | 给 `PreferredGraphicsApi` 追加 D3D12 选项 |
+| `diagnostics/D3D12PixCaptureController.kt` | F9 触发 PIX 定时捕获 |
+| `diagnostics/D3D12Fatal.kt` | 致命错误出口：写报告并抛 `ReportedException`，绕过候选后端回退 |
+| `render/presentation/D3D12GUISplit.kt` | GUI/世界层拆分：决定 blit 源纹理，present 后重置合成状态 |
+| `render/temporal/D3D12Temporal.kt` | 时间性 jitter：拦截 UBO 写入、逐帧滚动偏移 |
+| `d3d12/device/D3D12Device.kt` | 设备门面：资源工厂、管线缓存、着色器编译、关闭顺序 |
+| `d3d12/device/D3D12AdapterInfo.kt` | 适配器信息（手写 JSON 解析）与 F3 显示数据源 |
+| `diagnostics/D3D12RenderProf.kt` | 阶段计时（每 300 帧一行），供 Java mixin 静态调用 |
+| `d3d12/resource/D3D12TransientMemory.kt` | 瞬时内存：UBO ring、staging 块分配器、帧列表与回收 |
+| `d3d12/resource/D3D12GpuBuffer.kt` | 缓冲对象与 `map()`（含字节序修正与设备丢失识别） |
+| `d3d12/resource/D3D12GpuTexture.kt` | 纹理对象与视图引用计数 |
+| `d3d12/resource/D3D12GpuTextureView.kt` | 纹理视图（带 `baseMip`） |
+| `d3d12/surface/D3D12GpuSurface.kt` | 交换链：配置、延迟获取、blit、present |
+| `d3d12/resource/D3D12GpuQueryPool.kt` | 时间戳查询池（读取是阻塞的） |
+| `d3d12/command/D3D12AsyncContext.kt` | 异步录制上下文：分区描述符、bundle 池、worker 池 |
+| `d3d12/shader/D3D12GpuSampler.kt` | 采样器对象 |
+| `d3d12/shader/D3D12ShaderCompiler.kt` | GLSL→SPIR-V→HLSL→DXIL 的编译入口 |
+| `d3d12/shader/D3D12IntermediaryShaderModule.kt` | 中间着色器模块：缓存已翻译的 HLSL 并给顶点属性分配槽位 |
+| `d3d12/ffi/MCDR_ABI.kt` | 全部 C ABI 绑定（FFM downcall + 唯一 upcall 存根） |
+| `d3d12/ffi/MCDR_PipelineDesc.kt` | 图形/计算管线描述的 native 侧布局 |
+| `d3d12/ffi/MCDR_MeshPipelineDesc.kt` | mesh 管线描述的 native 侧布局 |
+| `d3d12/ffi/MCDR_Layout.kt` | 结构体字段偏移与 ABI 签名登记 |
 
 ---
 
@@ -562,3 +562,13 @@ copyBufferToTexture(...)   // 必须先 ensureListOpen()：分配 staging 不录
 
 本文覆盖的是「后端与设备 / 资源层」。管线编译链、呈现与后处理、meshlet 几何构建各有独立文档，
 交叉处只保留接口约定。
+
+## 自检与设备关闭
+
+`diagnostics.BackendSelfTests` 拥有资源、command、pipeline、mesh、compute、SRI、surface 检查。
+`d3d12.shader.D3D12BootstrapShaderSource` 提供资源包加载前的内嵌 shader 源。
+`D3D12Backend` 仅负责创建顺序、配置推送、自检入口、失败关闭与管线缓存清理。
+设备关闭先结算 encoder 的异步提交并结束列表，再等待已提交 fence 完成、销毁 encoder，最后关闭超分计时池。
+encoder 实例通过 `AutoCloseable` 集合持有随 command context 退休的资源；device 不引用超分业务类。
+一次性 encoder 在自身 `close()` 执行同一退休路径，共享 encoder 由设备关闭触发退休。
+等待上限为 5 秒；返回 false 时报告超时并中断正常销毁，不提前释放仍可能被 GPU 引用的查询池。

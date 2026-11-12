@@ -2,7 +2,9 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
+      <module fileurl="file://$PROJECT_DIR$/.idea/modules/Illusion.earlyService.iml" filepath="$PROJECT_DIR$/.idea/modules/Illusion.earlyService.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/modules/Illusion.main.iml" filepath="$PROJECT_DIR$/.idea/modules/Illusion.main.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/modules/io.github.dxegp.Illusion.main.iml" filepath="$PROJECT_DIR$/.idea/modules/io.github.dxegp.Illusion.main.iml" />
     </modules>
   </component>
 </project>
