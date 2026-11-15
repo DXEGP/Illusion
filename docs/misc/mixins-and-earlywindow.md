@@ -7,6 +7,12 @@
 
 只写能从代码确认的东西：描述符、配置键名、颜色值都抄自源码。代码没写清的判断标注「代码中未明确」。
 
+`@At("INVOKE")` 的目标使用 `Lowner;method(args)return`，例如
+`Lit/unimi/dsi/fastutil/objects/ObjectList;add(Ljava/lang/Object;)Z`。
+处理器参数遵守目标调用的 JVM 擦除类型：`ObjectList.add` / `set` 的值参数为 `Object`，
+`set` 的 `Operation` 返回类型也为 `Object`，列表的泛型声明不改变调用描述符。
+编译检查之外，修改这些注入点后运行客户端确认目标类实际织入，再记录世界运行结果。
+
 ## 1. mixin 在整条链上的位置
 
 ### 1.1 两个方向的分工
@@ -19,12 +25,19 @@ mixin 处理的是接口拿到**之前**、以及接口给不了的东西：
 - 原版在调用接口前自己做的决定：渲染目标分配多大、这一帧的主目标是谁、某个 pass 排在哪两条语句之间。
 - 只存在于原版方法局部变量里的值（`GuiRenderer#draw` 开头取一次主目标就再没用过）。
 - 静态上下文里没人递给你的对象（`GameRenderer#preloadUiShader` 里的 `ResourceManager`）。
+- `ScreenshotMixin` 包装 `Screenshot.lambda$takeScreenshot$1` 的两处 `NativeImage.setPixelABGR`，
+  对 D3D12 纹理将写入行改成 `image.height - 1 - row`，取消原版固定的垂直翻转。
+  两处分别覆盖原尺寸与缩小截图，其他后端保持原行序；GPU 完成等待由编码器负责。
 - 私有类型（`ShaderManager$PendingResults` 是私有 record，写不进方法描述符，只能包它的构造）。
+- `LevelLoadingGridMixin` 在 `LevelLoadingScreen.extractChunksForRendering` 入口把区块状态网格冻结为单个
+  `GuiElementRenderState`，保留原版颜色、格距、中心标记、pose 和 scissor；避免每格进入 GUI 层次的全表相交检查。
+  状态快照只保存颜色值，不能持有 `ChunkLoadStatusView` 或世界引用。
 
-体量：`Illusion\src\main\java\dev\nts\expdxr\mixin\` 下 **44 个文件、1947 行**。按注解行统计为
-53 处 `@Inject`、5 处 `@WrapOperation`、5 处 `@ModifyExpressionValue`、2 处 `@ModifyReturnValue`、
-1 处 `@ModifyArg`、2 处 `@ModifyVariable`、4 处 `@Invoker`、2 处 `@Accessor`。最大的是
-`options\OptionsMixin.java`（128 行）。
+体量：`src/main/kotlin/io/github/dxegp/mixin/` 下 82 个 Kotlin 文件，
+`src/main/java/io/github/dxegp/mixin/` 下 25 个 Java 文件，共 107 个注册项。
+按源码注解统计为 77 处 `@Inject`、56 处 `@WrapMethod`、79 处 `@WrapOperation`、
+6 处 `@ModifyExpressionValue`、2 处 `@ModifyReturnValue`、1 处 `@ModifyArg`、
+3 处 `@ModifyVariable`、5 处 `@Invoker`、5 处 `@Accessor`。
 
 ### 1.2 判据：什么必须留在 mixin
 
@@ -44,10 +57,39 @@ mixin 处理的是接口拿到**之前**、以及接口给不了的东西：
 | 跨帧状态机 | 状态要活过注入点，mixin 类不能随便加字段 | `D3D12GUISplit`、`D3D12RenderScale` |
 | 任何 native 调用 | mixin 只做转发，FFM 绑定集中在 `MCDR_ABI`（唯一 native 入口） | `D3D12RenderProf.begin/end` 这类 `@JvmStatic` 中转 |
 | 可测的纯计算 | 注入点是「没有单测的代码」 | `scaledForAttachment` 的取整规则 |
-| 被多处复用的逻辑 | 注入代码不许引用 `dev.nts.expdxr.mixin.*` 里的类 | `compat\FpsLimitCompat`、`EarlyWindowSurface` |
+| 被多处复用的逻辑 | 注入代码不许引用 `io.github.dxegp.mixin.*` 里的类 | `compat\FpsLimitCompat`、`EarlyWindowSurface` |
 
 最后一条不是风格问题：Mixin 会对被注入代码引用的类做 `IllegalClassLoadError` 检查。`FpsLimitCompat` 之所以单独放在
 `compat` 包、`EarlyWindowSurface` 之所以放在 `misc\fmlelw_control`，就是为了绕开这个检查。
+
+### 1.4 Kotlin Mixin 的字节码约束
+
+实例注入与实例 accessor 可以使用 Kotlin，类名、包名及 JSON 注册名保持一致。
+使用反引号声明含 `$` 的处理器名；`@Inject.method`、`at` 等数组参数按 Kotlin 注解语法填写。
+实现状态接口时使用属性，并用 `@field:Unique` 标记新增 backing field。
+`@Shadow` 字段保留目标名称、描述符及 `@Final` 标记；只需要目标方法时直接声明 `@Shadow` 方法，
+例如 `Options#getFile()`，不要为取一个属性引入对象转换。
+
+不要用 `@Suppress("CAST_NEVER_SUCCEEDS")` 隐藏迁移警告，也不要经 `Any` 或泛型辅助函数绕过检查。
+Mixin 源类与目标类没有源码继承关系，Kotlin 会对部分 `this as Target` 发出警告。
+此类转换依赖 Mixin 把实例方法合并进目标类：必须检查实际织入后的类型关系和字节码，
+并执行相应对象的实际路径；编译通过本身不证明转换安全。
+
+以下限制决定 Java 文件的保留范围：
+
+| 场景 | 当前处理 | 字节码依据 |
+| --- | --- | --- |
+| 真正的静态注入、静态 shadow、静态 invoker | 保留 Java；含这些成员的类不直接迁移 | Kotlin companion 的 `@JvmStatic` 桥接仍引用 companion 实例，不能把整个 companion 当普通 Mixin 合并 |
+| 构造器调用父构造器之前的注入 | `ModelSetTablesMixin` 保留 Java 静态处理器 | 该位置尚无可用的实例接收者 |
+| `@Coerce` 参数 | 保留 Java | 该注解未显式声明 Java retention；javac 写入 `RuntimeInvisibleParameterAnnotations`，当前 Kotlin 编译器写入 `RuntimeVisibleParameterAnnotations`，Mixin `Injector.checkCoerce` 只读取 invisible 参数注解 |
+
+25 个 Java 文件中，20 个含静态成员，8 个含 `@Coerce`，其中 3 个同时满足两项。
+`MainTarget` 的附件分配方法和 `ShaderManager#apply` 是实例方法，对应包装处理器使用实例方法即可。
+不要为提高 Kotlin 数量改变原版可见性或增加字节码后处理。
+
+验证分三层记录：编译与注入描述符/注解比对；客户端实际加载并织入全部迁移目标；
+实际 handler 路径的操作与返回值断言。目标类加载不等于每条 handler 都已执行，
+数组与调色板测试也不等于世界渲染或画面验收。
 
 ## 2. 注册：三个文件决定一切
 
@@ -70,10 +112,11 @@ file="META-INF/accesstransformer.cfg"
 | 键 | 值 | 说明 |
 | --- | --- | --- |
 | `required` | `true` | 配置级硬要求：这批 mixin 必须全部织入 |
-| `package` | `dev.nts.expdxr.mixin` | 数组里的名字都相对这个包 |
+| `mixinextras.minVersion` | `0.5.5` | `@Expression` / `MIXINEXTRAS:EXPRESSION` 的配置级依赖声明 |
+| `package` | `io.github.dxegp.mixin` | 数组里的名字都相对这个包 |
 | `compatibilityLevel` | `JAVA_25` | 与 `jvmTarget = JVM_25`、NeoForge 26.3 的字节码级别一致 |
-| `mixins` | `[]` | 通用列表留空，44 条全在 `client` |
-| `client` | 44 条 | 目标类（`Window` / `GameRenderer` / `Options` …）只存在于客户端发行版 |
+| `mixins` | `[]` | 通用列表留空，107 条全在 `client` |
+| `client` | 107 条 | 这些注入只在客户端启用，包含客户端使用的共享世界数据类 |
 | `injectors.defaultRequire` | `1` | 每条注入默认「必须命中一次」，改名或改结构即启动失败 |
 | `overwrites.requireAnnotations` | `true` | 目前没有任何 `@Overwrite`；开着它是禁止将来出现无注解覆写 |
 
@@ -94,7 +137,10 @@ file="META-INF/accesstransformer.cfg"
 
 ## 3. Mixin 地图
 
-### 3.1 分组总览
+### 3.1 主要渲染挂点
+
+下表列出渲染、窗口与选项挂点。额外的 RT 几何、数组发布和采集资格挂点见
+[RT 文档](../rt/README.md)；完整注册表以 `dxr_mc.mixins.json` 为准。
 
 | 系统 | 条数 | 它回答的问题 |
 | --- | --- | --- |
@@ -125,7 +171,7 @@ D3D12 时**保留**，因为游戏每个后端尝试都会建一次窗口，我�
 | Mixin | 目标（类#方法） | 注入点 | 目的 |
 | --- | --- | --- | --- |
 | `render\FrontendGpuDeviceCompilePipelineMixin` | `FrontendGpuDevice#compilePipeline(RenderPipeline,ShaderSource,Executor)` | `@Inject` HEAD | 把 `ShaderSource` 与管线登记进 `D3D12PipelineBridge`：26.3 的 `CreateInfo` 只有 SPIR-V 与状态，后端还要 GLSL 源、shaderDefines 与 mesh 变体判据 |
-| `render\ShaderManagerRequiredFailureMixin` | `ShaderManager#apply(GpuDevice,PendingResults)` | `@WrapOperation` at `@At("NEW") target=java/lang/RuntimeException` | message 以 `Failed to load required shader programs` 开头时打 ERROR 并 `Minecraft#delayCrash`，把静默黑屏升级成崩溃 |
+| `render\ShaderManagerRequiredFailureMixin` | `ShaderManager#apply(GpuDevice,PendingResults)` | `@WrapOperation` at `@At("NEW") target=java/lang/RuntimeException` | message 以 `Failed to load required shader programs` 开头时通过 `IllusionLogger.warnMessage` 报告并调用 `Minecraft#delayCrash` |
 | `render\GameRendererPreloadUiShaderMixin` | `GameRenderer#preloadUiShader`（static） | `@Inject` HEAD | 捕获那一刻的 `ResourceManager` 交给 `D3D12FallbackShaderSource`，供缺失管线回退 |
 
 两个坑写在代码注释里，改动前必读：26.3 的 `preloadUiShader` 是静态方法，**注入处理器也必须是 `static`**，
@@ -137,10 +183,12 @@ D3D12 时**保留**，因为游戏每个后端尝试都会建一次窗口，我�
 | Mixin | 目标（类#方法） | 注入点 | 目的 |
 | --- | --- | --- | --- |
 | `render\MainTargetRenderScaleMixin` | `MainTarget#allocateColorAttachment` / `#allocateDepthAttachment` | `@WrapOperation`（INVOKE `GpuDevice#createTexture`） | 主目标附件按渲染比例分配，但不动 `RenderTarget.width/height` 的逻辑尺寸 |
-| `render\RenderTargetCreateBuffersScaleMixin` | `RenderTarget#createBuffers` | 同一 INVOKE，`@WrapOperation` | 覆盖窗口 resize 路径；只对 `(Object) this instanceof MainTarget` 生效 |
+| `render\RenderTargetCreateBuffersScaleMixin` | `RenderTarget#createBuffers` | 同一 INVOKE，`@WrapOperation` | 当前包装直接透传 `width` / `height`，没有调用其缩放辅助方法 |
 | `render\LevelRendererWorldTargetsScaleMixin` | `LevelRenderer#render` | `@ModifyExpressionValue`（FIELD `RenderTarget.width` / `.height`，remap=false）×2 | 世界层辅助目标改用 `worldLayerSize`，与主目标附件同尺寸 |
 
-这三条合起来是一件事：**只有颜色/深度附件的真实分配按比例缩，`RenderTarget` 对外报告的逻辑尺寸一直是窗口尺寸。**
+`MainTarget` 的附件创建调用 `scaledForAttachment`，世界辅助目标使用 `worldLayerSize`；
+这些注入不修改 `RenderTarget.width/height` 字段。
+注意 `RenderTargetCreateBuffersScaleMixin` 当前透传尺寸，不能根据类名推断 resize 已实施缩放。
 
 - 不改 `width/height`：`GameRenderer` 每帧比较 `windowRenderState.width != mainRenderTarget.width`，不等就重建主目标；逻辑尺寸一缩，主目标每帧重建。
 - 只缩 `MainTarget`：GUI / 模糊等目标用窗口坐标，跟着缩会让 scissor 越界，实测出现过 `RenderArea 1484x773` 配 `scissor 1492x992`。
@@ -158,18 +206,23 @@ D3D12 时**保留**，因为游戏每个后端尝试都会建一次窗口，我�
 
 | Mixin | 目标（类#方法） | 注入点 | 目的 |
 | --- | --- | --- | --- |
-| `render\GameRendererSmaaWorldMixin` | `GameRenderer#render` | ① `@Inject` INVOKE `GuiRenderer#render()V` ② `@Inject` INVOKE `CommandEncoder#clearDepthTexture(GpuTexture,D)` shift=BEFORE | ① 世界画完、GUI 未画之间依次 `D3D12TAA` → `D3D12SMAAWorld` → `SuperResolution` → DLSS 提交记账 → `D3D12GUISplit.prepareForGui` ② 清深度前只做 DLSS 的每帧记账 |
+| `render\GameRendererSmaaWorldMixin` | `GameRenderer#render` | ① `@Inject` INVOKE `GuiRenderer#render()V` ② `@Inject` HEAD | ① 世界画完、GUI 未画之间依次 `D3D12TAA` → `D3D12SMAAWorld` → `SuperResolution` → DLSS 提交记账 → `D3D12GUISplit.prepareForGui` ② DLSS 后端的帧起点使旧深度快照失效，再协调抗锯齿状态 |
 | `render\LevelRendererMainPassDepthMixin` | `LevelRenderer#lambda$addMainPass$0` | `@Inject` RETURN, remap=false | 采时域数据、录速度 pass、深度快照、OIT 透射率（唯一无条件入帧图的 pass，且在任何清深度之前） |
 | `render\ChunkSectionsToRenderSamplerMixin` | `ChunkSectionsToRender#renderGroup` / `#renderOit` | `@ModifyVariable`（HEAD, argsOnly）×2 | 只给地形专用 sampler 加超分 mip bias，不污染共享 sampler 缓存 |
 | `render\GameRendererTransparencyMixin` | `GameRenderer#useImprovedTransparency` | `@Inject` HEAD, cancellable | mesh 地形强制返回 `true`：mesh 路径的线程组顺序不保证，只能走顺序无关的 Wavelet OIT |
-| `render\SectionUploadCaptureMixin` | `SectionRenderDispatcher$RenderSection#addSectionBuffersToUberBuffer` | `@Inject` HEAD | 记下每段每层的 indexCount 与缓冲尺寸，供 meshlet 几何构建 |
+| `render\SectionUploadCaptureMixin` | `RenderSection#addSectionBuffersToUberBuffer` / `#setSectionMesh` / `#releaseSectionMesh` / `#reset` | HEAD / `@WrapMethod` / HEAD / HEAD | 暂存层字节；保留当前任务的原版安装与通知，独立核验 RT 发布；清理取消上传、空段和卸载 |
 | `render\DynamicGpuDataCaptureMixin` | `DynamicGpuData#writeChunkSectionCommands`（HEAD/RETURN）、`#writeChunkSectionsInstanced`（HEAD） | `@Inject` ×3 | 抓 `drawIndexedIndirect` 的参数缓冲，mesh 路径按同一份参数重放 |
 
 深度唯一有效的采集点是 `LevelRenderer#lambda$addMainPass$0` 的 RETURN：帧图 main pass 是唯一无条件进入帧图的 pass，
 深度在那一刻有效、且在全部 `clearDepthTexture` 之前。**不要改挂 `GameRenderer.render`**（那时深度已清过三次，采样全为
 `mean=0.0`），也不要挂 `always_on_top` pass（`hasAnyAlwaysOnTop()` 为假时根本不跑）。
+帧起点与深度采集分开：`pclFrameBegin()` 挂在 `GameRenderer.render` HEAD，必须早于 main pass RETURN 的快照捕获；后续清深度不得再次使本帧快照失效。
 `SectionUploadCaptureMixin` 必须挂 `addSectionBuffersToUberBuffer`，不要改挂 `SectionCompiler.compile`：后者能成功应用，
 但回调一次也不触发。
+上传 HEAD 仅复制 CPU 字节，在 `setSectionMesh` 包装器确认原版已安装后发布 RT；仅监听非空层上传会漏掉整段清空与层消失。
+当前任务及结果身份校验通过后必须执行原版安装；RT 令牌失效只拒绝 RT 发布，不能漏掉 `onSectionMeshUpdate`。
+实际原版安装须结束任务等待，缺 RT 内容由有预算的恢复队列补齐，不以 RT 失败重新发送世界 dirty。
+reset 在原版替换 section 坐标前移除旧记录；初建的 `UNCOMPILED` 哨兵不移除记录，避免误删坐标零处的其它段。
 
 ### 3.7 视频设置与选项（10）
 
@@ -210,7 +263,7 @@ D3D12 时**保留**，因为游戏每个后端尝试都会建一次窗口，我�
 | `client\InactivityFpsLimitMixin` | `InactivityFpsLimit` 的 `CODEC` 与 `$VALUES` | `@Mutable @Final @Shadow` | 允许 `FpsLimitCompat` 往枚举里插一个 `NEVER` |
 | `client\FpsLimitTrackerMixin` | `FramerateLimitTracker#getFramerateLimit` | `@Inject` HEAD, cancellable | 失焦限帧档为 `NEVER` 时返回 `options.framerateLimit()`，即取消失焦降帧 |
 
-`FpsLimitCompat` 在 `dev.nts.expdxr.compat`（`compat` 包唯一文件），用 `privateLookupIn` 取 4 参构造器
+`FpsLimitCompat` 在 `io.github.dxegp.compat`（`compat` 包唯一文件），用 `privateLookupIn` 取 4 参构造器
 `(String,int,String,String)` 造 `("NEVER", ordinal, "never", "options.inactivityFpsLimit.never")`：描述符必须写满四个参数，
 javac 给枚举隐式加了 `name` / `ordinal`，少写就 `NoSuchMethodException`；写字段用普通反射而非 `VarHandle` ——
 `@Mutable` 已去掉 final，`VarHandle.set` 反而抛 `UnsupportedOperationException`。
@@ -241,17 +294,18 @@ javac 给枚举隐式加了 `name` / `ordinal`，少写就 `NoSuchMethodExceptio
 | --- | --- | --- | --- |
 | 1 | `Minecraft#renderFrame` HEAD | 开 `FRAME` 段、`frameStart`、强制开启改进透明 | `D3D12RenderProf` |
 | 2 | `GameRenderer#extract` | 开 `EXTRACT` 段 | 同上 |
-| 3 | `FrameGraphBuilder#execute` HEAD | `D3D12ShadingRateImage.prepareFrame()` + 开 `EXECUTE_FRAMEGRAPH` | VRS |
+| 3 | `GameRenderer#render` HEAD | DLSS 帧起点使旧快照失效，再协调抗锯齿状态 | DLSS / Reflex |
 | 4 | `LevelRenderer#render` | 辅助目标改用 `worldLayerSize`；三段计时 | 渲染比例 / 计时 |
-| 5 | `LevelRenderer#lambda$addMainPass$0` RETURN | TAA 时域数据、速度 pass、深度快照、OIT 透射率 | TAA / DLSS / 超分掩码 |
+| 5 | `FrameGraphBuilder#execute` HEAD | `D3D12ShadingRateImage.prepareFrame()` + 开 `EXECUTE_FRAMEGRAPH` | VRS |
 | 6 | `ChunkSectionsToRender#renderGroup` | 地形 sampler 加 mip bias、`RENDER_GROUP` 段 | 超分 / 计时 |
-| 7 | `GameRenderer#render` INVOKE `GuiRenderer#render` | TAA → SMAA → SR → DLSS 提交记账 → `prepareForGui` | 后处理链 / 帧生成 |
-| 8 | `GuiRenderer#draw` / `CubeMap#render` | 换到 GUI 目标 | GUI 拆分 |
-| 9 | `GameRenderer#processBlurEffect` | 背景模糊换到 GUI 目标 | GUI 拆分 |
-| 10 | `GuiRenderer#render` | 开 `GUI` 段 | 计时 |
-| 11 | `Minecraft#close` HEAD | 接管来的 SDL 窗口刷黑 | 退出闪屏 |
+| 7 | `LevelRenderer#lambda$addMainPass$0` RETURN | TAA 时域数据、速度 pass、深度快照、OIT 透射率 | TAA / DLSS / 超分掩码 |
+| 8 | `GameRenderer#render` INVOKE `GuiRenderer#render` | TAA → SMAA → SR → DLSS 提交记账 → `prepareForGui` | 后处理链 / 帧生成 |
+| 9 | `GuiRenderer#draw` / `CubeMap#render` | 换到 GUI 目标 | GUI 拆分 |
+| 10 | `GameRenderer#processBlurEffect` | 背景模糊换到 GUI 目标 | GUI 拆分 |
+| 11 | `GuiRenderer#render` | 开 `GUI` 段 | 计时 |
+| 12 | `Minecraft#close` HEAD | 接管来的 SDL 窗口刷黑 | 退出闪屏 |
 
-第 7 步的顺序是硬约束，为什么必须是这个顺序、以及 SMAA 与 DLSS 为什么各判各的开关，写在抗锯齿与超分两篇文档里；
+第 8 步的顺序是硬约束，为什么必须是这个顺序、以及 SMAA 与 DLSS 为什么各判各的开关，写在抗锯齿与超分两篇文档里；
 这里只记一个事实：**它是全帧唯一一个「世界已画完、GUI 还没画」的可注入时刻。**
 
 ## 5. 早期窗口（early window）
@@ -284,7 +338,7 @@ loading window and the game window are two different windows」。所以目标�
 一条 WARN —— 软件 renderer 在任何显卡 / 驱动状态下都能画出加载屏，而这一步正好发生在显卡后端还没起来的时候。
 
 **加载屏用 AWT 合成，整帧走 surface → texture，不要建流式纹理。** 素材：`assets\logo_flat_dark.jpg`、Mojangles ASCII 页
-（`assets\dxrmc\mojangles_ascii.png`，16×16 格、每格 8×8）；配色：进度条 `0xC46BFF`、轨道 `0x2E3238`、背景纯黑、文字 `0xD8,0xDC,0xE2`；
+（`assets\dxrmc\mojangles_ascii.png`，16×16 格、每格 8×8）；源树当前没有 `assets/mojangles_ascii.png`，缺失时跳过字幕。配色：进度条 `0xC46BFF`、轨道 `0x2E3238`、背景纯黑、文字 `0xD8,0xDC,0xE2`；
 整帧经 `SDL_CreateSurfaceFrom`（`ARGB8888`）+ `SDL_CreateTextureFromSurface` + `RenderTexture` 上屏 —— 软件 renderer **静默忽略**流式纹理上传。
 
 **不要在 `periodicTick()` 里 drain SDL 事件。** FML 在加载线程上调用 `periodicTick()`，而 `SDL_PollEvent(NULL)` 只要还有
@@ -317,7 +371,7 @@ FML 只在 `mods/` 下的**顶层 `*.jar`** 里找早期服务（`EarlyServiceDi
 | 产物 | 内容 | 谁加载 |
 | --- | --- | --- |
 | `dxr_mc-<ver>.jar` | 正常模组，**排除** `earlywindow` 类与那条 service 文件 | 模组发现 |
-| `META-INF/dxrmc/earlywindow.jar`（嵌在上者内部） | 只有 `dev/nts/expdxr/earlywindow/**` + service 文件 + 加载屏图片 | 由安装器解到 `mods/` |
+| `META-INF/dxrmc/earlywindow.jar`（嵌在上者内部） | 只有 `io/github/dxegp/earlywindow/**` + service 文件 + 加载屏图片 | 由安装器解到 `mods/` |
 
 安装器 `EarlyWindowJarInstaller.ensureInstalled()` 在模组构造期跑（`Illusion.init` 第 44 行），做两件事：
 
@@ -376,8 +430,8 @@ FML 只在 `mods/` 下的**顶层 `*.jar`** 里找早期服务（`EarlyServiceDi
 
 ### 6.3 优先级
 
-44 个 mixin **没有一个**声明 `priority`（默认 1000）。同一目标类上的多个 mixin（`Options` 上有 4 个、
-`GameRenderer` 上有 5 个、`LevelRenderer` 上有 3 个）靠「注入点位置 + 被注入方法名」区分，不靠优先级排序。
+`LevelRendererRtDebugViewMixin` 显式使用 `priority = 1100`，其余使用默认值 1000。
+同一目标类上的多个 mixin 通过注入点位置与被注入方法名区分。
 
 不要为了抢顺序去加 `priority`：真正的顺序保证来自 `INVOKE` 目标与 `shift`，那是可验证、可 review 的；
 `priority` 只影响同一位置的多个回调谁先跑，改了以后没有任何编译期或启动期检查替你兜底。
@@ -403,7 +457,7 @@ FML 只在 `mods/` 下的**顶层 `*.jar`** 里找早期服务（`EarlyServiceDi
 
 1. **处理器 `static` 与否必须和目标方法一致。** `GameRenderer#preloadUiShader` 是静态方法，非 static 处理器在 APPLY 阶段 fatal。
 2. **mixin 类不能有非 private 的成员方法。** 需要工具方法就放 Kotlin。
-3. **注入代码不能引用 `dev.nts.expdxr.mixin.*` 里的类**（`IllegalClassLoadError`）。共用逻辑放 `compat` / `misc` / `d3d12`。
+3. **注入代码不能引用 `io.github.dxegp.mixin.*` 里的类**（`IllegalClassLoadError`）。共用逻辑放 `compat` / `misc` / `d3d12`。
 4. **`@Shadow` 只能读已存在的成员；写 final 静态字段需要 `@Mutable @Final @Shadow`，并且用普通反射写**（`VarHandle.set` 会抛 `UnsupportedOperationException`）。
 5. **私有 record / 私有内部类只能包 `NEW`**：`ShaderManager$PendingResults` 这类参数类型写不进 Java 源码，`@Inject` 无法声明签名。
 6. **描述符要写全。** 内部类带 `$`（`FrameGraphBuilder$Inspector`），有重载就写完整参数表。
@@ -422,36 +476,36 @@ FML 只在 `mods/` 下的**顶层 `*.jar`** 里找早期服务（`EarlyServiceDi
 
 ## 7. 文件导航
 
-mixin 侧（前缀 `Illusion\src\main\java\dev\nts\expdxr\mixin\`，逐条清单见 `dxr_mc.mixins.json`）：
+mixin 侧（前缀 `Illusion\src\main\java\io\github\dxegp\mixin\`，逐条清单见 `dxr_mc.mixins.json`）：
 
 | 文件 | 内容 |
 | --- | --- |
-| `core\WindowAdoptCreatedMixin.java`、`core\MinecraftCloseEarlyWindowMixin.java` | 接管早期 SDL 窗口（仅 D3D12）、退出前刷黑 |
-| `render\GameRendererSmaaWorldMixin.java` | 全帧唯一的「世界画完 / GUI 未画」挂点 |
-| `render\LevelRendererMainPassDepthMixin.java` | main pass RETURN：时域、速度、深度、透射率 |
-| `render\MainTargetRenderScaleMixin.java`、`render\RenderTargetCreateBuffersScaleMixin.java`、`render\LevelRendererWorldTargetsScaleMixin.java` | 渲染比例的三个尺寸点 |
-| `render\GuiRendererTargetMixin.java`、`render\CubeMapTargetMixin.java`、`render\GameRendererBlurTargetMixin.java` | GUI 目标归属 |
-| `render\FrontendGpuDeviceCompilePipelineMixin.java`、`render\ShaderManagerRequiredFailureMixin.java`、`render\GameRendererPreloadUiShaderMixin.java` | 管线与着色器 |
-| `render\SectionUploadCaptureMixin.java`、`render\DynamicGpuDataCaptureMixin.java` | 地形数据采集 |
-| `render\*ProfMixin.java`（9 个）、`debug\PreparedFrameProfMixin.java` | 阶段计时 |
-| `options\OptionsMixin.java`、`options\OptionsRenderOptionsMixin.java`、`options\OptionsAntiAliasingMixin.java`、`options\OptionsGraphicsPresetMixin.java` | `Options` 上的四处注入 |
+| `core\WindowAdoptCreatedMixin.kt`、`core\MinecraftCloseEarlyWindowMixin.kt` | 接管早期 SDL 窗口（仅 D3D12）、退出前刷黑 |
+| `render\GameRendererSmaaWorldMixin.kt` | 全帧唯一的「世界画完 / GUI 未画」挂点 |
+| `render\LevelRendererMainPassDepthMixin.kt` | main pass RETURN：时域、速度、深度、透射率 |
+| `render\MainTargetRenderScaleMixin.kt`、`render\RenderTargetCreateBuffersScaleMixin.kt`、`render\LevelRendererWorldTargetsScaleMixin.kt` | 渲染比例的三个尺寸点 |
+| `render\GuiRendererTargetMixin.kt`、`render\CubeMapTargetMixin.kt`、`render\GameRendererBlurTargetMixin.kt` | GUI 目标归属 |
+| `render\FrontendGpuDeviceCompilePipelineMixin.kt`、`render\ShaderManagerRequiredFailureMixin.kt`、`render\GameRendererPreloadUiShaderMixin.java` | 管线与着色器 |
+| `render\SectionUploadCaptureMixin.kt`、`render\DynamicGpuDataCaptureMixin.kt` | 地形数据采集 |
+| `render\*ProfMixin.kt`、`debug\PreparedFrameProfMixin.kt` | 阶段计时 |
+| `options\OptionsMixin.java`、`options\OptionsRenderOptionsMixin.kt`、`options\OptionsAntiAliasingMixin.kt`、`options\OptionsGraphicsPresetMixin.kt` | `Options` 选项注入 |
 | `options\PreferredGraphicsApiMixin.java`、`options\PreferredGraphicsApiAccessor.java` | 往原版枚举里追加 D3D12 |
 | `options\OptionsScreenVideoMixin.java`、`options\VideoSettingsScreenOptionsAccessor.java` | 自绘视频设置界面 |
-| `client\InactivityFpsLimitMixin.java`、`client\FpsLimitTrackerMixin.java`、`render\DebugCrosshairRendererMixin.java` | 「永不」限帧档；已停用的准星空壳 |
+| `client\InactivityFpsLimitMixin.java`、`client\FpsLimitTrackerMixin.kt`、`render\DebugCrosshairRendererMixin.kt` | 「永不」限帧档；已停用的准星空壳 |
 
 早期窗口与兼容层：
 
 | 文件 | 内容 |
 | --- | --- |
-| `Illusion\src\main\java\dev\nts\expdxr\earlywindow\DxrmcEarlyWindowProvider.java` | 独立 jar 里的 provider：SDL 窗口 + AWT 加载屏 + 交接 |
-| `Illusion\src\main\kotlin\dev\nts\expdxr\misc\fmlelw_control\EarlyWindowJarInstaller.kt` | 解出 `mods\dxrmc-earlywindow.jar`、改 `fml.toml` |
-| `Illusion\src\main\kotlin\dev\nts\expdxr\misc\fmlelw_control\EarlyWindowSurface.kt` | 记住 / 刷黑被接管的窗口句柄 |
-| `Illusion\src\main\java\dev\nts\expdxr\compat\FpsLimitCompat.java` | 反射安装 `InactivityFpsLimit.NEVER`（`compat` 包唯一文件） |
-| `Illusion\src\main\resources\dxr_mc.mixins.json`、`...\META-INF\accesstransformer.cfg` | 44 条注册；两条 AT |
+| `Illusion\src\main\java\io\github\dxegp\earlywindow\DxrmcEarlyWindowProvider.java` | 独立 jar 里的 provider：SDL 窗口 + AWT 加载屏 + 交接 |
+| `Illusion\src\main\kotlin\io\github\dxegp\misc\fmlelw_control\EarlyWindowJarInstaller.kt` | 解出 `mods\dxrmc-earlywindow.jar`、改 `fml.toml` |
+| `Illusion\src\main\kotlin\io\github\dxegp\misc\fmlelw_control\EarlyWindowSurface.kt` | 记住 / 刷黑被接管的窗口句柄 |
+| `Illusion\src\main\java\io\github\dxegp\compat\FpsLimitCompat.java` | 反射安装 `InactivityFpsLimit.NEVER`（`compat` 包唯一文件） |
+| `Illusion\src\main\resources\dxr_mc.mixins.json`、`...\META-INF\accesstransformer.cfg` | 107 条注册；两条 AT |
 | `Illusion\src\main\resources\META-INF\services\net.neoforged.neoforgespi.earlywindow.ImmediateWindowProvider`、`...\neoforge.mods.toml` | provider 的 service 声明；`[[mixins]]` 与 `[[accessTransformers]]` 登记 |
 | `Illusion\build.gradle.kts` | `earlyWindowJar` 任务、主 jar 的排除与嵌入、`jarALL` |
 
-被 mixin 调用的 Kotlin 侧（前缀 `Illusion\src\main\kotlin\dev\nts\expdxr\`）：
+被 mixin 调用的 Kotlin 侧（前缀 `Illusion\src\main\kotlin\io\github\dxegp\`）：
 
 | 文件 | 内容 |
 | --- | --- |
@@ -463,7 +517,7 @@ mixin 侧（前缀 `Illusion\src\main\java\dev\nts\expdxr\mixin\`，逐条清单
 | `d3d12\render\advanced\terrain\D3D12TerrainSampler.kt` | 地形 sampler 包装（mip bias） |
 | `d3d12\debug\D3D12DebugInfo.kt`、`D3D12FrameStats.kt` | F3 数据行的来源 |
 | `d3d12\backend\D3D12Backend.kt`、`misc\settings\D3D12Settings.kt` | 判定「是不是我们的后端」；`skipGlSwap` / `meshTerrain` 等开关 |
-| `dxrmc\sr\SuperResolution.kt`、`dxrmc\sr\D3D12SrMask.kt` | 超分后端选择与掩码 |
+| `dxrmc\superresolution\SuperResolution.kt`、`dxrmc\superresolution\D3D12SrMask.kt` | 超分后端选择与掩码 |
 
 ## 8. 文档维护
 
