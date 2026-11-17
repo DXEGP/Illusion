@@ -17,11 +17,11 @@ class D3D12GpuTextureView(private val tex: GpuTexture, private val baseMip: Int,
 
     init {
         val dx12Texture = tex as D3D12GpuTexture
-        dx12Texture.addViews()
         this.handle = MCDR_ABI.ID3D12CreateTextureView(dx12Texture.handle(), baseMip, levelCount)
         if (this.handle == 0L) {
             throw IllegalStateException("dx12CreateTextureView returned a null handle")
         }
+        dx12Texture.addViews()
     }
 
     fun handle(): Long {

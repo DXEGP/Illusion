@@ -14,7 +14,10 @@ native 调用只用 FFM；JVM 提交世界增量与帧输入，不管理 SDK 各
 
 当前源码已按 `io.github.dxegp` 的业务目录归类，当前模块地图见 `docs/overview.md`。
 MCDR_ABI 保持唯一 FFM 出口；NativeLibraryResources 只解包资源且不得反向初始化 ABI。
-BackendSelfTests 拥有启动自检；ReconstructionTiming 拥有超分查询池与采样状态。
+启动路径不运行行为自检；独立行为探针位于 `src/probes/`。只为明确的 ABI、资源生命周期或硬件行为缺口添加探针，不为重复覆盖 getter、分支或形式化防御增加测试；运行时能力查询和降级属于生产行为。ReconstructionTiming 拥有超分查询池与采样状态。
+拖影、闪烁、运动稳定性等动态视觉确认交给用户；代理提供具体场景和观察项，不以静态截图替代动态结论，不反复截图或自动操作游戏尝试证明画质。
+连续全图读回和写盘会严重降帧，不用于用户操作时的动态确认；已有采集数据优先离线分析。
 计时池仅在 command context 完成并销毁后释放，停用超分只重置采样。
 计时池使用前向唯一 encoder 实例登记 AutoCloseable；device 不反向引用重建业务。
 共享与一次性 encoder 都在成功等待 fence、销毁 context 后关闭登记资源，超时不释放。
+Kotlin 的内联边界与 FFM 大小、对齐、空数组及调用作用域统一遵循 `docs/misc/ffm-abi.md`；跨异步提交的内存必须由真实资源 owner 和 fence 持有。

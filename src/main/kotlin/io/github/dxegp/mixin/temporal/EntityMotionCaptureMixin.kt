@@ -16,4 +16,5 @@ abstract class EntityMotionCaptureMixin {
         callback: CallbackInfoReturnable<EntityRenderState>) {
         D3D12ObjectMotion.captureExtracted(entity, callback.returnValue)
     }
+
 }

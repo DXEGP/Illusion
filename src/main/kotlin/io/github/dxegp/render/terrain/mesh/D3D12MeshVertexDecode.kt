@@ -19,7 +19,11 @@ object D3D12MeshVertexDecode {
             else -> null
         } ?: return "        vin.${field.name} = (${field.type})0;  // 未支持的格式 $gpuFormat\n"
 
-        val convert = if (field.type.startsWith("int")) "int4" else "float4"
+        val convert = when {
+            field.type.startsWith("uint") -> "uint4"
+            field.type.startsWith("int") -> "int4"
+            else -> "float4"
+        }
         val swizzle = buildString {
             for (i in 0 until count) {
                 if (i > 0) append(", ")
@@ -27,7 +31,7 @@ object D3D12MeshVertexDecode {
             }
         }
         val addr = "vertexIndex * ${stride}u + ${offset}u"
-        return "        { ${convert} t = ${convert}($read($addr)); " +
+        return "        { ${convert} t = ${convert}($read($addr, ${count}u)); " +
             "vin.${field.name} = ${field.type}($swizzle); }\n"
     }
 

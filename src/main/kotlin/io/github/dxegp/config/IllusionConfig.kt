@@ -4,15 +4,6 @@ import io.github.dxegp.diagnostics.IllusionLogLevel
 import io.github.dxegp.diagnostics.IllusionLogger.i18n_LOG_KEY
 import net.neoforged.neoforge.common.ModConfigSpec
 
-/** `[renderer] commandBundles` — how one multi-draw batch is split across command bundles. */
-enum class CommandBundleMode {
-    AUTO,
-
-    SERIAL,
-
-    PARALLEL,
-}
-
 /** `[dlss] implementation` — which upscaler backend the native DLL drives. */
 enum class DlssImplementation {
     NGX,
@@ -66,15 +57,6 @@ enum class RtMode {
     FULL,
 }
 
-/** `[debug] meshDiagnostics` — one-shot isolation test for "texture write vs read-back". */
-enum class MeshDiagnostics {
-    NONE,
-
-    CLEAR,
-
-    PASS,
-}
-
 /**
  * Every switch the player can change, in `config/dxr_mc-client.toml`; `D3D12Settings` resolves them
  * into one immutable snapshot.
@@ -100,13 +82,6 @@ object IllusionConfig {
 
     /** `[renderer] glContext` — the escape hatch that keeps a real OpenGL context alive. */
     val GL_CONTEXT: ModConfigSpec.BooleanValue
-
-    /** `[renderer] asyncCommandLists` — record command lists on the worker pool. */
-    val ASYNC_COMMAND_LISTS: ModConfigSpec.BooleanValue
-
-    val ASYNC_WORKERS: ModConfigSpec.IntValue
-
-    val COMMAND_BUNDLES: ModConfigSpec.EnumValue<CommandBundleMode>
 
     val HDR: ModConfigSpec.EnumValue<HdrMode>
 
@@ -172,19 +147,6 @@ object IllusionConfig {
 
     /** `[debug] temporalJitter` — inject sub-pixel jitter into the level projection. */
     val TEMPORAL_JITTER: ModConfigSpec.BooleanValue
-
-    /** `[debug] selfTestSurface` — run the swap-chain self-test (steals the RTSS OSD binding). */
-    val SELF_TEST_SURFACE: ModConfigSpec.BooleanValue
-
-    val SELF_TEST_MESH: ModConfigSpec.BooleanValue
-
-    /** `[debug] selfTestCompute` — run the compute self-test (root UAV + root constants). */
-    val SELF_TEST_COMPUTE: ModConfigSpec.BooleanValue
-
-    /** `[debug] failDevice` — make device creation fail on purpose (failure-policy test). */
-    val FAIL_DEVICE: ModConfigSpec.BooleanValue
-
-    val MESH_DIAGNOSTICS: ModConfigSpec.EnumValue<MeshDiagnostics>
 
     val NO_CRASH_POPUP: ModConfigSpec.BooleanValue
 
@@ -278,37 +240,11 @@ object IllusionConfig {
             .gameRestart()
             .define("glContext", false)
 
-        ASYNC_COMMAND_LISTS = BUILDER
-            .comment(
-                "Record command lists in parallel on a worker pool.",
-                "OFF forces single-threaded recording, which is slower on a busy scene but",
-                "removes any recording-order question from the picture (diagnostic)."
-            )
-            .translation("dxr_mc.configuration.renderer.asyncCommandLists")
-            .gameRestart()
-            .define("asyncCommandLists", true)
-
-        ASYNC_WORKERS = BUILDER
-            .comment("Worker threads for async recording (1-8).")
-            .translation("dxr_mc.configuration.renderer.asyncWorkers")
-            .gameRestart()
-            .defineInRange("asyncWorkers", 8, 1, 8)
-
-        COMMAND_BUNDLES = BUILDER
-            .comment(
-                "How one multi-draw batch is split across command bundles.",
-                "AUTO picks per batch; SERIAL always records a single bundle (maximum",
-                "compatibility, more CPU); PARALLEL always splits across the worker pool."
-            )
-            .translation("dxr_mc.configuration.renderer.commandBundles")
-            .gameRestart()
-            .defineEnum("commandBundles", CommandBundleMode.AUTO)
-
         HDR = BUILDER
             .comment(
                 "Native HDR presentation (scRGB swapchain).",
                 "AUTO follows the display's Windows advanced-colour state. FORCE_ON creates the",
-                "HDR swapchain even on an SDR display (for testing the path), FORCE_OFF keeps the",
+                "HDR swapchain even on an SDR display (to exercise the path), FORCE_OFF keeps the",
                 "8-bit SDR swapchain. Takes effect on the next swapchain creation (resize or",
                 "fullscreen toggle), so a restart is not required."
             )
@@ -378,9 +314,7 @@ object IllusionConfig {
         DLSS_OUTPUT_HANDOVER = BUILDER
             .comment(
                 "Let the JVM own DLSS's output texture (the shipped path).",
-                "OFF makes the native DLL use its private output texture instead. That path is",
-                "kept as a fallback for diagnosis only: on some drivers NGX cannot write into it,",
-                "which shows up as a black world."
+                "OFF makes the native DLL use its private output texture instead."
             )
             .translation("dxr_mc.configuration.dlss.outputHandover")
             .define("outputHandover", true)
@@ -560,10 +494,10 @@ object IllusionConfig {
 
         VRS_SRI_TEMPORAL_CLAMP = BUILDER
             .comment(
-                "Never let a tile get coarser than it was in the previous frame's",
-                "shading-rate image. Stops edges from breathing under a static camera,",
-                "at the cost of keeping a tile at 1X1 for one frame after it gets finer",
-                "(and of one extra ping-pong image)."
+                "Require two consecutive compatible coarse candidates before a tile becomes coarse.",
+                "Candidate history is reprojected with the camera and raster jitter; missing",
+                "coverage stays 1X1. A fine tile can become coarse again after the next",
+                "stable candidate, rather than inheriting its final fine rate indefinitely."
             )
             .translation("dxr_mc.configuration.vrs.sriTemporalClamp")
             .define("sriTemporalClamp", true)
@@ -691,63 +625,11 @@ object IllusionConfig {
             .translation("dxr_mc.configuration.debug.temporalJitter")
             .define("temporalJitter", true)
 
-        SELF_TEST_SURFACE = BUILDER
-            .comment(
-                "Create, present and destroy a throw-away swap chain on the real window.",
-                "OFF by default: RTSS/Afterburner bind their overlay to the first presented swap",
-                "chain, so a self-test chain would steal it from the game for the whole session."
-            )
-            .translation("dxr_mc.configuration.debug.selfTestSurface")
-            .gameRestart()
-            .define("selfTestSurface", false)
-
-        SELF_TEST_MESH = BUILDER
-            .comment(
-                "Run the mesh-shader self-test (DXC compile, mesh PSO, DispatchMesh, read-back).",
-                "Proves the capability chain works; it compiles HLSL on the spot, so it does not",
-                "belong on the startup critical path."
-            )
-            .translation("dxr_mc.configuration.debug.selfTestMesh")
-            .gameRestart()
-            .define("selfTestMesh", false)
-
-        SELF_TEST_COMPUTE = BUILDER
-            .comment(
-                "Run the compute self-test (compile cs_6_8, create a compute PSO, dispatch",
-                "one thread group into a storage texture and read it back).",
-                "Proves the compute path that the shading-rate image and NRC build on;",
-                "it compiles HLSL on the spot, so it does not belong on the startup critical path."
-            )
-            .translation("dxr_mc.configuration.debug.selfTestCompute")
-            .gameRestart()
-            .define("selfTestCompute", false)
-
-        FAIL_DEVICE = BUILDER
-            .comment(
-                "Make device creation fail on purpose.",
-                "End-to-end test of the failure policy: no GL/Vulkan fallback, preferred graphics",
-                "backend reset, and a crash report that says why. Not for playing."
-            )
-            .translation("dxr_mc.configuration.debug.failDevice")
-            .gameRestart()
-            .define("failDevice", false)
-
-        MESH_DIAGNOSTICS = BUILDER
-            .comment(
-                "One-shot mesh read-back isolation test.",
-                "CLEAR writes a flat colour through a mesh dispatch and reads it back; PASS runs",
-                "the full mesh pass first. Tells 'the read-back path is broken' apart from 'the",
-                "pass never landed on the texture'."
-            )
-            .translation("dxr_mc.configuration.debug.meshDiagnostics")
-            .gameRestart()
-            .defineEnum("meshDiagnostics", MeshDiagnostics.NONE)
-
         NO_CRASH_POPUP = BUILDER
             .comment(
                 "Suppress the fatal-error dialog and only write the crash report.",
-                "For automated runs (self-tests, regressions): the dialog is modal and would wait",
-                "forever for a click nobody is there to make."
+                "For headless crash capture the dialog is modal and would wait forever for a click",
+                "nobody is there to make."
             )
             .translation("dxr_mc.configuration.debug.noCrashPopup")
             .define("noCrashPopup", false)

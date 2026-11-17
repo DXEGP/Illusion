@@ -32,6 +32,7 @@ class MCDRPipelineDesc {
         private val OFF_COLOR_COUNT: Long = off(MCDRLayout.PIPELINE_DESC, "colorCount")
         private val OFF_COLOR_TARGETS: Long = off(MCDRLayout.PIPELINE_DESC, "colorTargets")
         private val OFF_HAS_DEPTH: Long = off(MCDRLayout.PIPELINE_DESC, "hasDepth")
+        private val OFF_FLAGS: Long = off(MCDRLayout.PIPELINE_DESC, "pipelineFlags")
         private val OFF_DEPTH_STATE: Long = off(MCDRLayout.PIPELINE_DESC, "depth")
         private val OFF_TOPOLOGY: Long = off(MCDRLayout.PIPELINE_DESC, "topology")
         private val OFF_CULL: Long = off(MCDRLayout.PIPELINE_DESC, "cullEnabled")
@@ -134,6 +135,7 @@ class MCDRPipelineDesc {
     var vsBytes: ByteArray? = null
     var psBytes: ByteArray? = null
     var hasDepth: Boolean = false
+    var rasterMotion: Boolean = false
     var depthFormat: Int = 0
     var depthWrite: Boolean = false
     var depthCompareOp: Int = 0
@@ -207,7 +209,7 @@ class MCDRPipelineDesc {
 
         desc.set(MCDRLayout.I32, OFF_COLOR_COUNT, colorTargets.size)
         if (colorTargets.isNotEmpty()) {
-            val array = arena.allocate(MCDRLayout.COLOR_TARGET, colorTargets.size.toLong())
+            val array = arena.allocateFfmArray(colorTargets.size, MCDRLayout.COLOR_TARGET)
             for (i in 0 until colorTargets.size) {
                 writeColorTarget(array, i * MCDRLayout.COLOR_TARGET.byteSize(), colorTargets[i])
             }
@@ -215,6 +217,7 @@ class MCDRPipelineDesc {
         }
 
         desc.set(MCDRLayout.I32, OFF_HAS_DEPTH, if (hasDepth) 1 else 0)
+        desc.set(MCDRLayout.I32, OFF_FLAGS, if (rasterMotion) 1 else 0)
         if (hasDepth) {
             val d = OFF_DEPTH_STATE
             desc.set(MCDRLayout.I32, d + OFF_DS_FORMAT, depthFormat)
@@ -228,7 +231,7 @@ class MCDRPipelineDesc {
 
         desc.set(MCDRLayout.I32, OFF_ELEM_COUNT, inputElements.size)
         if (inputElements.isNotEmpty()) {
-            val array = arena.allocate(MCDRLayout.INPUT_ELEMENT, inputElements.size.toLong())
+            val array = arena.allocateFfmArray(inputElements.size, MCDRLayout.INPUT_ELEMENT)
             val stride = MCDRLayout.INPUT_ELEMENT.byteSize()
             for (i in 0 until inputElements.size) {
                 writeInputElement(arena, array, i * stride, inputElements[i])
@@ -238,7 +241,7 @@ class MCDRPipelineDesc {
 
         desc.set(MCDRLayout.I32, OFF_BINDING_COUNT, bindings.size)
         if (bindings.isNotEmpty()) {
-            val array = arena.allocate(MCDRLayout.PIPELINE_BINDING, bindings.size.toLong())
+            val array = arena.allocateFfmArray(bindings.size, MCDRLayout.PIPELINE_BINDING)
             val stride = MCDRLayout.PIPELINE_BINDING.byteSize()
             for (i in 0 until bindings.size) {
                 val base = i * stride

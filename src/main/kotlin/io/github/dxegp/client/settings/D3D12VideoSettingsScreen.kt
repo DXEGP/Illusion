@@ -1,6 +1,7 @@
 package io.github.dxegp.client.settings
 
 import io.github.dxegp.render.presentation.D3D12HdrPresentation
+import io.github.dxegp.render.config.RenderConfiguration
 import net.minecraft.client.Minecraft
 import net.minecraft.client.OptionInstance
 import net.minecraft.client.gui.GuiGraphicsExtractor
@@ -35,6 +36,8 @@ class D3D12VideoSettingsScreen @JvmOverloads constructor(
 
     /** 打开界面时的取值，撤销写回用。 */
     private val baseline: IdentityHashMap<OptionInstance<*>, Any?> = IdentityHashMap()
+    private var applyingConfiguration = false
+    private var configurationFailure: RenderConfiguration.Outcome? = null
 
     private var page = 0
     private var scroll = 0.0
@@ -310,7 +313,7 @@ class D3D12VideoSettingsScreen @JvmOverloads constructor(
             buttonWidth,
             D3D12Widget.DEFAULT_HEIGHT,
             { translatable(if (hasChanges()) "dxr_mc.video.apply" else "dxr_mc.video.done") },
-            { true },
+            { !applyingConfiguration },
             {
                 if (hasChanges()) {
                     apply()
@@ -345,20 +348,31 @@ class D3D12VideoSettingsScreen @JvmOverloads constructor(
 
     /** 应用：暂存值一次性写回 [OptionInstance]（到这一步才真正重建渲染目标、开关 DLSS），然后落盘。 */
     private fun apply() {
+        if (applyingConfiguration) return
         val opts = Minecraft.getInstance().options
         val presetRow = optionRows.firstOrNull { it.first === opts.graphicsPreset() }?.second
         val presetChanged = presetRow?.hasPendingChange() == true
-        for ([_, widget] in optionRows) {
-            widget.commitPending()
+        applyingConfiguration = true
+        configurationFailure = null
+        RenderConfiguration.submitSettings({
+            for ([option, widget] in optionRows) {
+                if (RenderConfiguration.ownsOption(option)) widget.commitPending()
+            }
+        }) { outcome ->
+            applyingConfiguration = false
+            when (outcome) {
+                is RenderConfiguration.Outcome.Published, RenderConfiguration.Outcome.AwaitingWorld -> {
+                    for ([option, widget] in optionRows) {
+                        if (!RenderConfiguration.ownsOption(option)) widget.commitPending()
+                    }
+                    if (presetChanged) opts.applyGraphicsPreset(opts.graphicsPreset().get())
+                    minecraft.options.save()
+                    snapshotBaseline()
+                    if (outcome == RenderConfiguration.Outcome.AwaitingWorld) configurationFailure = outcome
+                }
+                else -> configurationFailure = outcome
+            }
         }
-        // 画质预设与抗锯齿的联动必须在"应用"之后显式补一次：`OptionInstance.set` 只写取值，原版是靠
-        // `Options.applyGraphicsPreset(...)` 触发 `GraphicsPreset.apply`，我们的自绘界面绕过了那段。
-        if (presetChanged) {
-            opts.applyGraphicsPreset(opts.graphicsPreset().get())
-        }
-
-        minecraft.options.save()
-        snapshotBaseline()
     }
 
     private fun undo() {
@@ -404,15 +418,21 @@ class D3D12VideoSettingsScreen @JvmOverloads constructor(
         widgets.forEach { it.render(renderer, mouseX, mouseY, partialTick) }
         drawTooltip(renderer, mouseX, mouseY)
 
-        if (restartPending()) {
+        if (restartPending() || configurationFailure != null || RenderConfiguration.awaitingWorld()) {
             // 提示行是常驻预留的（见 init 里的 contentBottom）；再夹一道横向裁剪，小窗 + 中文长句时宁可截断。
             val hintY = contentBottom + (HINT_LINE - 8) / 2
             renderer.enableScissor(contentLeft, contentBottom, contentRight, contentBottom + HINT_LINE)
             renderer.text(
-                translatable("options.restartRequired"),
+                when {
+                    configurationFailure == RenderConfiguration.Outcome.PreparationFailed ->
+                        translatable("dxr_mc.video.configuration_failed")
+                    configurationFailure == RenderConfiguration.Outcome.AwaitingWorld || RenderConfiguration.awaitingWorld() ->
+                        translatable("dxr_mc.video.configuration_waiting_world")
+                    else -> translatable("options.restartRequired")
+                },
                 contentLeft + 6,
                 hintY,
-                D3D12Widget.RED,
+                if (RenderConfiguration.awaitingWorld()) D3D12Widget.WHITE else D3D12Widget.RED,
             )
             renderer.disableScissor()
         }
@@ -541,7 +561,8 @@ class D3D12VideoSettingsScreen @JvmOverloads constructor(
         }
     }
     private fun restartPending(): Boolean =
-        D3D12HdrPresentation.isRestartPending() || minecraft.options.isRestartRequiredToApplyVideoSettings()
+        configurationFailure == RenderConfiguration.Outcome.RestartRequired ||
+            D3D12HdrPresentation.isRestartPending() || minecraft.options.isRestartRequiredToApplyVideoSettings()
 
     override fun mouseClicked(event: MouseButtonEvent, doubleClick: Boolean): Boolean {
         val mouseX = event.x
@@ -669,7 +690,11 @@ class D3D12VideoSettingsScreen @JvmOverloads constructor(
     }
 
     override fun removed() {
-        minecraft.options.save()
+        if (applyingConfiguration) {
+            RenderConfiguration.cancelSubmission()
+            applyingConfiguration = false
+        }
+        if (!applyingConfiguration) minecraft.options.save()
     }
 
     private companion object {

@@ -2,6 +2,11 @@ package io.github.dxegp.render.temporal
 
 import io.github.dxegp.render.antialiasing.D3D12TAA
 import io.github.dxegp.render.frameprep.MotionCoverage
+import io.github.dxegp.render.frameprep.MotionGuideCoverage
+import io.github.dxegp.render.frame.vanilla.VanillaFrameCoordinator
+import io.github.dxegp.render.frame.vanilla.VanillaFrameInputResources
+import io.github.dxegp.render.frame.vanilla.VanillaFrameInputs
+import io.github.dxegp.render.reconstruction.ReconstructionFrameInputs
 
 import com.mojang.renderpearl.api.GpuFormat
 import com.mojang.renderpearl.api.buffers.GpuBuffer
@@ -15,6 +20,7 @@ import io.github.dxegp.d3d12.surface.D3D12GpuSurface
 import io.github.dxegp.d3d12.resource.D3D12GpuBuffer
 import io.github.dxegp.d3d12.resource.D3D12GpuTexture
 import io.github.dxegp.d3d12.resource.D3D12GpuTextureView
+import io.github.dxegp.d3d12.shader.D3D12RasterMotionTuple
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import net.minecraft.client.Minecraft
@@ -22,7 +28,8 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
 /**
- * Full-screen velocity pass: camera reprojection plus approximate entity translation in AABBs.
+ * Full-screen velocity composition: covered CPU entity models use raster guides; remaining pixels
+ * use camera reprojection. The legacy path without a raster target uses entity translation in AABBs.
  *
  * Raw ABI pipeline (`MCDRPipelineDesc` takes HLSL directly; SM 6.9 / DXIL required, no SM 5.1
  * fallback). Bindings: entry 0 = CBV `register(b0)`, 256 B; entry 1 = depth SRV + static sampler
@@ -47,7 +54,29 @@ private const val STEP_DEPTH_VIEW: Int = 2
     /** [abandonedSteps] bit: the velocity pipeline failed to create, bind or draw. */
 private const val STEP_PIPELINE: Int = 4
 
+internal class OpaqueMotionInputs(
+    val frame: VanillaFrameInputs,
+    val motion: D3D12GpuTexture,
+    val coverage: D3D12GpuTexture,
+    val guideCoverage: MotionGuideCoverage,
+)
+
 object D3D12Velocity {
+    private enum class MotionPhase { OPAQUE, FINAL }
+
+    private class MotionSources(
+        val frame: VanillaFrameInputs,
+        val phase: MotionPhase,
+        val depth: D3D12GpuTexture,
+        val raster: D3D12GpuTextureView?,
+    )
+
+    private class OpaqueTargets(val motion: D3D12GpuTexture, val coverage: D3D12GpuTexture) : AutoCloseable {
+        override fun close() {
+            try { motion.close() } finally { coverage.close() }
+        }
+    }
+
     private val LOGGER: Logger = LoggerFactory.getLogger("dxrmc-velocity")
 
     /** Two half floats of pixel motion (native ordinal 41). */
@@ -78,9 +107,6 @@ object D3D12Velocity {
     /** Per-object motion cap in pixels; a larger delta means the row matched the wrong object (fall back). */
     private const val OBJECT_MAX_MOTION_PIXELS: Float = 128.0f
 
-    /** Camera-translation fallback when there is no previous camera yet. */
-    private val CAMERA_DELTA_NONE: FloatArray = floatArrayOf(0.0f, 0.0f, 0.0f)
-
     /** [recordedFrame] sentinel: nothing recorded yet. */
     private const val FRAME_NONE: Long = -1L
 
@@ -91,6 +117,12 @@ object D3D12Velocity {
     /** Ping-pong textures: `current` is written this frame, `previous` is the last frame's result. */
     private var current: D3D12GpuTexture? = null
     private var previous: D3D12GpuTexture? = null
+    private var currentCoverage: D3D12GpuTexture? = null
+    private var previousCoverage: D3D12GpuTexture? = null
+    private var opaqueTargets: OpaqueTargets? = null
+    private var opaqueSources: MotionSources? = null
+    private var opaqueDepthView: D3D12GpuTextureView? = null
+    private var opaqueDepthViewFor: Long = 0L
     private var previousReady = false
     private var uploadOwner: io.github.dxegp.d3d12.command.D3D12CommandEncoderBackend? = null
     private var width: Int = 0
@@ -124,7 +156,7 @@ object D3D12Velocity {
     private var depthView: D3D12GpuTextureView? = null
     private var depthViewFor: Long = 0L
 
-    private var frameIndex: Long = 0L
+    private var previousRecordedFrame: Long = FRAME_NONE
 
     /** Last recorded frame. DLSS records early, so the later call from `blitFromTexture` must short-circuit. */
     private var recordedFrame: Long = FRAME_NONE
@@ -140,7 +172,8 @@ object D3D12Velocity {
     private var abandonedSteps: Int = 0
 
     /** Whether recording is allowed; the temporal master switch must be on as well (TAA consumes vectors too). */
-    fun isActive(): Boolean = (enabled || D3D12TAA.isSelected()) && D3D12Temporal.isActive()
+    fun isActive(): Boolean = (enabled || D3D12TAA.isSelected() ||
+        io.github.dxegp.render.presentation.framegen.FrameGeneration.isEnabled()) && D3D12Temporal.isActive()
 
     /** Latched off: [disable] ran, or a build step was abandoned (DLSS uses this to decide on a retry). */
     @Synchronized
@@ -153,42 +186,64 @@ object D3D12Velocity {
         reset()
         abandonedSteps = 0
         pipelineError = null
-        if (pipeline != 0L) MCDR_ABI.ID3D12DestroyResource(pipeline)
+        if (pipeline != 0L) MCDR_ABI.D3D12DestroyPipeline(pipeline)
         pipeline = 0L
         return hadLatch
     }
 
     /** This frame's velocity texture handle (0 = not built). */
     @Synchronized
-    fun currentHandle(): Long = if (recordedFrame == frameIndex) this.current?.handle() ?: 0L else 0L
+    fun currentHandle(): Long = if (isActive() &&
+        recordedFrame == VanillaFrameCoordinator.currentFrame()?.identity?.realFrameId)
+        this.current?.handle() ?: 0L else 0L
 
-    internal fun motionCoverage(): MotionCoverage = if (objectCount > 0)
-        MotionCoverage.CAMERA_WITH_ENTITY_TRANSLATION_APPROXIMATION else MotionCoverage.CAMERA_REPROJECTION
+    internal fun currentTexture(): D3D12GpuTexture? = current?.takeIf {
+        isActive() && recordedFrame == VanillaFrameCoordinator.currentFrame()?.identity?.realFrameId
+    }
+
+    @Synchronized
+    fun currentCoverageHandle(): Long = if (isActive() &&
+        recordedFrame == VanillaFrameCoordinator.currentFrame()?.identity?.realFrameId)
+        currentCoverage?.handle() ?: 0L else 0L
+
+    internal fun motionCoverage(): MotionCoverage = when {
+        D3D12RasterMotion.view() != null -> MotionCoverage.CAMERA_WITH_RASTER_ENTITY_MODELS
+        objectCount > 0 -> MotionCoverage.CAMERA_WITH_ENTITY_TRANSLATION_APPROXIMATION
+        else -> MotionCoverage.CAMERA_REPROJECTION
+    }
+
+    internal fun motionGuideCoverage(): MotionGuideCoverage = if (D3D12RasterMotion.view() != null)
+        MotionGuideCoverage.CPU_ENTITY_MODEL_RASTER_PARTIAL else D3D12ObjectMotion.motionGuideCoverage()
 
     /** Diagnostic one-liner for "why is there no motion texture" (the caller rate-limits it). */
     @Synchronized
     fun debugState(): String {
-        return "frame=$frameIndex recorded=$recordedFrame current=${current != null}" +
+        return "frame=${VanillaFrameCoordinator.currentFrame()?.identity?.realFrameId} recorded=$recordedFrame current=${current != null}" +
             " previous=${previous != null} abandoned=$abandonedSteps latch=$disabledReason" +
             " active=${isActive()} enabled=$enabled temporal=${D3D12Temporal.isActive()}"
     }
 
     /** This frame's motion SRV for the TAA resolve; null = no data yet. */
     @Synchronized
-    fun currentMotionView(): D3D12GpuTextureView? = if (recordedFrame != frameIndex || this.current == null) null else this.currentView
+    fun currentMotionView(): D3D12GpuTextureView? = if (recordedFrame != VanillaFrameCoordinator.currentFrame()?.identity?.realFrameId || this.current == null) null else this.currentView
 
     /** Previous frame's velocity texture handle (0 = no history). */
     @Synchronized
-    fun previousHandle(): Long = if (previousReady) this.previous?.handle() ?: 0L else 0L
+    fun previousHandle(): Long = if (hasPreviousFrame()) this.previous?.handle() ?: 0L else 0L
 
     /** Previous frame's motion SRV (the VRS motion test); null = no history, the caller skips this frame. */
     @Synchronized
-    fun previousMotionView(): D3D12GpuTextureView? = if (!previousReady || this.previous == null) null else this.previousView
+    fun previousMotionView(): D3D12GpuTextureView? = if (!hasPreviousFrame() || this.previous == null) null else this.previousView
 
-    /** Releases everything (device shutdown / world exit / self-check). */
+    private fun hasPreviousFrame(): Boolean {
+        val frame = VanillaFrameCoordinator.currentFrame() ?: return false
+        return previousReady && frame.previous != null && previousRecordedFrame == frame.identity.realFrameId - 1L
+    }
+
+    /** Releases everything (device shutdown / world exit). */
     @Synchronized
     fun reset() {
-        frameIndex = 0L
+        previousRecordedFrame = FRAME_NONE
         recordedFrame = FRAME_NONE
         disabledReason = null
         releaseResources()
@@ -197,38 +252,68 @@ object D3D12Velocity {
     /** Per-frame ping-pong: the texture written this frame becomes "previous". */
     @Synchronized
     fun beginFrame() {
+        opaqueSources = null
         if (!isActive()) {
             previousReady = false
             return
         }
-        previousReady = recordedFrame == frameIndex && current != null
+        previousReady = current != null
+        previousRecordedFrame = recordedFrame
         val swap = this.previous
         this.previous = this.current
         this.current = swap
         val swapView = this.previousView
         this.previousView = this.currentView
         this.currentView = swapView
-        frameIndex++
+        val swapCoverage = previousCoverage
+        previousCoverage = currentCoverage
+        currentCoverage = swapCoverage
     }
 
     /** Records the pass right before the blit, while the frame is fully drawn and the depth valid; true = really recorded. */
     @Synchronized
     fun record(ctx: Long, device: D3D12Device?): Boolean {
+        if (!isActive()) return false
+        val frame = VanillaFrameCoordinator.currentFrame() ?: return false
+        val depth = ReconstructionFrameInputs.capturedDepth()
+            ?: (Minecraft.getInstance().gameRenderer.mainRenderTarget().depthTexture as? D3D12GpuTexture)
+            ?: return false
+        return recordMotion(ctx, device, MotionSources(frame, MotionPhase.FINAL, depth, D3D12RasterMotion.view()))
+    }
+
+    @Synchronized
+    internal fun recordOpaque(ctx: Long, device: D3D12Device?, depth: D3D12GpuTexture,
+        raster: D3D12GpuTextureView?): OpaqueMotionInputs? {
+        val frame = VanillaFrameCoordinator.currentFrame() ?: return null
+        if (!recordMotion(ctx, device, MotionSources(frame, MotionPhase.OPAQUE, depth, raster))) return null
+        val targets = checkNotNull(opaqueTargets)
+        return OpaqueMotionInputs(frame, targets.motion, targets.coverage,
+            if (frame.previous == null) MotionGuideCoverage.INVALID
+            else if (raster != null) MotionGuideCoverage.CPU_ENTITY_MODEL_RASTER_PARTIAL
+            else D3D12ObjectMotion.motionGuideCoverage())
+    }
+
+    private fun recordMotion(ctx: Long, device: D3D12Device?, sources: MotionSources): Boolean {
         if (!isActive()) {
             return false
         }
-        // While latched: short-circuit. A probe leaves no residue, since a successful step stops creating.
+        // While latched: short-circuit. A failed step leaves no residue, since a successful step stops creating.
         if (abandonedSteps != 0) {
             return false
         }
         // Already recorded this frame (DLSS' hook runs before the blit): the earlier data is the valid one.
-        if (this.recordedFrame == this.frameIndex) {
-            return this.current != null
+        val frame = sources.frame
+        check(frame === VanillaFrameCoordinator.currentFrame()) { "Motion inputs belong to another world frame" }
+        if (sources.phase == MotionPhase.FINAL && this.recordedFrame == frame.identity.realFrameId) {
+            return this.current != null && currentCoverage != null
         }
-        val minecraft = Minecraft.getInstance()
-        // The main target lives on `GameRenderer`, not on `Minecraft`.
-        val target = minecraft.gameRenderer.mainRenderTarget()
-        val depth = target.depthTexture as? D3D12GpuTexture ?: return false
+        if (sources.phase == MotionPhase.OPAQUE && opaqueSources?.frame === frame) {
+            check(opaqueSources?.depth === sources.depth && opaqueSources?.raster === sources.raster) {
+                "Opaque motion sources changed after recording"
+            }
+            return opaqueTargets != null
+        }
+        val depth = sources.depth
         if (depth.isClosed()) {
             return false
         }
@@ -237,15 +322,12 @@ object D3D12Velocity {
         if (w <= 0 || h <= 0) {
             return false
         }
-        // Camera view matrices come from the terrain `ChunkSection` records (see [D3D12Temporal]).
-        val view = D3D12Temporal.currentCameraView()
-        val previousView = D3D12Temporal.previousCameraView()
-        val curProjection = D3D12Temporal.currentProjection()
-        val prevProjection = D3D12Temporal.previousProjection()
-        if (view == null || previousView == null || curProjection == null || prevProjection == null) {
-            // First frame (no history) or nothing was drawn: skip, the texture keeps its old content.
-            return false
-        }
+        val camera = frame.current
+        val previousCamera = frame.previous ?: if (sources.phase == MotionPhase.OPAQUE) camera else return false
+        if (w != frame.identity.width || h != frame.identity.height) return false
+        val view = camera.viewRotation()
+        val previousView = previousCamera.viewRotation()
+        val prevProjection = previousCamera.projection()
         if (device == null) {
             return false
         }
@@ -255,12 +337,22 @@ object D3D12Velocity {
         if (!ensureResources(device, w, h)) {
             return false
         }
+        if (sources.phase == MotionPhase.OPAQUE && opaqueTargets == null) {
+            val motion = D3D12GpuTexture(USAGE, "Opaque velocity", FORMAT, w, h, 1, 1)
+            val coverage = try {
+                D3D12GpuTexture(USAGE, "Opaque motion coverage", GpuFormat.R8_UNORM, w, h, 1, 1)
+            } catch (failure: Throwable) {
+                try { motion.close() } catch (cleanup: Throwable) { failure.addSuppressed(cleanup) }
+                throw failure
+            }
+            opaqueTargets = OpaqueTargets(motion, coverage)
+        }
         val encoder = D3D12Device.sharedCommandEncoder() ?: return false
         check(encoder.nativeHandle() == ctx) { "Velocity upload owner differs from recording context" }
         if (uploadOwner == null) {
             encoder.retainUntilCommandsClosed(AutoCloseable {
                 reset()
-                if (pipeline != 0L) MCDR_ABI.ID3D12DestroyResource(pipeline)
+                if (pipeline != 0L) MCDR_ABI.D3D12DestroyPipeline(pipeline)
                 pipeline = 0L
                 pipelineError = null
                 uploadOwner = null
@@ -268,86 +360,141 @@ object D3D12Velocity {
             uploadOwner = encoder
         }
         check(uploadOwner === encoder) { "Velocity resources changed command owner" }
+        if (sources.phase == MotionPhase.OPAQUE && frame.previous == null) {
+            val targets = checkNotNull(opaqueTargets)
+            val uses = listOf(targets.motion, targets.coverage).map {
+                VanillaFrameInputResources.texture(it.handle(), frame.identity.resourceVersion, 2,
+                    VanillaFrameInputResources.STATE_RENDER_TARGET)
+            }
+            VanillaFrameCoordinator.declaredPass(ctx, VanillaFrameInputResources.OPAQUE_VELOCITY_PASS, uses,
+                graphicsEffects = 0) {
+                MCDR_ABI.D3D12ClearColorTexture(ctx, targets.motion.handle(), 0f, 0f, 0f, 0f)
+                MCDR_ABI.D3D12ClearColorTexture(ctx, targets.coverage.handle(), 0f, 0f, 0f, 0f)
+            }
+            opaqueSources = sources
+            return true
+        }
         val memory = encoder.transientMemory()
         uniform = memory.allocateGpuMapped(CBV_SIZE, 256L, GpuBuffer.USAGE_UNIFORM, 0L, 1L).use { it.slice() }
         objects = memory.allocateGpuMapped(OBJECT_BYTES, 256L,
             GpuBuffer.USAGE_UNIFORM_TEXEL_BUFFER, 0L, 4L).use { it.slice() }
         val uniformBuffer = this.uniform ?: return false
-        val color = this.current ?: return false
-        if (!ensureDepthView(depth)) {
+        val color = when (sources.phase) {
+            MotionPhase.FINAL -> this.current
+            MotionPhase.OPAQUE -> opaqueTargets?.motion
+        } ?: return false
+        val coverage = when (sources.phase) {
+            MotionPhase.FINAL -> currentCoverage
+            MotionPhase.OPAQUE -> opaqueTargets?.coverage
+        } ?: return false
+        if (!ensureDepthView(depth, sources.phase)) {
             return false
         }
-        val depthSrv = this.depthView ?: return false
+        val depthSrv = when (sources.phase) {
+            MotionPhase.FINAL -> depthView
+            MotionPhase.OPAQUE -> opaqueDepthView
+        } ?: return false
 
         // Use the same jittered matrix the depth was rendered with, else half a pixel of systematic error.
-        val jittered = D3D12Temporal.jitterProjection(curProjection,
-            D3D12Temporal.clipJitterX(w), D3D12Temporal.clipJitterY(h))
+        val jittered = camera.rasterProjection()
         val currViewProj = D3D12Temporal.multiply(jittered, view)
         val prevViewProj = D3D12Temporal.multiply(prevProjection, previousView)
         val invCurr = invert(currViewProj) ?: return false
         // Object rows: the pass answers "where was this pixel last frame", and the snapshot taken by this
         // frame's extract is exactly that "previous frame" (which is why the roll happens in writeWorldRows).
-        val rows = uploadObjects()
+        val rows = if (sources.raster != null) {
+            objectCount = 0
+            0
+        } else uploadObjects()
         // The shader emits an unjittered vector: it compensates the current projection jitter and does
         // not add previous jitter. The previous value remains in the ABI block for diagnostics/consumers.
-        val jitter = D3D12Temporal.jitter()
-        val prevJitter = D3D12Temporal.previousJitter()
+        val jitter = doubleArrayOf(camera.jitterX, camera.jitterY)
+        val prevJitter = doubleArrayOf(previousCamera.jitterX, previousCamera.jitterY)
         // Camera-translation term: the reprojected position is relative to this frame's camera while
         // PrevViewProj carries rotation only, so without it all parallax from moving is lost.
-        val camDelta = D3D12Temporal.cameraDelta() ?: CAMERA_DELTA_NONE
+        val camDelta = floatArrayOf((camera.originX - previousCamera.originX).toFloat(),
+            (camera.originY - previousCamera.originY).toFloat(), (camera.originZ - previousCamera.originZ).toFloat())
         if (!writeParameters(uniformBuffer, prevViewProj, invCurr, w, h, rows,
                 jitter[0].toFloat(), jitter[1].toFloat(),
                 prevJitter[0].toFloat(), prevJitter[1].toFloat(),
-                camDelta[0], camDelta[1], camDelta[2])) {
+                camDelta[0], camDelta[1], camDelta[2], sources.raster)) {
             return false
         }
 
-        MCDR_ABI.D3D12BeginRenderPass(ctx, longArrayOf(color.handle()), intArrayOf(0),
-            byteArrayOf(1), floatArrayOf(0.0f, 0.0f, 0.0f, 0.0f),
-            0L, 0, 0.toByte(), 0.0, 0, 0, w, h)
-        // Viewport / scissor are command-list state and must be set for every pass.
-        MCDR_ABI.D3D12SetViewport(ctx, 0, 0, w, h)
-        MCDR_ABI.D3D12SetScissor(ctx, 0, 0, w, h)
-        if (!MCDR_ABI.D3D12SetPipeline(ctx, this.pipeline, false)) {
-            disable("dx12SetPipeline failed: ${MCDR_ABI.D3D12LastError()}", STEP_PIPELINE)
-            MCDR_ABI.D3D12EndRenderPass(ctx)
-            return false
+        val objectBuffer = this.objects ?: return false
+        val rasterGuide = sources.raster
+        val rasterSrv = rasterGuide ?: depthSrv
+        val version = VanillaFrameCoordinator.currentResourceVersion() ?: 1L
+        val uses = listOf(
+            VanillaFrameInputResources.texture(color.handle(), version, 2,
+                VanillaFrameInputResources.STATE_RENDER_TARGET, VanillaFrameInputResources.STATE_COMMON),
+            VanillaFrameInputResources.texture(coverage.handle(), version, 2,
+                VanillaFrameInputResources.STATE_RENDER_TARGET, VanillaFrameInputResources.STATE_COMMON),
+            VanillaFrameInputResources.texture(depth.handle(), version, 1,
+                VanillaFrameInputResources.STATE_SHADER_RESOURCE),
+        ) + (if (rasterGuide != null) listOf(
+            VanillaFrameInputResources.texture((rasterGuide.texture() as D3D12GpuTexture).handle(), version, 1,
+                VanillaFrameInputResources.STATE_SHADER_RESOURCE)) else emptyList()) +
+            VanillaFrameInputResources.velocityBuffers(uniformBuffer, objectBuffer, version)
+        val pass = when (sources.phase) {
+            MotionPhase.FINAL -> VanillaFrameInputResources.VELOCITY_PASS
+            MotionPhase.OPAQUE -> VanillaFrameInputResources.OPAQUE_VELOCITY_PASS
         }
-        // `t2` = object rows; the array order matches register(t1)/register(t2) through the binding table.
-        val objectBuffer = this.objects
-        val pushed = MCDR_ABI.D3D12PushDescriptors(ctx,
-            intArrayOf(0, 1, 2),
-            longArrayOf((uniformBuffer.buffer() as D3D12GpuBuffer).handle(), 0L,
-                if (objectBuffer == null) 0L else (objectBuffer.buffer() as D3D12GpuBuffer).handle()),
-            longArrayOf(uniformBuffer.offset(), 0L, objectBuffer?.offset() ?: 0L),
-            longArrayOf(CBV_SIZE, 0L, OBJECT_BYTES),
-            intArrayOf(0, 0, OBJECT_FORMAT.ordinal),
-            longArrayOf(0L, depthSrv.handle(), 0L))
-        if (!pushed) {
-            disable("dx12PushDescriptors failed: ${MCDR_ABI.D3D12LastError()}", STEP_PIPELINE)
+        val recorded = VanillaFrameCoordinator.declaredPass(ctx, pass, uses) {
+            MCDR_ABI.D3D12BeginRenderPass(ctx, longArrayOf(color.handle(), coverage.handle()), intArrayOf(0, 0),
+                byteArrayOf(1, 1), FloatArray(8),
+                0L, 0, 0.toByte(), 0.0, 0, 0, w, h)
+            // Viewport / scissor are command-list state and must be set for every pass.
+            MCDR_ABI.D3D12SetViewport(ctx, 0, 0, w, h)
+            MCDR_ABI.D3D12SetScissor(ctx, 0, 0, w, h)
+            if (!MCDR_ABI.D3D12SetPipeline(ctx, this.pipeline, false)) {
+                disable("dx12SetPipeline failed: ${MCDR_ABI.D3D12LastError()}", STEP_PIPELINE)
+                MCDR_ABI.D3D12EndRenderPass(ctx)
+                return@declaredPass false
+            }
+            // `t2` = object rows; the array order matches register(t1)/register(t2) through the binding table.
+            val pushed = MCDR_ABI.D3D12PushDescriptors(ctx,
+                intArrayOf(0, 1, 2, 1),
+                longArrayOf((uniformBuffer.buffer() as D3D12GpuBuffer).handle(), 0L,
+                    (objectBuffer.buffer() as D3D12GpuBuffer).handle(), 0L),
+                longArrayOf(uniformBuffer.offset(), 0L, objectBuffer.offset(), 0L),
+                longArrayOf(CBV_SIZE, 0L, OBJECT_BYTES, 0L),
+                intArrayOf(0, 0, OBJECT_FORMAT.ordinal, 0),
+                longArrayOf(0L, depthSrv.handle(), 0L, rasterSrv.handle()))
+            if (!pushed) {
+                disable("dx12PushDescriptors failed: ${MCDR_ABI.D3D12LastError()}", STEP_PIPELINE)
+                MCDR_ABI.D3D12EndRenderPass(ctx)
+                return@declaredPass false
+            }
+            if (!MCDR_ABI.D3D12Draw(ctx, 3, 1, 0, 0)) {
+                disable("dx12Draw failed: ${MCDR_ABI.D3D12LastError()}", STEP_PIPELINE)
+                MCDR_ABI.D3D12EndRenderPass(ctx)
+                return@declaredPass false
+            }
             MCDR_ABI.D3D12EndRenderPass(ctx)
-            return false
+            true
         }
-        if (!MCDR_ABI.D3D12Draw(ctx, 3, 1, 0, 0)) {
-            disable("dx12Draw failed: ${MCDR_ABI.D3D12LastError()}", STEP_PIPELINE)
-            MCDR_ABI.D3D12EndRenderPass(ctx)
-            return false
-        }
-        MCDR_ABI.D3D12EndRenderPass(ctx)
+        if (!recorded) return false
         // Remember the recording so the second call in the same frame short-circuits (see [recordedFrame]).
-        recordedFrame = frameIndex
+        when (sources.phase) {
+            MotionPhase.FINAL -> recordedFrame = frame.identity.realFrameId
+            MotionPhase.OPAQUE -> opaqueSources = sources
+        }
         return true
     }
 
     /** Allocates the ping-pong textures plus their views, the parameter block and the object rows. */
     private fun ensureResources(device: D3D12Device, w: Int, h: Int): Boolean {
-        if (this.current != null && this.previous != null && this.width == w && this.height == h) {
+        if (this.current != null && this.previous != null && currentCoverage != null && previousCoverage != null &&
+            this.width == w && this.height == h) {
             return true
         }
         releaseResources()
         return try {
             this.current = D3D12GpuTexture(USAGE, "DXRMC velocity", FORMAT, w, h, 1, 1)
             this.previous = D3D12GpuTexture(USAGE, "DXRMC velocity (previous)", FORMAT, w, h, 1, 1)
+            currentCoverage = D3D12GpuTexture(USAGE, "World motion coverage", GpuFormat.R8_UNORM, w, h, 1, 1)
+            previousCoverage = D3D12GpuTexture(USAGE, "World motion coverage (previous)", GpuFormat.R8_UNORM, w, h, 1, 1)
             this.currentView = D3D12GpuTextureView(this.current!!, 0, 1)
             this.previousView = D3D12GpuTextureView(this.previous!!, 0, 1)
             // Declared as returning `GpuBuffer`; cast back to the implementation for the native handle.
@@ -365,8 +512,17 @@ object D3D12Velocity {
     }
 
     /** Depth SRV (built once per texture; rebuilt automatically after the main target is recreated). */
-    private fun ensureDepthView(depth: D3D12GpuTexture): Boolean {
+    private fun ensureDepthView(depth: D3D12GpuTexture, phase: MotionPhase): Boolean {
         val handle = depth.handle()
+        if (phase == MotionPhase.OPAQUE) {
+            if (opaqueDepthView != null && opaqueDepthViewFor == handle) return true
+            opaqueDepthView?.close()
+            opaqueDepthView = null
+            opaqueDepthViewFor = 0L
+            opaqueDepthView = D3D12GpuTextureView(depth, 0, 1)
+            opaqueDepthViewFor = handle
+            return true
+        }
         if (this.depthView != null && this.depthViewFor == handle) {
             return true
         }
@@ -400,9 +556,11 @@ object D3D12Velocity {
             .addColorTarget(MCDRPipelineDesc.ColorTarget()
                 .format(FORMAT.ordinal)
                 .writeMask(WRITE_MASK_RG))
+            .addColorTarget(MCDRPipelineDesc.ColorTarget().format(GpuFormat.R8_UNORM.ordinal).writeMask(1))
             .addBinding(0, 0)   // CBV -> register(b0)
             .addBinding(1, 1)   // SRV + static sampler -> register(t1)/(s1)
             .addBinding(2, 2)   // object rows -> register(t2) (texel buffer, no sampler)
+            .addBinding(1, 3)
         val handle = MCDR_ABI.D3D12CreateGraphicsPipeline(desc)
         if (handle == 0L) {
             this.pipelineError = MCDR_ABI.D3D12LastError()
@@ -426,9 +584,9 @@ object D3D12Velocity {
             return 0
         }
         // Rows are world-space: subtract *this* frame's camera (another frame's would bake camera motion in).
-        val camera = Minecraft.getInstance().gameRenderer.mainCamera().position()
+        val camera = VanillaFrameCoordinator.currentFrame()?.current ?: return 0
         val rows = try {
-            D3D12ObjectMotion.writeWorldRows(this.objectScratch, camera.x, camera.y, camera.z)
+            D3D12ObjectMotion.writeWorldRows(this.objectScratch, camera.originX, camera.originY, camera.originZ)
         } catch (t: Throwable) {
             LOGGER.warn("velocity: object row read failed — {}", t.toString())
             0
@@ -460,7 +618,7 @@ object D3D12Velocity {
     private fun writeParameters(buffer: GpuBufferSlice, prevViewProj: FloatArray,
         invCurrViewProj: FloatArray, w: Int, h: Int, rows: Int,
         jitterX: Float, jitterY: Float, prevJitterX: Float, prevJitterY: Float,
-        camDeltaX: Float, camDeltaY: Float, camDeltaZ: Float): Boolean {
+        camDeltaX: Float, camDeltaY: Float, camDeltaZ: Float, raster: D3D12GpuTextureView?): Boolean {
         return try {
             buffer.map(false, true).use { view ->
                 val fb: FloatBuffer = view.data().order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
@@ -477,6 +635,7 @@ object D3D12Velocity {
                 fb.put(camDeltaX)
                 fb.put(camDeltaY)
                 fb.put(camDeltaZ)
+                fb.put(if (raster != null) 1f else 0f)
                 // Pad to 256 B = 64 floats.
                 while (fb.position() < 64) {
                     fb.put(0.0f)
@@ -575,6 +734,12 @@ object D3D12Velocity {
 
     private fun releaseResources() {
         previousReady = false
+        opaqueSources = null
+        opaqueDepthView?.close()
+        opaqueDepthView = null
+        opaqueDepthViewFor = 0L
+        opaqueTargets?.close()
+        opaqueTargets = null
         this.currentView?.close()
         this.currentView = null
         this.previousView?.close()
@@ -583,6 +748,10 @@ object D3D12Velocity {
         this.current = null
         this.previous?.close()
         this.previous = null
+        currentCoverage?.close()
+        currentCoverage = null
+        previousCoverage?.close()
+        previousCoverage = null
         this.uniform = null
         this.objects = null
         this.objectCount = 0
@@ -612,8 +781,7 @@ object D3D12Velocity {
     /**
      * Depth reprojection -> screen-space motion in pixels, plus the per-object correction.
      *
-     * `SV_Position.xy` is the pixel centre, so the uv needs no extra interpolation. Depth 0 or 1 (sky,
-     * far plane) reports 0 so nothing is reprojected out of the far plane.
+     * `SV_Position.xy` is the pixel centre, so the uv needs no extra interpolation.
      *
      * Per-object rows carry only the AABB and the two positions: a rigid body translates, so
      * `world + (prev - cur)` is exact — an object-centre screen delta would move static objects.
@@ -634,7 +802,7 @@ object D3D12Velocity {
             // 位置，而 PrevViewProj 的视图矩阵只有旋转，所以必须补上这段平移，否则相机自己
             // 走动/侧移造成的视差整块丢失。
             float3 CameraDelta;
-            float CameraDeltaPad;
+            float HasRasterGuide;
         };
 
         Texture2D<float> DXRMDepth : register(t1, space0);
@@ -642,6 +810,7 @@ object D3D12Velocity {
 
         // texel buffer：每个 float 一个元素（绑定类型 2 + texelFormat = R32_FLOAT）。
         Buffer<float> DXRMObjects : register(t2, space0);
+        Texture2D<float4> DXRMRasterGuide : register(t3, space0);
 
         static const uint OBJECT_ROW_FLOATS = 16;
         static const uint OBJECT_FIELD_CUR_X = 1;
@@ -686,42 +855,72 @@ object D3D12Velocity {
             return all(world >= minCorner) && all(world <= maxCorner);
         }
 
-        float4 main(float4 position : SV_Position) : SV_Target0 {
+        struct VelocityGuides {
+            float2 motion : SV_Target0;
+            float coverage : SV_Target1;
+        };
+
+        VelocityGuides motionGuides(float2 motion, uint coverage) {
+            VelocityGuides output;
+            if (!all(isfinite(motion)) || any(abs(motion) > 65504.0)) {
+                motion = 0.0;
+                coverage = 1u;
+            }
+            output.motion = motion;
+            output.coverage = float(coverage) / 255.0;
+            return output;
+        }
+
+        VelocityGuides main(float4 position : SV_Position) {
             float2 uv = position.xy / ScreenSize;
             float depth = DXRMDepth.SampleLevel(DXRMDepthSampler, uv, 0).r;
-            if (depth <= 0.0 || depth >= 1.0) {
-                // 天空/远平面（reverse-Z 下 depth==0）没有可靠的对应点，报 0 让 DLSS 自己判断。
-                return float4(0.0, 0.0, 0.0, 0.0);
+            if (!isfinite(depth) || depth < 0.0 || depth > 1.0) return motionGuides(0.0, 1u);
+            uint coverage = 3u;
+            if (HasRasterGuide > 0.5) {
+                float4 guide = DXRMRasterGuide.Load(int3(uint2(position.xy), 0));
+                if (!all(isfinite(guide))) coverage = 1u;
+                else if (guide.w > 0.5) {
+                    coverage = 1u;
+                    if ((guide.z >= 0.0 && guide.z == depth) ||
+                        (guide.z == ${D3D12RasterMotionTuple.CELESTIAL_VALID} && depth == 0.0)) {
+                        return motionGuides(guide.xy, 3u);
+                    }
+                    if (guide.z == ${D3D12RasterMotionTuple.CAMERA_SURFACE} && guide.x >= depth && guide.x <= 1.0) {
+                        depth = guide.x;
+                        coverage = 3u;
+                    }
+                }
             }
             float4 ndc = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
             float4 world = mul(InvCurrViewProj, ndc);
-            if (abs(world.w) < 1e-6) {
-                return float4(0.0, 0.0, 0.0, 0.0);
+            if (!all(isfinite(world))) return motionGuides(0.0, 1u);
+            float4 prevClip;
+            if (depth == 0.0) {
+                prevClip = mul(PrevViewProj, float4(world.xyz, 0.0));
+            } else {
+                if (abs(world.w) < 1e-6) return motionGuides(0.0, 1u);
+                world /= world.w;
+                prevClip = mul(PrevViewProj, float4(world.xyz + CameraDelta, 1.0));
             }
-            world /= world.w;
-            float4 prevClip = mul(PrevViewProj, float4(world.xyz + CameraDelta, 1.0));
             // 点在上一帧相机背后（w<0）时绝不能再做 xy/w：负的 w 会把屏幕位置镜像到另一边，
             // 得到一个量级看着合理、实际指向别处的位移，DLSS 照着它去历史缓冲取错颜色（沙地
             // 变白、树叶变紫，只在转视角/走动时闪一下）。这种像素没有对应点，报 0 交给 disocclusion。
             // `abs(prevClip.w) < 1e-6` 只挡住数值退化，恰好放过了 w<0 这一整类。
-            if (prevClip.w <= 1e-4) {
-                return float4(0.0, 0.0, 0.0, 0.0);
+            if (!all(isfinite(prevClip)) || prevClip.w <= 1e-4) {
+                return motionGuides(0.0, 1u);
             }
             float2 prevNdc = prevClip.xy / prevClip.w;
             float2 prevUv = float2(prevNdc.x * 0.5 + 0.5, 0.5 - prevNdc.y * 0.5);
             // 运动向量方向是「从本帧指向该像素在上一帧的位置」，即 prevPos - curPos；写成
             // `uv - prevUv` 方向整体反了，静止时两边都是 0 看不出来，一动就在运动方向上拖出
             // 永不收敛的残影（机制见 docs/antialiasing/README.md 的速度缓冲一节）。
-            // jitter 注入的是列 2（`out[8]`/`out[9]`，即 `m20`/`m21`），它乘 view.z，而透视的
-            // `w = -view.z`，所以 `clip.x += j*z` 经透视除法后内容在 NDC 里移动 `-j`，换算到像
-            // 素坐标（y 向下）是 `(+j.x, -j.y)` —— y 轴反号。MV 要的是未抖动网格之间的位移，
-            // 故下面补 `(+J.x, -J.y)`。
             float2 motion = (prevUv - uv) * ScreenSize + float2(JitterPixels.x, -JitterPixels.y);
             // NaN/inf 兜底：NaN 参与的比较恒为假，所以用"取反的 <=" 写法把它一并挡掉。上一条
             // 守卫之后这里理论上不会触发，留着是因为一旦传出去就是一整块画面的错色。
             if (!(dot(motion, motion) <= 1.0e12)) {
-                return float4(0.0, 0.0, 0.0, 0.0);
+                return motionGuides(0.0, 1u);
             }
+            if (depth == 0.0) return motionGuides(motion, coverage);
             // 先到先得 —— 行是按「上一帧采集顺序」排的，一个像素落在多个盒子里时
             // （嵌套的乘客/坐骑、相邻的掉落物）取第一行，够用且稳定。
             uint rowLimit = (uint)ObjectParams.x;
@@ -754,9 +953,9 @@ object D3D12Velocity {
                 if (dot(objectMotion, objectMotion) > ObjectParams.y * ObjectParams.y) {
                     continue;
                 }
-                return float4(objectMotion, 0.0, 0.0);
+                return motionGuides(objectMotion, coverage);
             }
-            return float4(motion, 0.0, 0.0);
+            return motionGuides(motion, coverage);
         }
     """.trimIndent()
 }

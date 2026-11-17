@@ -7,6 +7,8 @@ class D3D12IntermediaryShaderModule(
     val source: String,
     val stage: ShaderType,
     val conversion: D3D12ShaderConversion?,
+    internal val compilationGeneration: Long = -1,
+    internal val compilerIdentity: Any? = null,
 ) : AutoCloseable {
     override fun close() = Unit
 

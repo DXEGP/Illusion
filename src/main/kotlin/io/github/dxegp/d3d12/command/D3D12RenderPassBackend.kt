@@ -15,18 +15,15 @@ import com.mojang.renderpearl.api.commands.RenderPass.RenderArea
 import com.mojang.renderpearl.backend.api.RenderPassBackend
 import com.mojang.renderpearl.api.textures.GpuSampler
 import com.mojang.renderpearl.api.textures.GpuTextureView
-import io.github.dxegp.config.D3D12Settings
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
 import io.github.dxegp.d3d12.device.D3D12Device
-import io.github.dxegp.render.terrain.mesh.D3D12TerrainWorkGraph
-import io.github.dxegp.render.temporal.D3D12Temporal
 import io.github.dxegp.d3d12.resource.D3D12GpuBuffer
 import io.github.dxegp.d3d12.resource.D3D12GpuQueryPool
 import io.github.dxegp.d3d12.resource.D3D12GpuTextureView
-import io.github.dxegp.d3d12.resource.D3D12TransientMemory
 import io.github.dxegp.d3d12.shader.D3D12GpuSampler
-import io.github.dxegp.render.vrs.D3D12VariableShadingRate
-import io.github.dxegp.diagnostics.IllusionLogger
+import io.github.dxegp.d3d12.shader.D3D12PipelineOrientation
+import io.github.dxegp.diagnostics.D3D12RenderProf
+import io.github.dxegp.diagnostics.RenderProfiling
 import org.lwjgl.PointerBuffer
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
@@ -36,15 +33,12 @@ import java.util.*
 import java.util.function.Supplier
 
 
-/** mesh 跳过理由的去重必须**跨帧**（每个 pass 每帧都会新建 backend）；只服务日志。 */
-/** 其余均为日志去重/限流状态，同样必须全局（实例字段每帧都会被重置）。 */
-private val gDrawIndirectLocations: MutableSet<String> = HashSet()
 
 /**
  * D3D12 render pass 后端（镜像官方 VulkanRenderPass）：uniform/texture 暂存在本类 map，core 之前按需
  * 推入原生瞬时描述符堆（[pushDescriptors]）；顶点/索引缓冲与 draw 直接下发 native。
  */
-class D3D12RenderPassBackend(
+class D3D12RenderPassBackend internal constructor(
     private val device: D3D12Device?,
     private val ctx: Long,
     private val renderArea: RenderArea?,
@@ -54,21 +48,18 @@ class D3D12RenderPassBackend(
     private val colorTargetHandle: Long,
     /** 是否使用 shader Y-flip 变体管线（GUI 离屏 pass，由 CommandEncoder 按 texture usage 判断）。 */
     private val flipY: Boolean,
-    /** 本 encoder 的瞬态上传区：meshlet 派发要上传段表/meshlet 表/小常量，只有 `uploadStaging` 能给 COPY_SRC 与 256 对齐偏移。 */
-    private val transientMemory: D3D12TransientMemory,
-    private val meshletResidency: io.github.dxegp.render.terrain.mesh.D3D12MeshletResidency,
+    private val policy: D3D12RasterPassPolicy,
+    private val rasterMotionTarget: Long = 0L,
 ) : RenderPassBackend {
     private var pushedDebugGroups = 0
 
-    /** mesh 派发是否启用（唯一入口是 `[mesh] terrain` 配置项）。 */
-    private val meshDispatchEnabled: Boolean
-        get() = D3D12Settings.meshTerrain
 
     /** 最近一次 slot0 顶点切片的字节偏移（MDI 每段的 `baseVertex` 相对它）。 */
     private var lastVertexSliceOffset = -1L
 
     /** 最近一次 slot0 顶点切片的缓冲（meshlet 派发要把它当 t14 的 RAW SRV 绑定）。 */
     private var lastVertexBuffer: GpuBuffer? = null
+    private var lastVertexStride = 0
 
     /** 早期显示会**先绑顶点缓冲、后设管线**：stride 只能从管线推导，故先挂起等 [setPipeline] 落实；抛异常会让加载屏整条 draw 被吞掉。 */
     private val pendingVertexBuffers = LinkedHashMap<Int, Pair<D3D12GpuBuffer, Long>>()
@@ -77,10 +68,31 @@ class D3D12RenderPassBackend(
     private var anyDescriptorDirty = false
     private var constantSnapshot: ByteBuffer? = null
     private val bindingPackets = IdentityHashMap<D3D12CompiledRenderPipeline, D3D12BindingPacket>()
+    private val motionBindingPackets =
+        IdentityHashMap<D3D12CompiledRenderPipeline, MutableMap<String?, D3D12BindingPacket>>()
+    private var motionBindings: D3D12MotionBindings? = null
+    private var additionalBindings: D3D12AdditionalRasterBindings? = null
+    private enum class RasterTopology { PIPELINE, LINE_QUAD }
+    private var rasterTopology = RasterTopology.PIPELINE
+    private val additionalBindingPackets = IdentityHashMap<D3D12CompiledRenderPipeline, D3D12BindingPacket>()
+    private var route = D3D12RasterRoute.INDIRECT
+
+    init {
+        policy.setViewport(areaX(), areaY(), areaWidth(), areaHeight())
+    }
+
+    private var multiDrawPackedScratch = IntArray(0)
+    private var multiDrawFirstScratch = IntArray(0)
+    private var multiDrawCountScratch = IntArray(0)
+    private var multiDrawBaseScratch = IntArray(0)
+    private var motionOverrideBuffers = LongArray(0)
+    private var motionOverrideOffsets = LongArray(0)
+    private var motionOverrideLengths = LongArray(0)
 
     /** 当前管线的 uniform 名字表（顺序 = CreateInfo.uniforms，非 layouts 展平顺序）。 */
     private var uniformNames: List<String> = emptyList()
     private var currentIndexType: IndexType? = null
+    private var currentIndexBuffer: GpuBuffer? = null
     private val uniforms: MutableMap<String, GpuBufferSlice> = HashMap()
 
     private val textures: MutableMap<String, TextureViewAndSampler> = HashMap()
@@ -152,7 +164,8 @@ class D3D12RenderPassBackend(
         // 前端缓存里可能是上一次资源重载**前**编译的对象（vanilla 重载会把它们 close、handle 归 0 ⇒
         // isValid()==false）→ 会抛 "not valid" 且没有 COMPILE FAILED 日志。故 flipY 变体或失效对象都重新取。
         val compiled = if (this.flipY || !base.isValid()) {
-            device.getOrCompilePipeline(base.info(), this.flipY)
+            device.pipelines.getOrCompilePipeline(base.info(),
+                if (this.flipY) D3D12PipelineOrientation.FLIPPED_Y else D3D12PipelineOrientation.ORIGINAL)
         } else {
             base
         }
@@ -165,6 +178,7 @@ class D3D12RenderPassBackend(
             constantSnapshot = null
         }
         this.pipeline = compiled
+        motionBindings = null
 
         // vanilla 按「管线 uniform 列表下标」回调 setUniform(Int)，下标来自 `CreateInfo.uniforms`（≠
         // flattenUniforms(bindGroupLayouts) 的顺序）。flipY 变体是另一个实例，把 base 的名单复制过去即可。
@@ -173,7 +187,7 @@ class D3D12RenderPassBackend(
         }
         this.uniformNames = compiled.uniformNamesSnapshot()
         if (this.uniformNames.isEmpty()) {
-            // 兜底：管线只经自检路径编译（无 CreateInfo）时名单为空，用 layouts 展平顺序顶上。
+            // 兜底：没有 CreateInfo 的旁路编译对象名单为空，用 layouts 展平顺序顶上。
             this.uniformNames = BindGroupLayout.flattenUniforms(compiled.info().bindGroupLayouts)
                 .map { it.name() }
         }
@@ -182,10 +196,15 @@ class D3D12RenderPassBackend(
         // depthStencilState，套上 withDepth PSO 会让 GREATER_EQUAL 丢掉所有 fragment → 黑屏。
         val pipelineHasDepth = compiled.info().depthStencilState != null
         val useDepth = this.hasDepth && pipelineHasDepth
-        val ok = MCDR_ABI.D3D12SetPipeline(this.ctx, compiled.handle(), useDepth)
+        route = policy.selectPipeline(compiled)
+        additionalBindings = if (!flipY) policy.recordAdditionalBindings(compiled) else null
+        MCDR_ABI.D3D12SetAdditionalColorTarget(ctx, additionalBindings?.target ?: 0L)
+        val ok = MCDR_ABI.D3D12SetPipeline(this.ctx,
+            additionalBindings?.pso ?: compiled.handle(), useDepth)
         if (!ok) {
             throw IllegalStateException("dx12SetPipeline failed for ${base.info().location}")
         }
+        policy.setVertexInput(lastVertexBuffer, lastVertexSliceOffset)
         // 落实 setPipeline 之前挂起的顶点缓冲（早期显示是"先绑 buffer、后设管线"）。
         if (this.pendingVertexBuffers.isNotEmpty()) {
             val formatBindings = compiled.info().vertexFormatBindings
@@ -216,7 +235,7 @@ class D3D12RenderPassBackend(
             null -> {
                 this.textures.remove(name)
                 this.uniforms.remove(name)
-                for (packet in bindingPackets.values) {
+                updateBindingPackets { packet ->
                     packet.setUniform(name, null)
                     packet.setTexture(name, null)
                 }
@@ -249,26 +268,45 @@ class D3D12RenderPassBackend(
                 throw IllegalArgumentException("Both texture and sampler must be null or non-null")
             }
             this.textures.remove(name)
-            for (packet in bindingPackets.values) packet.setTexture(name, null)
+            updateBindingPackets { it.setTexture(name, null) }
             this.anyDescriptorDirty = true
             return
         }
         this.textures[name] = TextureViewAndSampler(
             textureView as D3D12GpuTextureView, sampler as D3D12GpuSampler
         )
-        for (packet in bindingPackets.values) packet.setTexture(name, textureView)
+        updateBindingPackets { it.setTexture(name, textureView) }
         this.anyDescriptorDirty = true
     }
 
     private fun setUniformByName(name: String, value: GpuBufferSlice) {
-        // 捕获时间性渲染要的逐物体 UBO（"DynamicTransforms" / "ChunkSection"）；vanilla 的 DynamicTransforms
-        // 环由 CPU 直接写（usage 130），map(read) 安全。只在有深度附件的 pass 记录：GUI/图集 blit 也 set 这两个名字，混进来会让配对序号失真。
         if (this.hasDepth) {
-            D3D12Temporal.captureUniform(name, value)
+            policy.captureUniform(name, value)
         }
         this.uniforms[name] = value
-        for (packet in bindingPackets.values) packet.setUniform(name, value)
+        updateBindingPackets { it.setUniform(name, value) }
         this.anyDescriptorDirty = true
+    }
+
+    private inline fun updateBindingPackets(update: (D3D12BindingPacket) -> Unit) {
+        for (packet in bindingPackets.values) update(packet)
+        for (packets in motionBindingPackets.values) {
+            for (packet in packets.values) update(packet)
+        }
+        for (packet in additionalBindingPackets.values) update(packet)
+    }
+
+    private fun packedMultiDrawParameters(size: Int): IntArray {
+        if (multiDrawPackedScratch.size < size) multiDrawPackedScratch = IntArray(size)
+        return multiDrawPackedScratch
+    }
+
+    private fun ensureMultiDrawColumns(size: Int, indexed: Boolean) {
+        if (multiDrawFirstScratch.size < size) {
+            multiDrawFirstScratch = IntArray(size)
+            multiDrawCountScratch = IntArray(size)
+        }
+        if (indexed && multiDrawBaseScratch.size < size) multiDrawBaseScratch = IntArray(size)
     }
     /**
      * 转发到 native 的 RSSetViewports。与 [enableScissor] 不同，这里**不**做 Y 翻转：直接透传调用方给的 y。
@@ -277,10 +315,60 @@ class D3D12RenderPassBackend(
         if (!MCDR_ABI.D3D12SetViewport(this.ctx, x, y, width, height)) {
             LOGGER.error("dx12SetViewport failed ({} {} {} {})", x, y, width, height)
         }
+        policy.setViewport(x, y, width, height)
+    }
+
+    private fun rasterMotionPipeline(): Long = when (rasterTopology) {
+        RasterTopology.PIPELINE -> additionalBindings?.rasterMotionPso ?: pipeline?.rasterMotionPso ?: 0L
+        RasterTopology.LINE_QUAD -> additionalBindings?.rasterMotionLineQuadPso ?: pipeline?.rasterMotionLineQuadPso ?: 0L
+    }
+
+    private fun activeRasterPipeline(): Long = when (rasterTopology) {
+        RasterTopology.PIPELINE -> additionalBindings?.pso ?: checkNotNull(pipeline).handle()
+        RasterTopology.LINE_QUAD -> additionalBindings?.lineQuadPso ?: checkNotNull(pipeline).lineQuadPipeline()
+    }
+
+    private fun canRecordRasterMotion(): Boolean = rasterMotionTarget != 0L && rasterMotionPipeline() != 0L &&
+        !flipY && hasDepth
+
+    private inline fun <T> withRasterMotion(prepareBindings: () -> D3D12MotionBindings, action: () -> T): T {
+        if (!canRecordRasterMotion()) return action()
+        motionBindings = prepareBindings()
+        var failure: Throwable? = null
+        try {
+            val motionPipeline = rasterMotionPipeline()
+            check(motionPipeline != 0L && MCDR_ABI.D3D12SetPipeline(ctx, motionPipeline, true)) {
+                "Raster motion pipeline bind failed: ${MCDR_ABI.D3D12LastError()}"
+            }
+            anyDescriptorDirty = true
+            return action()
+        } catch (drawFailure: Throwable) {
+            failure = drawFailure
+            throw drawFailure
+        } finally {
+            motionBindings = null
+            anyDescriptorDirty = true
+            try {
+                check(MCDR_ABI.D3D12SetPipeline(ctx, activeRasterPipeline(), true)) {
+                    "Raster motion pipeline restore failed: ${MCDR_ABI.D3D12LastError()}"
+                }
+            } catch (cleanup: Throwable) {
+                if (failure == null) throw cleanup else failure.addSuppressed(cleanup)
+            }
+        }
     }
 
     /** 镜像官方 pushDescriptors：把当前 uniform/texture 写入原生瞬时描述符堆并绑定 root table。 */
     private fun pushDescriptors() {
+        val packet = prepareDescriptors() ?: return
+        if (!MCDR_ABI.D3D12PushDescriptors(this.ctx, packet.types, packet.buffers, packet.offsets,
+                packet.lengths, packet.texelFormats, packet.views)) {
+            throw IllegalStateException("dx12PushDescriptors failed: ${MCDR_ABI.D3D12LastError()}")
+        }
+        this.anyDescriptorDirty = false
+    }
+
+    private fun prepareDescriptors(): D3D12BindingPacket? {
         if (this.pipeline?.isValid() == true && MCDR_ABI.D3D12EnsureGraphicsState(ctx)) {
             anyDescriptorDirty = true
         }
@@ -292,24 +380,52 @@ class D3D12RenderPassBackend(
             }
         }
         if (!this.anyDescriptorDirty) {
-            return
+            return null
         }
         val pipeline = this.pipeline
         if (pipeline == null || !pipeline.isValid()) {
             LOGGER.warn("pushDescriptors: SKIP (pipeline null or invalid)")
-            return
+            return null
         }
-        val packet = bindingPackets.getOrPut(pipeline) {
-            D3D12BindingPacket(pipeline.buildBindings()).also { created ->
-                for ((name, value) in uniforms) created.setUniform(name, value)
-                for ((name, value) in textures) created.setTexture(name, value.view)
+        val motion = motionBindings
+        val additional = additionalBindings
+        val additionalParameterName = additional
+            ?.takeIf { it.parameters != null }
+            ?.parameterName
+        val packet = if (motion != null) {
+            val motionPackets = motionBindingPackets.getOrPut(pipeline) {
+                HashMap<String?, D3D12BindingPacket>()
+            }
+            motionPackets.getOrPut(additionalParameterName) {
+                D3D12BindingPacket(pipeline.motionBindingLayout(
+                    D3D12MotionBindings.PARAMETER_NAME, D3D12MotionBindings.HISTORY_NAME,
+                    additionalParameterName)).also { created ->
+                    for ((name, value) in uniforms) created.setUniform(name, value)
+                    for ((name, value) in textures) created.setTexture(name, value.view)
+                }
+            }
+        } else {
+            val packets = if (additionalParameterName != null)
+                additionalBindingPackets else bindingPackets
+            packets.getOrPut(pipeline) {
+                val layout = if (additionalParameterName != null)
+                    pipeline.additionalBindingLayout(additionalParameterName) else pipeline.bindingLayout
+                D3D12BindingPacket(layout).also { created ->
+                    for ((name, value) in uniforms) created.setUniform(name, value)
+                    for ((name, value) in textures) created.setTexture(name, value.view)
+                }
             }
         }
+        if (motion != null) {
+            packet.setUniform(D3D12MotionBindings.PARAMETER_NAME, motion.parameters)
+            packet.setUniform(D3D12MotionBindings.HISTORY_NAME, motion.history)
+        }
+        if (additional?.parameters != null) packet.setUniform(additional.parameterName, additional.parameters)
         val bindings = packet.entries
         val count = bindings.size
         if (count == 0) {
             this.anyDescriptorDirty = false
-            return
+            return null
         }
         val types = packet.types
         val buffers = packet.buffers
@@ -348,11 +464,60 @@ class D3D12RenderPassBackend(
                 }
             }
         }
-        if (!MCDR_ABI.D3D12PushDescriptors(this.ctx, types, buffers, offsets, lengths, texelFormats, views)) {
-            // 带上 native 的具体原因：最常见的是 CBV 地址没按 256 字节对齐，只报 "failed" 会丢掉那条 offset 信息。
-            throw IllegalStateException("dx12PushDescriptors failed: ${MCDR_ABI.D3D12LastError()}")
+        return packet
+    }
+
+    private fun recordMotionBatch(indexed: Boolean, parameters: IntArray, instanceCount: Int,
+        firstInstance: Int, drawCount: Int) {
+        val overrideCount = Math.multiplyExact(drawCount, 2)
+        if (motionOverrideBuffers.size < overrideCount) {
+            motionOverrideBuffers = LongArray(overrideCount)
+            motionOverrideOffsets = LongArray(overrideCount)
+            motionOverrideLengths = LongArray(overrideCount)
         }
-        this.anyDescriptorDirty = false
+        var firstBindings: D3D12MotionBindings? = null
+        for (draw in 0 until drawCount) {
+            val base = parameters[draw * 3 + if (indexed) 2 else 0]
+            val bindings = policy.prepareMotionBindings(base, instanceCount)
+            if (draw == 0) firstBindings = bindings
+            val parameterSlot = draw * 2
+            motionOverrideBuffers[parameterSlot] = (bindings.parameters.buffer() as D3D12GpuBuffer).handle()
+            motionOverrideOffsets[parameterSlot] = bindings.parameters.offset()
+            motionOverrideLengths[parameterSlot] = bindings.parameters.length()
+            motionOverrideBuffers[parameterSlot + 1] = (bindings.history.buffer() as D3D12GpuBuffer).handle()
+            motionOverrideOffsets[parameterSlot + 1] = bindings.history.offset()
+            motionOverrideLengths[parameterSlot + 1] = bindings.history.length()
+        }
+        motionBindings = firstBindings
+        var failure: Throwable? = null
+        try {
+            val motionPipeline = rasterMotionPipeline()
+            check(motionPipeline != 0L && MCDR_ABI.D3D12SetPipeline(ctx, motionPipeline, true)) {
+                "Raster motion batch pipeline bind failed: ${MCDR_ABI.D3D12LastError()}"
+            }
+            anyDescriptorDirty = true
+            val packet = checkNotNull(prepareDescriptors())
+            val overrides = checkNotNull(packet.overrideSlots)
+            check(MCDR_ABI.D3D12MultiDrawBound(ctx, indexed, parameters, instanceCount, firstInstance,
+                drawCount, packet.types, packet.buffers, packet.offsets, packet.lengths,
+                packet.texelFormats, packet.views, overrides, motionOverrideBuffers,
+                motionOverrideOffsets, motionOverrideLengths)) {
+                "Raster motion batch failed: ${MCDR_ABI.D3D12LastError()}"
+            }
+        } catch (drawFailure: Throwable) {
+            failure = drawFailure
+            throw drawFailure
+        } finally {
+            motionBindings = null
+            anyDescriptorDirty = true
+            try {
+                check(MCDR_ABI.D3D12SetPipeline(ctx, activeRasterPipeline(), true)) {
+                    "Raster motion batch pipeline restore failed: ${MCDR_ABI.D3D12LastError()}"
+                }
+            } catch (cleanup: Throwable) {
+                if (failure == null) throw cleanup else failure.addSuppressed(cleanup)
+            }
+        }
     }
 
     private fun requireUniform(packet: D3D12BindingPacket, slot: Int): GpuBufferSlice {
@@ -383,7 +548,16 @@ class D3D12RenderPassBackend(
     // ---- vertex / index buffers + draws ----
 
     override fun setVertexBuffer(slot: Int, vertexBuffer: GpuBufferSlice?) {
-        if (vertexBuffer == null) return
+        if (vertexBuffer == null) {
+            if (slot == 0) {
+                lastVertexBuffer = null
+                lastVertexSliceOffset = -1L
+                lastVertexStride = 0
+                policy.setVertexInput(null, -1L)
+            }
+            pendingVertexBuffers.remove(slot)
+            return
+        }
 
         val buffer = vertexBuffer.buffer()
         if (buffer.isClosed) throw IllegalStateException("Vertex buffer at slot ${slot} has been closed!")
@@ -405,6 +579,7 @@ class D3D12RenderPassBackend(
         if (stride == 0) {
             // 管线还没设（早期显示先绑 buffer 后设管线）或该槽位没声明顶点布局 → 挂起；抛异常会让加载屏整条 draw 失败。
             this.pendingVertexBuffers[slot] = (buffer as D3D12GpuBuffer) to vertexBuffer.offset()
+            if (slot == 0) policy.setVertexInput(buffer, vertexBuffer.offset())
             return
         }
         this.applyVertexBuffer(slot, buffer as D3D12GpuBuffer, vertexBuffer.offset(), stride)
@@ -418,7 +593,9 @@ class D3D12RenderPassBackend(
         if (slot == 0) {
             // MDI 批次里每个段的 `baseVertex` 都相对这块切片，Stage 2 建段表要用。
             this.lastVertexSliceOffset = offset
+            policy.setVertexInput(buffer, offset)
             this.lastVertexBuffer = buffer
+            this.lastVertexStride = stride
         }
     }
 
@@ -429,124 +606,183 @@ class D3D12RenderPassBackend(
 
         if (!MCDR_ABI.D3D12SetIndexBuffer(this.ctx, (indexBuffer as D3D12GpuBuffer).handle(), if (indexType == IndexType.INT) 1 else 0)) throw IllegalStateException("dx12SetIndexBuffer failed")
         this.currentIndexType = indexType
+        this.currentIndexBuffer = indexBuffer
     }
 
     // ---- 绘制热路径插桩：PROF=1 时由 D3D12CommandEncoderBackend 每 300 帧汇总打印并清零 ----
     companion object {
-        /** 准星补画期间的诊断开关：打印这一笔绑了什么管线。 */
-        @JvmStatic
-        var replayProbe: Boolean = false
-        @JvmStatic
-        var replayBinds: Int = 0
         private val LOGGER: Logger = LoggerFactory.getLogger("dxrmc")
 
         private const val USAGE_VERTEX = 0x20
         private const val USAGE_INDEX = 0x40
 
-        /** DEBUG: true 时强制所有 pass 使用 withoutDepth PSO（禁用深度测试/写入），用于排查黑屏是否由深度问题导致。 */
-        private const val DEBUG_DISABLE_DEPTH_TEST = false
-
-
-        @JvmField var gProfDrawIndexedCalls = 0L  // drawIndexed 调用次数
-        @JvmField var gProfDrawIndexedNs = 0L     // drawIndexed（pushDescriptors + downcall）耗时
-        @JvmField var gProfMultiBatches = 0L
-        @JvmField var gProfMultiDraws = 0L
-        @JvmField var gProfMultiPathNs = 0L
-
-        private fun recordMultiProfile(drawCount: Int, started: Long) {
-            if (started != 0L) {
-                gProfMultiBatches++
-                gProfMultiDraws += drawCount
-                gProfMultiPathNs += System.nanoTime() - started
-            }
-        }
     }
 
     override fun drawIndexed(indexCount: Int, instanceCount: Int, firstIndex: Int,
         vertexOffset: Int, firstInstance: Int) {
-        val profT0 = if (MCDR_ABI.PROF) System.nanoTime() else 0L
-        // 线管线有三角形变体 ⇒ 切过去：同一份索引在 TRIANGLES 下摊成两个三角形，拼出 `LineWidth` 带宽；LINELIST 恒 1px。
-        val lineQuad = this.pipeline?.takeIf { it.hasLineQuadVariant() }
-        val lineQuadDepth = lineQuad?.let { it.info().depthStencilState != null } ?: false
-        if (lineQuad != null) {
-            if (!MCDR_ABI.D3D12SetPipeline(this.ctx, lineQuad.lineQuadPipeline(), lineQuadDepth)) {
-                throw IllegalStateException("dx12SetPipeline (line quad variant) failed")
+        val profT0 = if (RenderProfiling.enabled) System.nanoTime() else 0L
+        if (indexCount > 0 && instanceCount > 0) {
+            policy.retainIndexedGeometryReads(lastVertexBuffer, currentIndexBuffer)
+            val capture = (if (!flipY) policy.drawCapture else null)?.let { drawCapture ->
+                val vertexBuffer = lastVertexBuffer
+                val indexBuffer = currentIndexBuffer
+                val indexType = currentIndexType
+                val material = textures["Sampler0"]
+                val source = if (vertexBuffer != null && indexBuffer != null && indexType != null &&
+                    lastVertexSliceOffset >= 0L && lastVertexStride > 0) {
+                    D3D12IndexedRasterSource(vertexBuffer, lastVertexSliceOffset, lastVertexStride,
+                        indexBuffer, indexType, material?.view, material?.sampler,
+                        Collections.unmodifiableMap(HashMap(uniforms)),
+                        Collections.unmodifiableMap(textures.mapValues { (_, sampled) ->
+                            D3D12RasterSampledView(sampled.view, sampled.sampler)
+                        }))
+                } else null
+                drawCapture.prepareIndexed(checkNotNull(pipeline),
+                    D3D12IndexedRasterDraw(indexCount, instanceCount, firstIndex, vertexOffset, firstInstance, source))
             }
-            this.anyDescriptorDirty = true
-        }
-        this.pushDescriptors()
-        if (!MCDR_ABI.D3D12DrawIndexed(this.ctx, indexCount, instanceCount,
-            firstIndex, vertexOffset, firstInstance)) {
-            throw IllegalStateException("dx12DrawIndexed failed")
-        }
-        if (lineQuad != null) {
-            // 恢复本 pass 的常规管线（描述符表随 PSO 变化，需要重推）。
-            if (!MCDR_ABI.D3D12SetPipeline(this.ctx, lineQuad.handle(), lineQuadDepth)) {
-                throw IllegalStateException("dx12SetPipeline (restore after line quad) failed")
+            if (capture != null) {
+                recordCapturedDraw(capture) {
+                    check(MCDR_ABI.D3D12DrawIndexed(ctx, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance)) {
+                        "Captured indexed draw failed: ${MCDR_ABI.D3D12LastError()}"
+                    }
+                }
+                D3D12RenderProf.recordIndexedDraw(profT0)
+                return
             }
-            this.anyDescriptorDirty = true
-            this.pushDescriptors()
         }
-        if (profT0 != 0L) {
-            gProfDrawIndexedCalls++
-            gProfDrawIndexedNs += System.nanoTime() - profT0
+        withLineQuad {
+            withRasterMotion({ policy.prepareMotionBindings(vertexOffset, instanceCount) }) {
+                this.pushDescriptors()
+                if (!MCDR_ABI.D3D12DrawIndexed(this.ctx, indexCount, instanceCount,
+                    firstIndex, vertexOffset, firstInstance)) {
+                    throw IllegalStateException("dx12DrawIndexed failed")
+                }
+                if (indexCount > 0 && instanceCount > 0) recordRasterDraw(additionalBindings?.target ?: 0L)
+            }
         }
+        D3D12RenderProf.recordIndexedDraw(profT0)
+    }
+
+    private inline fun <Result> withLineQuad(action: () -> Result): Result {
+        val selected = pipeline?.takeIf { it.hasLineQuadVariant() } ?: return action()
+        val useDepth = hasDepth && selected.info().depthStencilState != null
+        val previousTopology = rasterTopology
+        rasterTopology = RasterTopology.LINE_QUAD
+        var failure: Throwable? = null
+        try {
+            check(MCDR_ABI.D3D12SetPipeline(ctx, activeRasterPipeline(), useDepth)) {
+                "dx12SetPipeline (line quad variant) failed: ${MCDR_ABI.D3D12LastError()}"
+            }
+            anyDescriptorDirty = true
+            return action()
+        } catch (drawFailure: Throwable) {
+            failure = drawFailure
+            throw drawFailure
+        } finally {
+            rasterTopology = previousTopology
+            try {
+                check(MCDR_ABI.D3D12SetPipeline(ctx, activeRasterPipeline(), useDepth)) {
+                    "dx12SetPipeline (restore after line quad) failed: ${MCDR_ABI.D3D12LastError()}"
+                }
+                anyDescriptorDirty = true
+                pushDescriptors()
+            } catch (cleanup: Throwable) {
+                if (failure == null) throw cleanup else failure.addSuppressed(cleanup)
+            }
+        }
+    }
+
+    private fun <Result> recordCapturedDraw(capture: D3D12PreparedRasterCapture, action: () -> Result): Result {
+        val selected = checkNotNull(pipeline)
+        val previousAdditional = additionalBindings
+        val useDepth = hasDepth && selected.info().depthStencilState != null
+        check(motionBindings == null) { "OIT capture cannot replace an active motion draw" }
+        var failure: Throwable? = null
+        try {
+            MCDR_ABI.D3D12SetAdditionalColorTarget(ctx, 0L)
+            additionalBindings = null
+            check(MCDR_ABI.D3D12SetPipeline(ctx, capture.pipeline, useDepth)) {
+                "OIT capture pipeline bind failed: ${MCDR_ABI.D3D12LastError()}"
+            }
+            anyDescriptorDirty = true
+            return capture.recordDraw {
+                pushDescriptors()
+                action()
+            }
+        } catch (drawFailure: Throwable) {
+            failure = drawFailure
+            throw drawFailure
+        } finally {
+            additionalBindings = previousAdditional
+            anyDescriptorDirty = true
+            try {
+                MCDR_ABI.D3D12SetAdditionalColorTarget(ctx, previousAdditional?.target ?: 0L)
+                check(MCDR_ABI.D3D12SetPipeline(ctx,
+                    previousAdditional?.pso ?: selected.handle(), useDepth)) {
+                    "OIT capture pipeline restore failed: ${MCDR_ABI.D3D12LastError()}"
+                }
+            } catch (cleanup: Throwable) {
+                if (failure == null) throw cleanup else failure.addSuppressed(cleanup)
+            }
+        }
+    }
+
+    private fun recordRasterDraw(additionalTarget: Long) {
+        policy.recordColorWrite(colorTargetHandle)
+        policy.recordDraw(additionalTarget)
+        policy.drawCapture?.recordUncapturedDraw(checkNotNull(pipeline),
+            additionalBindings?.attachment?.takeIf { it.target == additionalTarget })
     }
 
     /** DispatchMesh 入口：先推描述符再下发；没有 IA 状态、没有顶点/索引缓冲。 */
     fun dispatchMesh(x: Int, y: Int, z: Int) {
         this.pushDescriptors()
         if (!MCDR_ABI.D3D12DispatchMesh(this.ctx, x, y, z)) throw IllegalStateException("dx12DispatchMesh(${x}, ${y}, ${z}) failed")
+        if (x > 0 && y > 0 && z > 0) recordRasterDraw(0L)
     }
 
     override fun multiDrawIndexed(drawParameters: IntBuffer, instanceCount: Int,
         firstInstance: Int, drawCount: Int) {
-        val profT0 = if (MCDR_ABI.PROF) System.nanoTime() else 0L
+        val profT0 = if (RenderProfiling.enabled) System.nanoTime() else 0L
         require(drawCount >= 0) { "drawCount must be non-negative" }
         if (drawCount == 0) {
-            recordMultiProfile(0, profT0)
+            D3D12RenderProf.recordMultiDraw(0, profT0)
             return
         }
-        val parameters = IntArray(Math.multiplyExact(drawCount, 3))
-        drawParameters.get(parameters)
-        val lineQuad = this.pipeline?.takeIf { it.hasLineQuadVariant() }
-        val lineQuadDepth = lineQuad?.let { it.info().depthStencilState != null } ?: false
-        if (lineQuad != null && !MCDR_ABI.D3D12SetPipeline(this.ctx, lineQuad.lineQuadPipeline(), lineQuadDepth)) {
-            throw IllegalStateException("dx12SetPipeline (line quad variant) failed")
-        }
-        if (lineQuad != null) this.anyDescriptorDirty = true
-        try {
-            this.pushDescriptors()
-            if (!MCDR_ABI.D3D12MultiDrawIndexedPacked(this.ctx, parameters, instanceCount,
-                firstInstance, drawCount)) {
-                throw IllegalStateException("dx12MultiDrawIndexedPacked failed: ${MCDR_ABI.D3D12LastError()}")
-            }
-        } finally {
-            if (lineQuad != null) {
-                if (!MCDR_ABI.D3D12SetPipeline(this.ctx, lineQuad.handle(), lineQuadDepth)) {
-                    throw IllegalStateException("dx12SetPipeline (restore after line quad) failed")
-                }
-                this.anyDescriptorDirty = true
+        val parameterCount = Math.multiplyExact(drawCount, 3)
+        val parameters = packedMultiDrawParameters(parameterCount)
+        drawParameters.get(parameters, 0, parameterCount)
+        if (instanceCount > 0) policy.retainIndexedGeometryReads(lastVertexBuffer, currentIndexBuffer)
+        withLineQuad {
+            if (canRecordRasterMotion()) {
+                recordMotionBatch(true, parameters, instanceCount, firstInstance, drawCount)
+            } else {
                 this.pushDescriptors()
+                if (!MCDR_ABI.D3D12MultiDrawIndexedPacked(this.ctx, parameters, instanceCount,
+                    firstInstance, drawCount)) {
+                    throw IllegalStateException("dx12MultiDrawIndexedPacked failed: ${MCDR_ABI.D3D12LastError()}")
+                }
             }
+            if (instanceCount > 0) recordRasterDraw(additionalBindings?.target ?: 0L)
         }
-        recordMultiProfile(drawCount, profT0)
+        D3D12RenderProf.recordMultiDraw(drawCount, profT0)
     }
 
     override fun multiDrawIndexed(firstIndexOffsets: PointerBuffer, indexCounts: IntBuffer,
         vertexOffsets: IntBuffer, drawCount: Int) {
-        val profT0 = if (MCDR_ABI.PROF) System.nanoTime() else 0L
+        val profT0 = if (RenderProfiling.enabled) System.nanoTime() else 0L
         require(drawCount >= 0) { "drawCount must be non-negative" }
         if (drawCount == 0) {
-            recordMultiProfile(0, profT0)
+            D3D12RenderProf.recordMultiDraw(0, profT0)
             return
         }
         val indexType = this.currentIndexType
             ?: throw IllegalStateException("multiDrawDirectSeparate requires a bound index buffer")
         val elementBytes = if (indexType == IndexType.INT) 4L else 2L
-        val firstIndices = IntArray(drawCount)
-        val counts = IntArray(drawCount)
-        val bases = IntArray(drawCount)
+        ensureMultiDrawColumns(drawCount, indexed = true)
+        val firstIndices = multiDrawFirstScratch
+        val counts = multiDrawCountScratch
+        val bases = multiDrawBaseScratch
         for (i in 0 until drawCount) {
             val byteOffset = firstIndexOffsets.get()
             require(byteOffset >= 0L && byteOffset % elementBytes == 0L) {
@@ -556,89 +792,90 @@ class D3D12RenderPassBackend(
             counts[i] = indexCounts.get()
             bases[i] = vertexOffsets.get()
         }
-        val lineQuad = this.pipeline?.takeIf { it.hasLineQuadVariant() }
-        val lineQuadDepth = lineQuad?.let { it.info().depthStencilState != null } ?: false
-        if (lineQuad != null && !MCDR_ABI.D3D12SetPipeline(this.ctx, lineQuad.lineQuadPipeline(), lineQuadDepth)) {
-            throw IllegalStateException("dx12SetPipeline (line quad variant) failed")
-        }
-        if (lineQuad != null) this.anyDescriptorDirty = true
-        try {
-            this.pushDescriptors()
-            if (!MCDR_ABI.D3D12MultiDrawIndexedSeparate(this.ctx, firstIndices, counts, bases, 1, 0,
-                drawCount)) {
-                throw IllegalStateException("dx12MultiDrawIndexedSeparate failed: ${MCDR_ABI.D3D12LastError()}")
-            }
-        } finally {
-            if (lineQuad != null) {
-                if (!MCDR_ABI.D3D12SetPipeline(this.ctx, lineQuad.handle(), lineQuadDepth)) {
-                    throw IllegalStateException("dx12SetPipeline (restore after line quad) failed")
+        policy.retainIndexedGeometryReads(lastVertexBuffer, currentIndexBuffer)
+        withLineQuad {
+            if (canRecordRasterMotion()) {
+                val parameters = packedMultiDrawParameters(Math.multiplyExact(drawCount, 3))
+                for (index in 0 until drawCount) {
+                    parameters[index * 3] = firstIndices[index]
+                    parameters[index * 3 + 1] = counts[index]
+                    parameters[index * 3 + 2] = bases[index]
                 }
-                this.anyDescriptorDirty = true
+                recordMotionBatch(true, parameters, 1, 0, drawCount)
+            } else {
                 this.pushDescriptors()
+                if (!MCDR_ABI.D3D12MultiDrawIndexedSeparate(this.ctx, firstIndices, counts, bases, 1, 0,
+                    drawCount)) {
+                    throw IllegalStateException("dx12MultiDrawIndexedSeparate failed: ${MCDR_ABI.D3D12LastError()}")
+                }
             }
+            recordRasterDraw(additionalBindings?.target ?: 0L)
         }
-        recordMultiProfile(drawCount, profT0)
+        D3D12RenderProf.recordMultiDraw(drawCount, profT0)
     }
 
     override fun drawIndexedIndirect(commands: GpuBufferSlice, drawCount: Int) {
         require(drawCount >= 0) { "Draw count must be non-negative" }
         if (drawCount == 0) return
-        val location = this.pipeline?.info()?.location?.toString() ?: ""
-        if (this.pipeline?.info()?.let(D3D12TerrainWorkGraph::requiresOrderedDraw) == true) {
+        if (route == D3D12RasterRoute.TERRAIN_WORK_GRAPH) {
+            tryMeshletDraw(commands, drawCount)
+            return
+        }
+        policy.retainIndexedGeometryReads(lastVertexBuffer, currentIndexBuffer)
+        withRasterMotion({ policy.prepareIndirectMotionBindings() }) {
             this.pushDescriptors()
             check(MCDR_ABI.D3D12DrawIndexedIndirect(this.ctx,
                 (commands.buffer() as D3D12GpuBuffer).handle(), commands.offset(), drawCount)) {
-                "Ordered transparent draw failed: ${MCDR_ABI.D3D12LastError()}"
+                "dx12DrawIndexedIndirect failed: ${MCDR_ABI.D3D12LastError()}"
             }
-            return
-        }
-        if (gDrawIndirectLocations.add(location)) {
-            // 作用域白名单按管线名判：名字错了整条通路就是静默空转，所以每个新名字打一行方便核对。
-            LOGGER.info("MDI terrain candidate '{}' terrain={} rate={}", location,
-                isTerrain(location), D3D12VariableShadingRate.terrainRateFor(location))
-        }
-        // 地形**全部**（不透明 + OIT 半透明）只走 meshlet，无 IMR 回退；OIT 顺序无关，mesh 的线程组顺序才无所谓。
-        if (isTerrain(location)) {
-            // 着色率唯一作用域：整批地形包在一次 scope 内，白名单在 `terrainRateFor`；档位 OFF 时零 native 调用。
-            D3D12VariableShadingRate.scope(this.ctx, location) {
-                tryMeshletDraw(commands, drawCount)
-            }
-            return
-        }
-        this.pushDescriptors()
-        if (!MCDR_ABI.D3D12DrawIndexedIndirect(this.ctx,
-            (commands.buffer() as D3D12GpuBuffer).handle(), commands.offset(), drawCount)) {
-            throw IllegalStateException("dx12DrawIndexedIndirect failed")
+            recordRasterDraw(additionalBindings?.target ?: 0L)
         }
     }
 
-    /** 地形管线（含 OIT 三段）；shadow 不属于本路径。 */
-    private fun isTerrain(location: String): Boolean =
-        location.contains("terrain") && !location.contains("shadow")
-
     private fun tryMeshletDraw(commands: GpuBufferSlice, drawCount: Int) {
-        check(meshDispatchEnabled) { "Terrain Work Graph requires mesh dispatch" }
         val compiled = checkNotNull(this.pipeline) { "No terrain pipeline bound" }
         val vertexBuffer = checkNotNull(this.lastVertexBuffer as? D3D12GpuBuffer) { "No terrain vertex buffer" }
-        val prepared = checkNotNull(D3D12TerrainWorkGraph.prepare(compiled, commands, drawCount,
-            vertexBuffer, this.lastVertexSliceOffset, this.ctx, this.transientMemory,
-            this.meshletResidency, this.uniforms, D3D12Settings.meshTerrainCull,
-            D3D12VariableShadingRate.msBand())) { "Terrain Work Graph inputs or pipeline are unavailable" }
+        val motionTarget = if (!flipY && hasDepth) rasterMotionTarget else 0L
+        val draw = D3D12TerrainDraw(compiled, commands, drawCount, vertexBuffer,
+            lastVertexSliceOffset, motionTarget, additionalBindings?.attachment, uniforms,
+            textures["Sampler0"]?.view?.takeIf { !flipY && hasDepth }, textures["Sampler0"]?.sampler,
+            textures["Sampler2"]?.let { D3D12RasterSampledView(it.view, it.sampler) },
+            textures["Sampler0"]?.view, textures["Sampler0"]?.sampler,
+        )
         val useDepth = this.hasDepth && compiled.info().depthStencilState != null
-        prepared.use {
+        policy.recordTerrain(draw) { prepared ->
+            val capture = prepared.capture
+            if (capture != null) {
+                recordCapturedDraw(capture) {
+                    check(prepared.draw(this.ctx, vertexBuffer, this.lastVertexSliceOffset)) {
+                        "Terrain capture draw failed: ${MCDR_ABI.D3D12LastError()}"
+                    }
+                }
+                policy.recordDraw(0L)
+                return@recordTerrain
+            }
+            var failure: Throwable? = null
             try {
-                check(MCDR_ABI.D3D12SetPipeline(this.ctx, it.pipeline, useDepth)) {
+                check(MCDR_ABI.D3D12SetPipeline(this.ctx, prepared.pipeline, useDepth)) {
                     "Terrain pipeline bind failed: ${MCDR_ABI.D3D12LastError()}"
                 }
                 this.anyDescriptorDirty = true
                 this.pushDescriptors()
-                check(it.draw(this.ctx, vertexBuffer, this.lastVertexSliceOffset)) {
+                check(prepared.draw(this.ctx, vertexBuffer, this.lastVertexSliceOffset)) {
                     "Terrain indirect draw failed: ${MCDR_ABI.D3D12LastError()}"
                 }
+                recordRasterDraw(additionalBindings?.target ?: 0L)
+            } catch (drawFailure: Throwable) {
+                failure = drawFailure
+                throw drawFailure
             } finally {
                 this.anyDescriptorDirty = true
-                check(MCDR_ABI.D3D12SetPipeline(this.ctx, compiled.handle(), useDepth)) {
-                    "Terrain pipeline restore failed: ${MCDR_ABI.D3D12LastError()}"
+                try {
+                    check(MCDR_ABI.D3D12SetPipeline(ctx, additionalBindings?.pso ?: compiled.handle(), useDepth)) {
+                        "Terrain pipeline restore failed: ${MCDR_ABI.D3D12LastError()}"
+                    }
+                } catch (cleanup: Throwable) {
+                    if (failure == null) throw cleanup else failure.addSuppressed(cleanup)
                 }
             }
         }
@@ -646,52 +883,90 @@ class D3D12RenderPassBackend(
 
 
     override fun draw(vertexCount: Int, instanceCount: Int, firstVertex: Int, firstInstance: Int) {
-        this.pushDescriptors()
-        if (!MCDR_ABI.D3D12Draw(this.ctx, vertexCount, instanceCount, firstVertex, firstInstance)) {
-            throw IllegalStateException("dx12Draw failed")
+        withRasterMotion({ policy.prepareMotionBindings(firstVertex, instanceCount) }) {
+            this.pushDescriptors()
+            if (!MCDR_ABI.D3D12Draw(this.ctx, vertexCount, instanceCount, firstVertex, firstInstance)) {
+                throw IllegalStateException("dx12Draw failed")
+            }
+            if (vertexCount > 0 && instanceCount > 0) recordRasterDraw(additionalBindings?.target ?: 0L)
         }
     }
 
     override fun multiDraw(drawParameters: IntBuffer, instanceCount: Int, firstInstance: Int,
         drawCount: Int) {
-        val profT0 = if (MCDR_ABI.PROF) System.nanoTime() else 0L
+        val profT0 = if (RenderProfiling.enabled) System.nanoTime() else 0L
         require(drawCount >= 0) { "drawCount must be non-negative" }
         if (drawCount == 0) {
-            recordMultiProfile(0, profT0)
+            D3D12RenderProf.recordMultiDraw(0, profT0)
             return
         }
-        val parameters = IntArray(Math.multiplyExact(drawCount, 2))
-        drawParameters.get(parameters)
+        val parameterCount = Math.multiplyExact(drawCount, 2)
+        val parameters = packedMultiDrawParameters(parameterCount)
+        drawParameters.get(parameters, 0, parameterCount)
+        if (canRecordRasterMotion()) {
+            val triples = packedMultiDrawParameters(Math.multiplyExact(drawCount, 3))
+            for (index in drawCount - 1 downTo 0) {
+                val first = parameters[index * 2]
+                val count = parameters[index * 2 + 1]
+                triples[index * 3] = first
+                triples[index * 3 + 1] = count
+                triples[index * 3 + 2] = 0
+            }
+            recordMotionBatch(false, triples, instanceCount, firstInstance, drawCount)
+            if (instanceCount > 0) recordRasterDraw(additionalBindings?.target ?: 0L)
+            D3D12RenderProf.recordMultiDraw(drawCount, profT0)
+            return
+        }
         this.pushDescriptors()
         if (!MCDR_ABI.D3D12MultiDrawPacked(this.ctx, parameters, instanceCount, firstInstance, drawCount)) {
             throw IllegalStateException("dx12MultiDrawPacked failed: ${MCDR_ABI.D3D12LastError()}")
         }
-        recordMultiProfile(drawCount, profT0)
+        if (instanceCount > 0) recordRasterDraw(additionalBindings?.target ?: 0L)
+        D3D12RenderProf.recordMultiDraw(drawCount, profT0)
     }
 
     override fun multiDraw(firstVertices: IntBuffer, vertexCounts: IntBuffer, drawCount: Int) {
-        val profT0 = if (MCDR_ABI.PROF) System.nanoTime() else 0L
+        val profT0 = if (RenderProfiling.enabled) System.nanoTime() else 0L
         require(drawCount >= 0) { "drawCount must be non-negative" }
         if (drawCount == 0) {
-            recordMultiProfile(0, profT0)
+            D3D12RenderProf.recordMultiDraw(0, profT0)
             return
         }
-        val first = IntArray(drawCount)
-        val counts = IntArray(drawCount)
-        firstVertices.get(first)
-        vertexCounts.get(counts)
+        ensureMultiDrawColumns(drawCount, indexed = false)
+        val first = multiDrawFirstScratch
+        val counts = multiDrawCountScratch
+        firstVertices.get(first, 0, drawCount)
+        vertexCounts.get(counts, 0, drawCount)
+        if (canRecordRasterMotion()) {
+            val parameters = packedMultiDrawParameters(Math.multiplyExact(drawCount, 3))
+            for (index in 0 until drawCount) {
+                parameters[index * 3] = first[index]
+                parameters[index * 3 + 1] = counts[index]
+                parameters[index * 3 + 2] = 0
+            }
+            recordMotionBatch(false, parameters, 1, 0, drawCount)
+            recordRasterDraw(additionalBindings?.target ?: 0L)
+            D3D12RenderProf.recordMultiDraw(drawCount, profT0)
+            return
+        }
         this.pushDescriptors()
         if (!MCDR_ABI.D3D12MultiDrawSeparate(this.ctx, first, counts, drawCount)) {
             throw IllegalStateException("dx12MultiDrawSeparate failed: ${MCDR_ABI.D3D12LastError()}")
         }
-        recordMultiProfile(drawCount, profT0)
+        recordRasterDraw(additionalBindings?.target ?: 0L)
+        D3D12RenderProf.recordMultiDraw(drawCount, profT0)
     }
 
     override fun drawIndirect(commands: GpuBufferSlice, drawCount: Int) {
-        this.pushDescriptors()
-        if (!MCDR_ABI.D3D12DrawIndirect(this.ctx,
-            (commands.buffer() as D3D12GpuBuffer).handle(), commands.offset(), drawCount)) {
-            throw IllegalStateException("dx12DrawIndirect failed")
+        require(drawCount >= 0) { "Draw count must be non-negative" }
+        if (drawCount == 0) return
+        withRasterMotion({ policy.prepareIndirectMotionBindings() }) {
+            this.pushDescriptors()
+            check(MCDR_ABI.D3D12DrawIndirect(this.ctx,
+                (commands.buffer() as D3D12GpuBuffer).handle(), commands.offset(), drawCount)) {
+                "dx12DrawIndirect failed: ${MCDR_ABI.D3D12LastError()}"
+            }
+            recordRasterDraw(additionalBindings?.target ?: 0L)
         }
     }
 }

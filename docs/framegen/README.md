@@ -22,32 +22,36 @@
 | --- | --- | --- | --- |
 | 接管方式 | Streamline 代理（`sl.dlss_g`） | 自己包 `IDXGISwapChain` | 自己包 `IDXGISwapChain` |
 | 链归属常量 | `SL_PROXY` | `FSR_WRAP` | `XESS_WRAP` |
-| 需要独立 world 层 | 否（复用超分输出） | 是 | 是 |
-| 需要 UI 纹理 | 否（`needsUiResource = 0`） | 是 | 是 |
-| 需要深度 / 运动矢量 | 由 SL 侧取 | 是 | 是 |
-| 需要 view/projection 常量 | 否 | 是 | 是（行主序） |
+| 场景输入 | 最终 SceneDisplay | 最终 SceneDisplay | 最终 SceneDisplay |
+| UI 输入 | 独立 UiDisplay 标签 | 独立 UiDisplay 合成 | 独立 UiDisplay 标签 |
+| 深度 / 运动矢量 | 显示工作图输出 | 显示工作图输出 | 显示工作图输出，完整 tuple dilation |
+| 相机常量 | native 翻译显示相机，viewport1 | native 翻译显示相机 | native 翻译显示相机（行主序） |
 | 低延迟依赖 | Reflex（`needsReflex = 1`） | Anti-Lag 2（预留） | XeLL |
 | 每提交最多插几张 | 5 | 1（只有 2×） | 由 SDK 报，镜像到上限 |
 | 运行库在发行包里 | 否 | 否 | 是 |
 
-「需要独立 world 层」决定了 §1.3 的 hudless 模式：只有**包装型后端**（FSR-FG / XeSS-FG）需要把 UI 从呈现源里剥出去，DLSS-G 不需要。
+三家共用同一份最终场景、显示尺寸 guides 与 UI；交换链的 UI 合成规则由各 adapter 按 SDK 契约实现。
 
 ### 1.3 为什么需要 hudless UI
 
 如果把 HUD（准星、血条、文字、物品栏）一起烘进世界层再交给插帧后端，后端会把 HUD 当成「世界内容」按运动矢量插值：准星被拉扯、文字发糊、快捷栏跟着视角一起「游」。UI 本来应该是每帧都清晰、且不该被插值的东西。
 
-于是有了 **hudless 呈现**：present 给交换链的 backbuffer **只含世界层**，UI 另存一张透明纹理交给后端，由后端在合成阶段「一次性、无插值」地叠上去。
+显示过程保留三张窗口尺寸纹理：SceneDisplay 包含重建后的世界、第一人称手部及晚期效果，UiDisplay 从透明底绘制 GUI，composite 保存二者合成结果。
 
+```mermaid
+flowchart LR
+    World[世界 AA / SR] --> Scene[SceneDisplay + 手部 / 效果]
+    Gui[GUI] --> Ui[透明 UiDisplay]
+    Scene --> FG[GUI 完成后的 FG 输入]
+    Ui --> FG
+    Scene --> Composite[完整 composite]
+    Ui --> Composite
+    FG --> Provider[SDK adapter]
+    Composite --> Present[真实帧 Present]
+    Provider --> Present
 ```
-合成模式（无 hudless：DLSS-G 走这条，或帧生成关闭）
-  世界层 ──blit──▶ GUI 目标 ──画 UI──▶ 世界+UI 已合成 ──▶ Present
 
-hudless 模式（FSR-FG / XeSS-FG）
-  世界层 ──────────────────────────────────────────▶ Present（只有世界）
-  GUI 目标（透明底，只画 UI）──▶ 注册为 UI 纹理 ──▶ SDK 在合成阶段叠上去
-```
-
-关键约束：**同一帧里不能换模式**。世界层的去向（搬进 GUI 目标 vs 直接呈现）必须与超分本帧的行为一致，而超分的挂点排在 GUI 之前，所以模式只在帧边界（present 之后）裁决一次。
+FSR 的 scene-only Present 需要当帧 UI 注册成功。DLSS-G、XeSS-FG 仍使用各自的呈现与 UI 标签契约。每帧保持完整 composite，readiness 失败或本帧跳过 FG 时选择它，避免丢失界面。世界重建的输出目标固定为 SceneDisplay，UI 决策无需改变已经完成的 SR。
 
 ### 1.4 UI 纹理契约
 
@@ -58,9 +62,9 @@ hudless 模式（FSR-FG / XeSS-FG）
 3. **尺寸**：必须是窗口像素尺寸，与呈现源同尺寸——SDK 把「UI 纹理」理解成最终输出分辨率。
 4. **内容**：`RGBA8`，从**全透明**开始画。原版 `BlendFunction.TRANSLUCENT` 的 alpha 通道是 `ONE / INV_SRC_ALPHA`，所以「透明底 + 普通混合」得到的结果正好是「RGB 按自身 alpha 预乘 + alpha 是覆盖度」，对应 FidelityFX 的 `USE_PREMUL_ALPHA` 合成约定。
 
-配套的开关语义：`setUiComposition(1)` 表示「下一次 present 的 backbuffer 里只有世界层，UI 由 SDK 用这张纹理合成一次」；`0` 表示回到旧路径，此时后端**不得**注册 UI 资源，否则 HUD 会被合成两遍（界面上出现重影）。JVM 侧只在值真的变化时才推这个标志。
+配套的开关语义：`setUiComposition(1)` 请求 FSR 对本次 scene-only Present 合成 UI；`0` 使用完整 composite。GUI 完成后准备请求，晚期 DisplayFrame 接受后再次确认当帧 readiness，JVM 的 latch 与 native 同步。准备失败、本帧未被 SDK 接受或 GUI 已包含模糊场景背景时关闭 scene-only 呈现。菜单和加载帧显示完整 GUI。
 
-hudless 由 JVM 决定，因为只有 JVM 知道「这一帧有没有 3D 世界层」：门槛是 `FrameGeneration.hudlessWanted()`（帧生成开着、后端是 FSR-FG、且已进世界），真正的锁存（latch）在 `armUiComposition()` 里做——它把「想要」与「native 已就绪」合成一个每帧闸门。菜单、加载屏、暂停界面没有东西可插，应该直通合成。
+UiDisplay 清理前必须完成上一帧 Present 与 SDK 源读取等待。工作图对最终像素的 depth/MV/validity/provenance 作统一变换；整层或像素运动缺失、未知 post 映射、GUI 已含场景时跳过本帧 FG，真实帧继续呈现。
 
 ### 1.5 为什么有些后端不可用（发行包只带 XeSS 运行库）
 
@@ -82,22 +86,25 @@ hudless 由 JVM 决定，因为只有 JVM 知道「这一帧有没有 3D 世界�
 
 ## 2. 架构与数据流
 
+帧生成配置遵循 [`../rendering/render-configuration.md`](../rendering/render-configuration.md)：FG Prepare 与 SR Prepare 先分别形成候选，组合 Commit 成功后才发布世界附件和 UI 状态。同尺寸准备失败保留原 applied；resize 尚未 ready 时先发布新尺寸的临时 NONE/FG OFF 配置，同尺寸 SDK 拒绝后暂停自动重试。完整 Published 更新 persistent，save 通过 settingsToSave 读取它，临时配置不覆盖保存值。
+
 ### 2.1 分层
 
 ```
 JVM（策略层，io.github.dxegp）
-  render/presentation/framegen/FrameGeneration.kt            ← 门面：选项、互锁、持久化、文案、push 到 native
-  diagnostics/FrameGenerationSelfTest.kt    ← 自动化验收钩子（不是功能入口）
+  render/presentation/framegen/FrameGeneration.kt            ← 选项、配置请求、持久化与状态展示
   render/presentation/latency/NvidiaReflex.kt          ← Reflex 模式 + 被帧生成强制开启的策略
-  render/presentation/framegen/FrameGenerationConstants.kt         ← 插帧用的 view/projection/jitter 常量
-  render/antialiasing/D3D12GuiSplit.kt  ← 世界层 / UI 层拆分与 hudless 裁决
+  render/presentation/D3D12SceneDisplay.kt ← 重建输出与晚期场景
+  render/presentation/D3D12GUISplit.kt  ← UiDisplay / composite 与当帧 UI 合成
+  render/presentation/display/         ← DisplayFrameInputs 冻结、guides Prepare 与晚期 Submit
   d3d12/surface/D3D12GpuSurface.kt         ← present：调 native、帧计数、裁决挂点
   d3d12/ffi/MCDR_ABI.kt + MCDR_Layout.kt   ← FFM 绑定与结构体布局（唯一 native 入口）
-        │  fgPick / fgQueryCaps / fgSetMode / fgPresented / fgState / fgSetUiTexture /
-        │  fgSetUiComposition / fgUiCompositionReady / fgSetConstants
+        │  FG Prepare / SR Prepare / Commit / fgQueryCaps / fgState / fgSetUiTexture /
+        │  fgSetUiComposition / fgUiCompositionReady / beginDisplayFrame / prepareDisplayFrame / submitDisplayFrame
         ▼
 native（MCDR，C++23 模块）
   src/render/presentation/d3d12_framegen.cpp  ← 注册表（picked/applied/chainOwner）、门面、回滚判定
+  src/render/presentation/d3d12_display_frame.cpp ← 显示 guides 工作图与有效性判定
   src/render/reconstruction/d3d12_dlss.cpp      ← DLSS-G provider（真正的 slDLSSGSetOptions 在这里下发）
   src/render/presentation/d3d12_fsffg.cpp     ← FSR-FG provider（FFX 类型只在这个单元里）
   src/render/presentation/d3d12_xessfg.cpp    ← XeSS-FG provider
@@ -108,44 +115,33 @@ native（MCDR，C++23 模块）
 
 ### 2.2 一帧的时序
 
-设置线程（用户动开关）：
-
-```
-用户点「DLSS 帧生成」开关
-  └─ FrameGeneration.requestBackend(DLSSG, true)
-       ├─ selectedBackend = DLSSG, currentMode = 1（互锁：另外两家自动关）
-       ├─ syncOptions()                ← 把状态写回 OptionInstance（给界面看）
-       └─ push()
-            ├─ invalidateCaps() / capsFor(backend)   ← 1 秒 TTL 内直接用缓存
-            ├─ ensurePrerequisites()                 ← DLSS-G：确保 Reflex 开、超分是 DLSS
-            ├─ 计算 mode / frames
-            └─ fgSetMode(dispatch)                   ← 只记录期望值，不建链、不碰设备
-```
+用户修改设置时，FrameGeneration 只向 RenderConfiguration 提交 requested。渲染线程在帧首创建 PreparedRenderConfiguration，依次 FG Prepare、SR Prepare，再组合 Commit；成功后发布世界附件、applied、Option/UI，完整 Published 再更新 persistent 与保存值。同尺寸失败保留旧配置，resize 按配置契约先确保新尺寸可渲染；要求重启的 provider 切换通过独立结果返回。
 
 渲染线程（每帧）：
 
 ```
-渲染
- ├─ 世界渲染（renderScale% 分辨率的主目标）
- ├─ 超分（DLSS / FSR / XeSS）→ 世界层
- ├─ FrameGenerationConstants.push(jitter, reset)   ← 插帧的相机矩阵与抖动
- ├─ D3D12GUISplit.prepareForGui()
- │    ├─ 合成模式：世界层 blit 进 GUI 目标，随后 GUI 画上去
- │    └─ hudless：世界层不动（它就是呈现源），GUI 目标清成全透明后画 UI
- └─ D3D12GpuSurface.present()
-      ├─ D3D12Temporal.onFramePresented()        （时间性 jitter 按帧滚动）
-      ├─ D3D12PresentSurface(handle)
-      │    └─ presentSurface（native）
-      │         ├─ fgBeforePresent()             ← 按期望值建/包链，下发 SDK 选项
-      │         ├─ reflex_before_present()       ← 低延迟帧起点 + 限帧 sleep
-      │         ├─ swapChain->Present(...)       ← 真正插帧发生在这里
-      │         ├─ reflex_after_present()        ← 标记渲染提交
-      │         └─ fgAfterPresent()              ← presentId++、回滚判定、600 帧日志
-      ├─ D3D12FgPresented() → F3 的 output 计数
-      └─ D3D12GUISplit.armUiComposition()        ← 裁决下一帧走 hudless 还是合成
+GameRenderer.render
+ ├─ beginDisplayFrame：按已 configure 的窗口 resize 原版目标 → apply config → native display begin
+ ├─ 原版后续投影上传：使用已发布尺寸/配置计算 jitter
+ ├─ 世界渲染 → WorldReady → 发布 PreparedFrame → AA / SR → SceneDisplay
+ ├─ 手部：独立 HUD projection、depth、motion、coverage
+ ├─ screen effects / outline / post
+ ├─ beforeGui：seal SceneDisplay → prepareForGui → GuiReady → PrepareDisplayFrame
+ │    ├─ 冻结 scene / layers / posts / cameras，世界与手部各带独立 coverage
+ │    └─ 录制 guides / validity，先提交 world + guides，保存 guideFence 并换 ring
+ ├─ CPU 录制 GUI → completeGui
+ ├─ afterGui：SubmitDisplayFrame 只补 UI/backdrop
+ │    ├─ 核对冻结值 → 等准确 guideFence → 同帧 validity 回读
+ │    └─ 有效则 adapter 接受，否则跳过本帧 FG；随后生成完整 composite
+ ├─ 当帧 UI readiness → 选择 scene-only 或完整 composite
+ └─ 最终 blit → command submit → Present → 按 ticket 提交或失效历史
 ```
 
-三个顺序点，每个都有理由：`fgBeforePresent` 必须在 Present 之前（Streamline 的选项在下一次 Present 才生效，写在之后晚一帧）；它还必须排在 Reflex 的限帧 sleep 之前（sleep 期间不该算进「本帧的工作」，且要保证期望值在本次 Present 前已落到 SDK 里）；`armUiComposition()` 必须在 Present 之后（它给「下一帧」定模式，而本帧世界层的去向已由本帧的超分决定，放在帧内会与超分挂点抢时序）。
+provider/交换链在 display begin 准备，避免晚期重建使当帧资源失效。SDK 接受在 GUI 完成、冻结输入与同帧 validity 通过核对后发生；接受、最终提交、真实 Present 分别推进。guide 的中间提交保留同一 context 与 GuiReady，保存 fence 后换 ring 续录，不等待 guide 完成、不创建最终 Present ticket。最终异步 Present 携带不可变 `FgPresentTicket`，按 context、provider generation、frame identity 和 fence 配对，成功后提交历史。
+
+Minecraft.renderFrame HEAD 只记录帧开始时间，之后才 window configure；窗口目标和配置在 beginDisplayFrame 内依次更新。当前构建与运行覆盖见 [实施记录](../rendering/work-graph-implementation.md#当前构建与运行)。
+
+显示 Prepare/Submit 两阶段已接线，最终裁决仍有一次同帧 GPU→CPU 等待/回读；与 CPU GUI 录制重叠后的吞吐与延迟成本尚未测量。配置事务的 FG Prepare 与显示帧 Prepare 是两个入口：前者的 0 表示先前显示帧、录制、Present 或 provider 输入尚未退休，-3 表示 SDK 不支持或参数档位拒绝；显示帧 Prepare/Submit 的返回值、ABI11、coverage 编码和跳过条件见 [FFM ABI](../misc/ffm-abi.md)。
 
 设备移除（device removed）时，present 的帧生成钩子直接跳过并只警告一次：这些钩子会解引用设备对象，在已失效的设备上继续走就是崩在 SDK 里。
 
@@ -155,7 +151,7 @@ native 注册表里维护三套计数，**不能混用**：
 
 | 轨道 | 递增点 | 用途 |
 | --- | --- | --- |
-| `appFrameId` | `fgBeforePresent` 每次真实调用 | 应用侧「第几个渲染帧」，日志对账 |
+| `appFrameId` | display begin / provider 帧开始 | 应用侧真实显示帧，日志对账 |
 | `backendFrameId` | provider 每次把帧交给 SDK 时 | 后端侧提交序号，必须严格 +1 |
 | `presentId` | `Present` 成功之后 | 真实呈现次数，回滚判定与宽限计时都基于它 |
 
@@ -163,7 +159,7 @@ native 注册表里维护三套计数，**不能混用**：
 
 ### 2.4 期望值与生效值
 
-门面只记录「想要什么」（`desiredMode` / `desiredFrames`），真正生效要等下一次 `fgBeforePresent` 去建/包链。因此同一个状态在两侧有不同的表达：`picked` = 用户选的后端 id（`0` = 没选）；`applied` = 真正建好 provider 的后端 id；`chainOwner` = 当前交换链被谁接管（`APP_NATIVE` / `SL_PROXY` / `FSR_WRAP` / `XESS_WRAP`）；`chainMode` = 链是按「不带插帧」还是「带插帧」建的（0 / 1）。
+JVM 的 requested/applied 表达配置请求与成功发布；native 的运行状态继续记录 provider 与交换链实际状态。组合 Commit 更新被接受的 FG/SR 配置，display begin 再沿 native 生命周期准备对应 provider/交换链。因此同一个状态在两侧有不同的表达：`picked` = 用户选的后端 id（`0` = 没选）；`applied` = 真正建好 provider 的后端 id；`chainOwner` = 当前交换链被谁接管（`APP_NATIVE` / `SL_PROXY` / `FSR_WRAP` / `XESS_WRAP`）；`chainMode` = 链是按「不带插帧」还是「带插帧」建的（0 / 1）。
 
 「期望 ≠ 生效」时，能力表的 `note` 会被**替换成**失败理由，而不是继续显示静态的 `ready`。不这么做的话，用户点了开关、实际什么都没发生，界面还在说「已就绪」——界面在说假话。
 
@@ -197,9 +193,9 @@ native 注册表里维护三套计数，**不能混用**：
 | --- | --- | --- |
 | 用哪个后端 | JVM（用户点开关） | 三家观感/延迟/兼容都不同，不做自动挑 |
 | 能不能用 | native `fillCaps` | 只有 native 知道运行库、设备、链 |
-| 期望 mode / frames | JVM 门面 → `fgSetMode` | 设置属于策略，且要能持久化 |
-| 何时建链 / 包链 | native，在 Present 前 | 只有 device 模块能碰交换链 |
-| 本帧是否 hudless | JVM，在 Present 后 | 只有 JVM 知道本帧有没有世界层 |
+| mode / frames 配置 | RenderConfiguration → FG Prepare/组合 Commit | 只发布已成功准备的配置 |
+| 何时建链 / 包链 | native，在 display begin | 设备拥有交换链与 provider 生命周期 |
+| 本帧是否 scene-only | GUI 完成、晚期提交后的 JVM/native readiness | 必须对应本帧已接受输入及 UI 注册 |
 | 何时回滚 | native | 需要连续帧的可用性统计 |
 
 「不做自动挑后端」是明确的产品决定：三条链路的画面、延迟、兼容性都不同，自动挑会把用户带进一个他自己没选过的路径，出问题时也无法解释。`selectedBackend == 0` 就是「关」。
@@ -214,7 +210,7 @@ native 注册表里维护三套计数，**不能混用**：
 
 ### 3.2 被帧生成强制开启
 
-帧生成要求 Reflex 必须开。`NvidiaReflex.push(mode)` 里做了兜底：帧生成开启时，`mode == 0` 会被提升为 `1`；`ensurePrerequisites` 里还会显式调用 `forceOn()` 并记住「是帧生成逼的」（`forcedByFrameGeneration`），关掉帧生成时再 `releaseFrameGenerationForce()` 还原用户原来的选择。
+只有能力表声明 `needsReflex` 的后端强制 Reflex。RenderConfiguration 成功发布该配置后调用 `forceOn()`；关闭或切换到不要求 Reflex 的配置后调用 `releaseFrameGenerationForce()`，恢复用户偏好。准备未成功时不提前改变 Reflex 生效状态。
 
 为什么不能只写 `OPTION.set(1)`：`Options.load()` 期间 `OptionInstance.set` 不触发回调，写了选项但 native 没收到，于是「界面显示开、实际没开」。所以强制路径必须同时写选项与 native 两处。同样的理由，`save()` 写的是 `currentMode` 而不是 `OPTION.get()`：原版在某些时机会把选项重置回默认值，信选项就会把用户的选择弄丢。
 
@@ -240,38 +236,13 @@ Reflex 每帧两个点：`before_present`（帧起点 + 限帧 sleep）与 `afte
 
 `options.txt` 里一行 `dxrMcReflex:<off|on|boost>`。加载时按名字或数字解析，越界或无法识别就回到默认；保存时先过滤掉旧行再追加，避免出现两行。
 
-## 4. 自检（`FrameGenerationSelfTest`）
+## 4. 自动化验证边界
 
-### 4.1 定位
+帧生成的运行时门面不包含自动化开关、强制后端或按 tick 改配置的测试钩子。需要验证能力表、后端切换和 provider 生命周期时，在 `src/probes/` 或独立客户端脚本中调用公开 ABI，并使用独立进程和场景日志收集结果。验证程序不得写入玩家配置，也不得从 `IllusionClient` 注册 tick 监听器。
 
-它是**自动化验收用的钩子**，不是给玩家用的功能入口。触发方式是系统属性 `dxrmc.selfTest`，构建脚本里的 `-Pdxrmc.selfTest` 会把它转成 `-D`。用属性而不是配置项，是因为它要能在「无人值场的自动跑」里按 tick 精确改设置；`-Pdxrmc.*` 这一族参数都只用于自动化。规格为空时它不注册任何监听器，正常玩家路径上没有开销。
+### 4.1 失败如何降级
 
-### 4.2 规格
-
-`action@tick,action@tick`，tick 从**世界加载完成**开始计（20 tick = 1 秒）。解析失败会打印「想要 `act@tick,act@tick`」的警告并整体放弃；负数或未知动作同样算解析失败。
-
-为什么按 tick 而不是按秒：设置变更必须落在确定的世界帧上，否则「第 N 帧改设置」这种复现条件在两次运行之间会漂移。
-
-### 4.3 动作表
-
-| 动作 | 作用 |
-| --- | --- |
-| `fg-on` / `fg-off` | 按自检指定的后端开关帧生成 |
-| `fg-backend-dlssg` / `fg-backend-fsr` / `fg-backend-xess` | 强制选后端（越过 `available` 检查） |
-| `sr-dlss` / `sr-fsr` / `sr-xess` / `sr-none` | 切超分后端 |
-| `probe-fg` | 打印三家后端的完整能力表（可用性、链、依赖、倍率上限、延迟提供者、note） |
-
-`probe-fg` 是排障的主要手段：一条日志就能看出「运行库加载了吗、设备支持吗、链能不能包、缺的是 Reflex 还是 UI 资源」。
-
-### 4.4 为什么要绕过门面
-
-`fg-on` / `fg-off` 除了走正常的 `requestBackend`，还会把期望值**直推**给 native（`pushFrameGenModeDirectly`）。原因是：门面会把 mode 映射成 0（当它认为该后端不可用时），而自检的整个目的就是验证「不可用的后端被强行拉起来会怎样」，走门面就永远验证不到。强制路径同时会让 native 越过 `available` 检查建 provider——否则实验性后端连 provider 都建不出来，包装逻辑永远不会被触发。
-
-强制选定的语义仍然受 §6 第 1 条约束：自检里「启动时是 FSR、20 tick 后改 XeSS」这种序列会在几秒后崩在 SDK 线程里，这是设计上拒绝的状态。
-
-### 4.5 失败如何降级
-
-自检不改变运行时的降级策略，只是把状态暴露出来。真正的降级链是三段：`available = 0` → 门面不选它（发行版就是这一层，界面上显示原因）；建链/包链失败 → 每 30 帧重试，`note` 写失败理由；连续 60 帧不可用 → 回滚（§2.5），并在界面上显示「已回滚」。
+能力状态不改变运行时的降级策略，只是把状态暴露出来。真正的降级链是三段：`available = 0` → 门面不选它（发行版就是这一层，界面上显示原因）；建链/包链失败 → 每 30 帧重试，`note` 写失败理由；连续 60 帧不可用 → 回滚（§2.5），并在界面上显示「已回滚」。
 
 **回滚不改 JVM 的设置**：设置仍然是「开」，用户再点一次开关才会重新尝试。这是有意的——自动改用户的设置会让「我明明开了却没了」变成另一个谜。
 
@@ -312,26 +283,26 @@ Reflex 每帧两个点：`before_present`（帧起点 + 限帧 sleep）与 `afte
 
 ## 6. 不变量与硬约束
 
-1. **一次会话只用一个「接管交换链」的后端**。链已被 FSR-FG / XeSS-FG 接管时改选别的后端会被拒绝（`fgPick` 返回 0，理由 `restart to switch FG`）：代理链的上下文绑在旧 provider 上，热切换会让下一次 Present 走一条已经没有上下文的链（实测崩在 SDK 线程或返回运行期错误）。同一后端重建链（resize）不受此限制。
+1. **一次会话只用一个「接管交换链」的后端**。链已被 FSR-FG / XeSS-FG 接管时改选别的后端会被拒绝（FG Prepare 返回需重启结果，界面显示原因）：代理链的上下文绑在旧 provider 上，热切换会让下一次 Present 走一条已经没有上下文的链（实测崩在 SDK 线程或返回运行期错误）。同一后端重建链（resize）不受此限制。
 2. **换后端前必须先解包，再 shutdown**：不解包就 shutdown，代理链会留在 `IDXGISwapChain` 里，新后端再包一次就是双重包装。
 3. **`available` 是唯一结论位**：其余字段都是解释，JVM 的任何「能不能开」判断都必须回到它。
-4. **门面关闭时必须发给「上次真正下发的那个后端」**：发给一个新后端（或固定发 0 给 DLSS-G）都关不掉已经开着的那个。
-5. **期望值只有在下一次 Present 前才生效**：设置线程绝不直接建链、碰设备。
-6. **一帧内不换 hudless 模式**，模式只在 present 之后裁决一次。
-7. **hudless 与「超分 = DLSS」互斥**：DLSS 超分直接把结果写进 GUI 目标，没有独立的世界层纹理，而那张目标又是 DLSS-G 的 hudless 源，两者不能混用。
+4. **关闭也走配置候选**：native 负责释放实际现役 provider，JVM 不向某个猜测的后端逐项写开关。
+5. **配置在组合 Commit 后发布**：requested → 真实候选 → applied，provider/交换链继续在 native 的 display begin 生命周期准备。
+6. **scene-only 只按本帧 readiness 选择**：GUI 完成并提交显示帧后裁决，失效时使用完整 composite。
+7. **所有世界重建写入 SceneDisplay**：手部与晚期效果在重建后继续绘制，FG 不复用早期 SR 输入标签。
 8. **UI 纹理只在目标创建/重建时推**；`setUiComposition(0)` 时后端不得注册 UI 资源。
-9. **hudless 就绪的判据必须包含「已经发生过至少一次插帧 dispatch」**：只看「链已包好」不够——在每帧输入不成立（没有超分 / 100% 缩放）时，provider 只建了上下文、代理链从未 present 过；这时把世界层单独 present 出去，UI 会注册到一条没人 present 的链上，**整个界面消失**。
+9. **scene-only 需要当帧 FG 接受与 UI 注册成功**：仅有 provider/交换链就绪时仍呈现完整 composite。
 10. **`presentId` / `backendFrameId` 严格连续**，且 `presentId` 跨 resize 与切后端不复位。
 11. **设备移除后跳过所有帧生成钩子**，且只警告一次。
 12. **Reflex 关闭时仍每帧调用 sleep 与 PCL 标记**（mode = `eOff`）。
 13. **强制 Reflex 必须同时写选项与 native**：只写选项在 `Options.load()` 期间不生效。
-14. **「帧生成开着」与 Reflex `off` 不能并存**：帧生成开启时，Reflex 下拉只提供 `on` / `boost`，`off` 被隐藏；同理，帧生成开启时不允许切换超分后端。
+14. **Reflex 与 SR 前提由配置和能力表决定**：DLSS-G 要求 DLSS 与 Reflex；其他后端按各自 needsReflex/latencyProvider 处理。
 15. **进程内只有一个 Reflex 上下文、一个 XeLL 上下文**（XeLL 是进程级单例）。
-16. **`FrameGenerationConstants` 只在真正要出帧的渲染帧推**，且与 SR 后端无关。
-17. **插帧常量必须含相机平移**：`view` 用 `V_rot * T(-camPos)` 重新拼一次（世界层是相机相对空间，`clipToPrevClip` 缺平移就会「静止正常、一走动就拖影」）；推送时统一转成 XeSS-FG 的行主序，漏转的表现是画面整块偏移或完全不插帧。
+16. **帧生成读取 native 已复制的冻结帧与晚期 DisplayFrameInputs**；PreparedFrame 仅用于世界 AA/SR，独立 JVM SDK 常量通道已删除。
+17. **native 拥有连续历史参考原点与 SDK 转换**，先求 double 位置差再转 float。pending 候选、SDK accepted、实际 Present committed 分阶段推进；失败或中断失效历史，资源按 fence 保留。wrapped-FG 在提前 tag 新帧前先结算上一 pending Present。
 18. **hudless 下 GUI 目标每帧清成 `(0,0,0,0)`**，否则 UI 纹理带着上一帧内容叠上去就是残影；GUI 目标必须待在窗口尺寸上（`renderScale < 100%` 时塞回主目标会让 scissor 越界、进世界第一帧就崩）。
 19. **能力表必须说清「为什么不能开」**：`note` 区分 `runtimeLoaded` / `deviceSupported` / `chainCompatible` 三种原因，`backend == 0` 时直接走「关」的文案，F3 的 `output` 与倍率按当前生效的 provider 取数、关闭时复位成 1.0（≥ 1.25 才显示）。
-20. **动态倍率一次只走一帧**，倍率变化交给 SDK 的 `eDynamic`（每帧重算会在 2× / 3× 之间来回跳）；能力表缓存在 `push()` 时作废，`save()` 写当前生效的 `currentMode`。
+20. **动态倍率一次只走一帧**，倍率变化交给 SDK 的 `eDynamic`（每帧重算会在 2× / 3× 之间来回跳）；能力状态独立查询，`save()` 通过 settingsToSave 写 persistent，临时 resize applied 不覆盖偏好。
 
 ## 7. 配置与界面入口
 
@@ -345,14 +316,14 @@ Reflex 每帧两个点：`before_present`（帧起点 + 限帧 sleep）与 `afte
 
 | 路径 | 职责 |
 | --- | --- |
-| `render/presentation/framegen/FrameGeneration.kt` | 帧生成门面：后端选择、倍率、互锁、持久化、状态文案、推送 native |
-| `diagnostics/FrameGenerationSelfTest.kt` | 自动化自检：按 tick 改设置、打印能力表、强制选后端 |
+| `render/presentation/framegen/FrameGeneration.kt` | 帧生成门面：后端/倍率配置请求、持久化与状态文案 |
 | `render/presentation/latency/NvidiaReflex.kt` | Reflex 模式、被帧生成强制开启、持久化 |
-| `render/presentation/framegen/FrameGenerationConstants.kt` | 插帧的 view/projection/抖动/复位常量（行主序） |
 | `render/presentation/D3D12GUISplit.kt` | 世界层 / UI 层拆分、hudless 裁决、UI 纹理注册 |
-| `d3d12/surface/D3D12GpuSurface.kt` | present 入口、F3 计数、调用 `armUiComposition` |
+| `render/presentation/D3D12SceneDisplay.kt` | 世界重建输出、晚期目标和最终场景封存 |
+| `render/presentation/display/` | 显示层描述、wire 编码与 GUI 前 Prepare / GUI 后 Submit |
+| `d3d12/surface/D3D12GpuSurface.kt` | 最终 source blit、Present 入口与 F3 计数 |
 | `d3d12/ffi/MCDR_ABI.kt` | 帧生成与 Reflex 的 FFM 绑定 |
-| `d3d12/ffi/MCDR_Layout.kt` | `mcdr_fg_caps` / `mcdr_fg_dispatch` / 常量的字段偏移 |
+| `d3d12/ffi/MCDR_Layout.kt` | 能力/配置与 ABI11 中立帧结构布局 |
 | `client/settings/D3D12VideoSettingsContent.kt` | 视频设置里三段帧生成开关与状态行 |
 | `diagnostics/D3D12FrameStats.kt` | F3 的 `rendered/output fps (FG n.nx)` 改写 |
 | `config/IllusionConfig.kt` | `reflexFrameLimitUs` 配置定义 |
@@ -362,11 +333,12 @@ native 侧（相对 `MCDR\src\`）：
 
 | 路径 | 职责 |
 | --- | --- |
-| `advanced/d3d12_framegen.cpp` | 注册表、门面、回滚 / 重建、`[FG]` 周期日志 |
-| `advanced/d3d12_fsffg.cpp` | FSR-FG provider 与能力表 |
-| `advanced/d3d12_xessfg.cpp` | XeSS-FG provider 与能力表 |
-| `advanced/d3d12_dlss.cpp` | DLSS-G provider（`slDLSSGSetOptions` 的实际下发点） |
-| `core/d3d12_surface.cpp` | Present 两侧的钩子时序与设备移除守卫 |
+| `render/presentation/d3d12_framegen.cpp` | 注册表、显示帧接受/提交/呈现、回滚与重建 |
+| `render/presentation/d3d12_display_frame.cpp` | 显示 guides 工作图、有效性汇总和晚期 SDK 提交 |
+| `render/presentation/d3d12_fsffg.cpp` | FSR-FG provider 与能力表 |
+| `render/presentation/d3d12_xessfg.cpp` | XeSS-FG provider 与能力表 |
+| `render/reconstruction/d3d12_dlss.cpp` | DLSS-G provider（`slDLSSGSetOptions` 的实际下发点） |
+| `render/presentation/d3d12_surface.cpp` | Present 两侧的钩子时序与设备移除守卫 |
 
 接口定义：`MCDR\include\mcdr_abi.h` 的帧生成段与 Reflex 段。
 
@@ -374,5 +346,5 @@ native 侧（相对 `MCDR\src\`）：
 
 - 本文的事实来源是源码注释与实现。改代码时请同步本文，尤其是能力表字段语义（§1.6）、时序的三个顺序点（§2.2）、不变量（§6）、常量表（§5）。
 - 新增一个帧生成后端时，至少要动这些地方：`CANDIDATES` 与 `BACKEND_NAMES`、native 的 `makeXxxProvider` + `fillXxxCaps`、`MCDR_ABI` 的枚举、视频设置里的一段开关与状态行，以及本文的 §1.2 表格与 §5.3 枚举。
-- 判断「能不能用」的问题时，先看 `probe-fg` 的能力表，再看 `[FG]` 周期日志的 `available / active / note`；不要从 F3 的数字反推，F3 只说明「呈现了几帧」。
+- 判断「能不能用」的问题时，查看运行时能力状态和 `[FG]` 周期日志的 `available / active / note`；不要从 F3 的数字反推，F3 只说明「呈现了几帧」。能力验证通过独立进程或客户端场景脚本完成，不在游戏启动链注册测试入口。
 - 标注「代码中未明确」的地方如果后来有了结论，请把结论写进对应小节，并删掉这句标注。本文不引用仓库顶层的内部记录文档：读者拿到的是发布仓库，看不到它们。

@@ -1,34 +1,122 @@
 package io.github.dxegp.d3d12.backend
 
 import com.mojang.renderpearl.api.pipeline.RenderPipeline
+import com.mojang.renderpearl.api.pipeline.CompiledRenderPipeline
 import com.mojang.renderpearl.api.pipeline.ShaderSource
-import java.util.concurrent.ConcurrentHashMap
+import java.util.IdentityHashMap
+import java.util.WeakHashMap
 
 /**
- * 管线编译入参桥：backend 只收到 [CreateInfo]（打包好的 SPIR-V + 状态），拿不到 vanilla 的
- * [RenderPipeline] 与按次传入的 [ShaderSource]，而 GLSL→HLSL 链、`shaderDefines` 展开、
- * mesh 地形变体判定都依赖它们 —— 所以先由 `FrontendGpuDeviceCompilePipelineMixin` 登记，
- * `D3D12Device.compilePipeline(CreateInfo)` 再按 `CreateInfo.name()` 查回。
- *
- * 并发：登记在渲染线程/预热 worker，查回在 `finishCompile()`，不保证同线程 → 必须用 [ConcurrentHashMap]。
+ * Frontend registrations supply the reload inventory and the source for direct backend callers.
+ * PipelineBuilderSourceMixin forwards each asynchronous job's exact pipeline/source separately;
+ * a name-only registration cannot distinguish overlapping reloads. Native pipeline leases are
+ * independent of source registrations and are shared by staging/device caches and frontends.
  */
 object D3D12PipelineBridge {
-    private class Entry(val pipeline: RenderPipeline, val source: ShaderSource)
+    internal class Entry(val pipeline: RenderPipeline, val source: ShaderSource)
+    internal enum class RegistrationPhase { STAGED, PUBLISHED, DISCARDED }
+    internal class ReloadRegistration(var phase: RegistrationPhase = RegistrationPhase.STAGED)
 
-    private val entries = ConcurrentHashMap<String, Entry>()
+    private val registrationLock = Any()
+    private var entries: MutableMap<String, Entry> = HashMap()
+    private val reloadSources = WeakHashMap<ShaderSource, ReloadRegistration>()
+    private class Lease(var references: Int = 1, var onFrontend: ((CompiledRenderPipeline) -> Unit)? = null)
+    private val leases = IdentityHashMap<D3D12CompiledRenderPipeline, Lease>()
+
+    fun inventory(): List<RenderPipeline> = synchronized(registrationLock) { entries.values.map { it.pipeline } }
+
+    internal fun stage(source: ShaderSource) = synchronized(registrationLock) {
+        check(!reloadSources.containsKey(source)) { "Shader source is already registered for reload" }
+        reloadSources[source] = ReloadRegistration()
+    }
+
+    internal class PreparedRegistrations(
+        private val replacement: MutableMap<String, Entry>,
+        private val registration: ReloadRegistration,
+        private val retiredRegistrations: Array<ReloadRegistration>,
+    ) {
+        internal fun publish() {
+            entries = replacement
+            for (retired in retiredRegistrations) retired.phase = RegistrationPhase.DISCARDED
+            registration.phase = RegistrationPhase.PUBLISHED
+        }
+    }
+
+    internal fun publishRegistrations(
+        source: ShaderSource,
+        inventory: Iterable<RenderPipeline>,
+        candidates: Collection<D3D12CompiledRenderPipeline>,
+        publication: (PreparedRegistrations) -> Unit,
+    ) = synchronized(registrationLock) {
+        val registration = checkNotNull(reloadSources[source]) { "Shader reload source was not staged" }
+        check(registration.phase == RegistrationPhase.STAGED) { "Shader reload registration is already consumed" }
+        val replacement = HashMap<String, Entry>()
+        inventory.forEach { pipeline -> replacement[pipeline.location.toString()] = Entry(pipeline, source) }
+        val retired = reloadSources.values.filter { it.phase == RegistrationPhase.PUBLISHED }.toTypedArray()
+        val prepared = PreparedRegistrations(replacement, registration, retired)
+        synchronized(leases) {
+            candidates.forEach { pipeline ->
+                checkNotNull(leases[pipeline]) { "Shader reload pipeline lease was released" }
+            }
+            candidates.forEach { pipeline -> leases[pipeline]!!.onFrontend = null }
+        }
+        publication(prepared)
+    }
+
+    fun own(pipeline: D3D12CompiledRenderPipeline) = synchronized(leases) {
+        check(leases.put(pipeline, Lease()) == null) { "Pipeline already has an owner" }
+    }
+
+    fun retain(pipeline: D3D12CompiledRenderPipeline): Boolean = synchronized(leases) {
+        val lease = leases[pipeline] ?: return false
+        lease.references = Math.incrementExact(lease.references)
+        true
+    }
+
+    fun observeFrontends(pipeline: D3D12CompiledRenderPipeline, observer: ((CompiledRenderPipeline) -> Unit)?) {
+        synchronized(leases) { checkNotNull(leases[pipeline]).onFrontend = observer }
+    }
+
+    fun frontendCreated(pipeline: D3D12CompiledRenderPipeline, frontend: CompiledRenderPipeline) {
+        val observer = synchronized(leases) { checkNotNull(leases[pipeline]).onFrontend }
+        observer?.invoke(frontend)
+    }
+
+    fun release(pipeline: D3D12CompiledRenderPipeline) {
+        synchronized(leases) {
+            val lease = checkNotNull(leases[pipeline]) { "Pipeline lease already released" }
+            if (lease.references == 1) {
+                pipeline.close()
+                leases.remove(pipeline)
+            } else {
+                lease.references--
+            }
+        }
+    }
+
+    fun discard(source: ShaderSource) {
+        synchronized(registrationLock) {
+            reloadSources[source]?.phase = RegistrationPhase.DISCARDED
+            entries.entries.removeIf { it.value.source === source }
+        }
+    }
 
     @JvmStatic
-    fun register(pipeline: RenderPipeline, source: ShaderSource) {
+    fun register(pipeline: RenderPipeline, source: ShaderSource) = synchronized(registrationLock) {
+        val phase = reloadSources.getOrPut(source) { ReloadRegistration(RegistrationPhase.PUBLISHED) }.phase
+        if (phase == RegistrationPhase.STAGED || phase == RegistrationPhase.DISCARDED) return@synchronized
         entries[pipeline.location.toString()] = Entry(pipeline, source)
     }
 
     @JvmStatic
-    fun lookup(name: String): RenderPipeline? {
-        return entries[name]?.pipeline
-    }
+    fun lookup(name: String): RenderPipeline? = synchronized(registrationLock) { entries[name]?.pipeline }
 
     @JvmStatic
-    fun lookupSource(name: String): ShaderSource? {
-        return entries[name]?.source
+    fun lookupSource(name: String): ShaderSource? = synchronized(registrationLock) { entries[name]?.source }
+
+    @JvmStatic
+    fun clear() = synchronized(registrationLock) {
+        entries.clear()
+        reloadSources.values.forEach { it.phase = RegistrationPhase.DISCARDED }
     }
 }

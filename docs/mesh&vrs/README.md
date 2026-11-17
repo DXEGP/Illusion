@@ -2,8 +2,8 @@
 
 本文整理 D3D12 后端里两块相对独立的子系统：
 
-- **网格着色器管线**：地形（不透明、镂空、OIT 半透明）如何从原版的分段上传数据切出 meshlet，
-  再由放大着色器（AS）剔除、网格着色器（MS）展开成三角形。
+- **网格着色器管线**：地形（不透明、镂空、OIT 半透明）从原版分段上传数据切出 meshlet，
+  再由 Work Graph 剔除并生成 GPU 间接参数，网格着色器（MS）展开成三角形。
 - **可变着色率与渲染比例**：视频设置里的 VRS 选项、屏幕空间着色率图，以及按百分比缩放主渲染目标。
 
 写法以「从源码确认的事实」为准：所有数值都取自代码常量。凡是源码里没有写死的取舍理由、
@@ -17,15 +17,15 @@
 
 | 机制 | 需要什么 | 由谁判定 | 缺失时 |
 | --- | --- | --- | --- |
-| mesh 管线 | FL 12_2 + mesh shader tier ≥ 1 + DXC 可用 | `D3D12MeshShader.isSupported()` | 地形批整批不画，记 ERROR（**没有** IMR 回退） |
-| AS 剔除 | mesh 管线 + `[mesh] terrainCull` + VS 里能解析出相机和矩阵 uniform | `D3D12MeshletShader.resolveCullUniforms`、`tryMeshletDraw` | 所选变体不可用时报告错误，不自动切换变体 |
+| 地形 Work Graph | mesh 查询通过、Work Graph Tier ≥ 1.0、SM ≥ 6.9 | `D3D12TerrainWorkGraph.requireSupport()` | `[mesh] terrain=true` 时在设备创建阶段拒绝启动并报告缺项；关闭隔离开关时不检查 |
+| GPU 地形剔除 | `[mesh] terrainCull` + 可解析的相机与矩阵 uniform | `D3D12TerrainWorkGraph.source()`、五节点工作图 | 所需图或输入不可用时明确报错，不自动切换管线 |
 | 逐图元距离档位 | 视频设置 VRS = AUTO 且 native 预检通过 | `D3D12VariableShadingRate.push()` | 恒 1X1 |
 | 屏幕空间着色率图（Tier 2） | 设备支持 SRI + `[vrs] sri` + 主深度可读 | `D3D12ShadingRateImage.prepareFrame()` | 退回逐图元距离档位 |
 | 渲染比例 | D3D12 后端正在驱动渲染 | `D3D12RenderScale.isAvailable()` | 比例只记录不生效，warn 一次 |
 
 三条互相独立的「谁负责什么」边界：
 
-1. mesh 管线决定**谁来产生三角形**（顶点/索引拉取换成 AS + MS 展开）。
+1. Work Graph 决定存活 meshlet，mesh 管线决定**谁来产生三角形**。
 2. VRS 决定**每个图元或每个屏幕 tile 用多少着色样本**（1X1 / 1X2 / 2X2）。
 3. 渲染比例决定**渲染目标本身多大**，与 VRS 是乘法关系。
 
@@ -133,13 +133,15 @@ MS 的顶点属性来自最终 naga manifest，由 `NagaVertexAdapter` 生成稳
 3. 名字为 `ChunkVisibility` → `s.visibility`（float，供原版着色用）。
 4. 都不匹配 → `(type)0`，并留注释。
 
-#### 2.5.1 放大着色器（AS）
+#### 2.5.1 可独立生成的放大着色器（AS）
+
+本节描述 `build(cull=true)` 的生成能力。生产地形使用 §2.6 的 Work Graph + visible MS，
+不创建或调用此 AS 变体；生产剔除参数由 `terrain_workgraph.hlsl` 消费。
 
 - `[numthreads(32, 1, 1)]`：每 32 个线程处理 32 个 meshlet（一个线程一个）。
 - 载荷 `struct MeshPayload { uint slot[32]; }`，128 B；配 `groupshared` 的计数与数组。
 - 线程对应关系 `local = (gid.x + gid.y * 256) * 32 + tid.x`，只有 `local < gMeshletCount` 才继续判。
-- `cullOn = gCullEnabled != 0`：常量走 b8。绘制入口按当前配置选择缓存的 MS-only 或 AS/MS PSO；
-  关闭 `terrainCull` 时直接派发 MS，不承担 AS 的载荷压缩开销。
+- `cullOn = gCullEnabled != 0`：常量走 b8，控制辅助 AS 的剔除判据。
 - 背面掩码（带 1 个方块余量，避免贴面被误剔）：
   - `backfaceCull` 服从管线实际的 rasterizer cull 状态；双面管线跳过方向剔除，仍保留视锥剔除。
   - `mn.x < 1.0` → `1`；`mx.x > -1.0` → `2`
@@ -163,10 +165,11 @@ MS 的顶点属性来自最终 naga manifest，由 `NagaVertexAdapter` 生成稳
 
 - 默认档 `[numthreads(64, 1, 1)] [outputtopology("triangle")]`，最多输出 64 个顶点、32 个三角形。
   32/64 quad 档的输出容量分别为 128/256 顶点、64/128 三角形，64 档以步长 128 循环写顶点。
-- meshlet 编号：没有 AS 时是 `gid.x + gid.y * 256`；有 AS 时是 `payload.slot[gid.x]`。
+- 生产 visible MS 编号是 `gVisibleBase + gid.x + gid.y * 256`，`gVisibleBase` 来自间接参数中的 b9 root constant。
+  辅助直接派发版使用 `gid.x + gid.y * 256`，AS 版使用 `payload.slot[gid.x]`。
 - 解析描述符：`quadCount = (packedMin >> 24) & 0xFF`，
   `vertexCount = quadCount * 4`，`primCount = quadCount * 2`。
-- 二维派发的尾组先检查 `meshletId < gMeshletCount`，不读取越界描述符。
+- visible MS 的尾组检查 `meshletId < gSections.Load(0)`（GPU 可见数），不读取越界描述符。
   无效组使用零输出；`SetMeshOutputCounts(vertexCount, primCount)` 在统一控制流里仅有一个调用点。
 - 顶点索引 = `s.vertexBase + m.localVertexOffset + vid`，
   其中 `s.vertexBase` 是相对**当前绑定的顶点切片**的偏移。
@@ -182,9 +185,10 @@ MS 的顶点属性来自最终 naga manifest，由 `NagaVertexAdapter` 生成稳
 | 名字 | 类型 | 内容 |
 | --- | --- | --- |
 | `t14` | `ByteAddressBuffer` | 顶点流，28 B / 顶点 |
-| `t15` | `ByteAddressBuffer` | 实例表 32 B / 段，后接 work 表 8 B / meshlet |
+| `t15` | `ByteAddressBuffer` | 32 B GPU 表头，后接实例表 32 B / 段与可见 work 表 8 B / meshlet |
 | `t16` | `ByteAddressBuffer` | DEFAULT heap 静态 meshlet 表，16 B / 条 |
 | `b8` | cbuffer | `MeshletGlobals` |
+| `b9` | root constant | 当前间接绘制切片的可见记录起点 |
 
 - `SectionDesc`（32 B）：`vertexBase`、`quadBase`、`meshletBase`、`meshletCount`、
   `chunkX`、`chunkY`、`chunkZ`、`visibility`。
@@ -207,70 +211,77 @@ MS 的顶点属性来自最终 naga manifest，由 `NagaVertexAdapter` 生成稳
   MS-only 与 AS/MS 都能输出 `SV_ShadingRate`，不以开启剔除作为生成条件。
 - `NagaVertexAdapter` 解析 cbuffer instance 与 struct 成员，输出 `instance.member`，不能把嵌套成员作为裸变量引用。
 
-### 2.6 管线创建与热切换（`D3D12Device.createMeshVariant`）
+### 2.6 Work Graph 与 visible MS 创建
 
 - 顶点格式取 `pipeline.vertexFormatBindings.firstOrNull()`。
 - 剔除开关：`pipeline.isCull && !flipY && !location.contains("animate_sprite")`
   （flipY 与精灵动画的绕序特殊，不能交给背面剔除）。
-- 像素着色器使用原版转换后的 HLSL，编 `ps_6_9`；MS 编 `ms_6_9`、AS 编 `as_6_9`
-  （mesh 阶段要求 SM 6.9）。
-- 根签名 `D3D12CreateMeshRootSignature(bindings, 1)`，1 表示带 mesh 阶段。
-- PSO 描述：`MCDRMeshPipelineDesc().shaders(ms, as, ps)`、逐 color target 描述、
+- `compileTerrainWorkGraphVariants()` 将五节点库编为 `lib_6_9`，初始化/间接参数终结编为 `cs_6_9`。
+  像素着色器使用原版转换后的 HLSL，编为 `ps_6_9`；16/32/64 quad 的 visible MS 编为 `ms_6_9`。
+- 根签名 `D3D12CreateMeshRootSignature(bindings, 2, pushConstantSize)` 启用 visible-work 布局。
+- PSO 描述：`MCDRMeshPipelineDesc().shaders(ms, null, ps)`、逐 color target 描述、
   `depth(GpuFormat.D32_FLOAT.ordinal, writeDepth, depthTest)`、`topology(cull, polygonMode)`。
 
-- 每条地形管线独立创建并缓存两种变体：`cull = false` 的 MS-only，以及 `cull = true` 的 AS/MS。
-- `D3D12CompiledRenderPipeline` 分别持有两种 PSO；替换与关闭时都释放。
-- 每批读取 `D3D12Settings.meshTerrainCull`，直接选择对应句柄。热切换无需重新编译；
-  地形暂时关闭时也保留已编译变体。
-- 某个变体编译或创建失败时记 WARN；用户选中不可用变体时整批拒绝并报告错误。
-  不拼接 AS 载荷版 MS 与无 AS PSO，不自动改用另一变体。
+- 每条生产地形管线缓存一个 `TerrainProgram` 和三个容量的 visible MS PSO。
+- 每批读取 `D3D12Settings.meshTerrainCull`，写入 b8；开关只改变工作图剔除，不重新编译或切换 AS。
+- 节点链为 `SectionEntry → SectionCull → MeshletRange → MeshletCull → EmitVisible`。
+  关闭剔除时仍由图生成可见记录和间接参数。
+- `EmitVisible` 使用 coalescing launch，每组接收最多 64 条存活记录，一个线程原子领取连续槽位，
+  其余线程并行写入；不足 64 条时按实际数量领取。容量溢出设置错误位，参数终结阶段禁用该批绘制。
+- 三节点融合只保留在独立候选 shader；单列表连续派发的长尾尚未定位，生产继续使用五节点。
+  真实 GPU 验证和两组计时范围见[实施记录](../rendering/work-graph-implementation.md#地形节点融合与驻留编码)。
+- 普通半透明及其它非 OIT 混合管线必须保持原版绘制顺序，沿有序 indexed indirect 路径执行；
+  这是显式的排序契约，不是 Work Graph 失败后的自动回退。
 
 ### 2.7 派发（`D3D12RenderPassBackend.drawIndexedIndirect` / `tryMeshletDraw`）
 
 - 地形识别是**按管线名白名单**：`isTerrain(location) = location.contains("terrain") && !location.contains("shadow")`。
   名字错了整条通路会静默空转，所以每个新名字第一次出现时会打一行
   `MDI terrain candidate '…' terrain=… rate=…`。
+- `LevelRendererMeshCaptureMixin` 在原版 `render()` 的路由字段读取处接线：D3D12 且 `[mesh] terrain=true`
+  时强制选择 MDI；若原版能力判据不可用则明确拒绝，不能静默绕到普通 draw。
+  原版 `Minecraft.multiDrawIndirect=false` 不会绕过生产 Work Graph。隔离开关关闭时保持原版路由。
 - 层映射：`solid_terrain → SOLID`、`cutout_terrain → CUTOUT`、`translucent` / `oit_ → TRANSLUCENT`。
-  地形**全部**（含 OIT 半透明）只走 meshlet，没有 IMR 回退；
-  半透明能这么做的前提是强制打开的 improved transparency（Wavelet OIT）——
-  OIT 与顺序无关，所以线程组顺序不影响结果。
+  不透明、镂空与 OIT 地形使用 Work Graph；普通有序混合绘制见 §2.6。
 - 地形批整个包在 VRS 的作用域里：`scope(ctx, location) { tryMeshletDraw(...) }`（见 3.4）。
-- `tryMeshletDraw` 的前置条件（任一不满足就记一条去重的 INFO，然后返回 false）：
+- `tryMeshletDraw` 的前置条件（任一不满足就明确抛出错误）：
   mesh 派发开关、已绑定管线、存在 mesh 变体、能按参数偏移找到捕获的 MDI 批、
   `drawCount` 一致、层名可识别、slot 0 顶点缓冲存在、顶点切片偏移已知、段表 / meshlet 表完整。
-- 剔除开关只读 `[mesh] terrainCull`，每批热选择 MS-only 或 AS/MS；没有文件系统探测。
-- 上传：实例/work 与 globals 直接写入映射 staging，无 ByteArray 或堆 ByteBuffer 中转。
+- `prepare()` 上传每段 40 B 的候选范围与 32 B globals；可见 work 由 GPU 生成，CPU 不逐 meshlet 展开。
   globals 起点 256 B 对齐，前 16 B 为 meshlet 数、剔除开关、实例数和保留 uint。
   `D3D12MeshletResidency` 归 encoder 所有，按不可变 LayerUpload 身份缓存 DEFAULT heap 偏移。
+  同一捕获批次复用去重后的几何列表；全部几何已驻留时直接返回 atlas，不创建缺失项列表或安排复制。
   首次使用才复制静态内容；跨帧与 OIT pass 复用。增长时压缩弱引用中仍存活的几何，
-  旧 buffer 的销毁交给 native 全局 queue fence pending-delete；关闭 encoder 必须先等待并销毁 context。
+  总字节与候选 offset 只遍历一次，append/replacement 向上传函数直接传入已计算的字节数；
+  checked copy 成功后才发布候选 offset，超过 2 GB 的累计范围在转换为 Int 前拒绝。
+  替换或上传失败的 atlas buffer 都登记到当前 encoder 的提交退休队列，只有对应 fence 完成后才释放。
+  terrain prepare 同时保留 atlas 的 COM 引用和 `retainObjectForRecording` 租约；列表 slot 的租约在对应
+  fence 等待成功并 Reset 后释放。
+  `flushPendingDeletes` 不回收 recordingReferences 非零的对象，强制清理也遵守此限制。
+  `retainUntilCommandsClosed` 管理最后一个 atlas owner 的关闭；退休队列与录制租约共同覆盖扩容旧 atlas 的安全性。
 - 绑定顺序有讲究：先 `D3D12SetPipeline(meshletPipeline)`，再 `pushDescriptors` ——
   设管线会重设根签名，之前推的根描述符会失效。
-- 派发量：有 AS 时 `dispatchCount = (meshletCount + 31) / 32`（AS 是 32 线程/组），
-  没有 AS 时就是 `meshletCount`（MS 一个线程组一个 meshlet）。
-- native 接收的值是派发组数：不超过 65535 时使用一维；更大时使用 `256 × ceil(count / 256)`。
-  两条 shader 路径都按 `gid.x + gid.y * 256` 还原线性组号，并丢弃尾部填充组。
-  接受范围为 `[1, 4194304]`（`2^22`），超限明确返回错误；不宣称支持任意大小的批次。
-- 派发完恢复 IMR 管线状态；按层累计 `gMeshletSolid / gMeshletCutout / gMeshletTranslucent`，
-  每 2 秒打一行 DEBUG `meshlet dispatch: draws=… meshlets=… layer=… totals[…]`。
-- 失败（`!drawn`）会打 ERROR：`terrain batch not drawn (mesh path unavailable): …`
-  —— 这是「地形不见了」的第一现场，比静默 fallback 更有用。
-- 启动时若 `[mesh] terrain` 为真但 `D3D12MeshShader.isSupported()` 为假，
-  后端创建阶段就会告警（此时地形必然不画）。
+- native 顺序为初始化 compute → `DispatchGraph` → 参数终结 compute → `ExecuteIndirect` → visible MS。
+  初始化、图完成和参数终结之间具有 UAV 顺序；绘制前将可见表转为 SRV、参数转为 INDIRECT_ARGUMENT。
+- 每个间接参数切片最多 `2^22` 个 meshlet，宽度最多 256，尾组由 MS 丢弃。零可见时 X=0，不发出几何。
+  GPU 溢出标记会将间接计数置零；CPU 输入必须通过候选容量校验。
+- 派发完在 `finally` 恢复原图形管线并标记描述符需要重新绑定；Prepared 关闭只释放外部 batch 句柄，
+  图、输入与输出的命令租约持续到 GPU 完成。
+- `[mesh] terrain=true` 时 mesh/WG/SM 能力缺失在设备创建阶段拒绝；准备、绑定或绘制失败带原生错误终止该路径。
 
 ### 2.8 性能上换到了什么
 
 - **省掉索引缓冲带宽**：三角形由线程组 ID + 算术索引生成，顶点按 `vertexBase + localVertexOffset` 线性取。
 - **默认一个线程组最多 32 三角形**：64 线程负责最多 64 顶点，前 16 个线程各写 2 个三角形；其他档见组大小对照。
-- **AS 换掉视锥外的 MS 与光栅化**：代价是一次额外派发与 128 B 组内载荷；
+- **GPU 图剔除视锥外的 MS 与光栅化**：代价是工作图节点、可见表和间接参数生成；
   `slack = 64` 是为了不误剔，会牺牲一部分剔除率。
-- **动态表每批现传**：每个段 32 B、每个 meshlet 8 B；静态描述符首次使用上传 16 B/条。
+- **动态表每批现传**：每个段 40 B；静态描述符首次使用上传 16 B/条，8 B/meshlet 的可见引用由 GPU 写出。
 - **组大小对照**：NeoForge `[mesh] quadsPerMeshlet` 可选 16（默认）、32、64。配置快照只影响新上传的几何；
-  旧几何保留捕获尺寸。三组 MS-only/AS+MS PSO 同时编译，批次按实际最大 quadCount 选择容量。
+  旧几何保留捕获尺寸。三组 visible MS PSO 同时编译，批次按实际最大 quadCount 选择容量。
   16/32/64 分别输出最多 64/128/256 顶点与 32/64/128 图元；线程数为 64/128/128，64 档循环写两轮顶点。
 - **聚类边界**：当前无索引 MS 要求连续 quad，方向/空间重排必须同步重排原版顶点流或引入显式 quad 索引表；
   仅排序描述符不改善组内纯度。
-  AS 已在 GPU 压缩存活 work；Work Graph 仍缺节点 PSO、backing memory、DispatchGraph 与能力生命周期，未接入假执行入口。
+  Work Graph 已在 GPU 压缩存活 work，但不改变源顶点的空间或方向布局。
 
 ---
 
@@ -324,36 +335,35 @@ MS 的顶点属性来自最终 naga manifest，由 `NagaVertexAdapter` 生成稳
 逐图元的距离带有个天生缺点：段与段的交界是一条几何上的硬边，缺少屏幕内容的信息时无法避开
 地平线。Tier 2 的着色率图就是那个「按屏幕内容修正」的环节。
 
-- 一张图像，每个 tile = `TILE = 16` × 16 像素，
-  网格尺寸 `(width + 15) / 16` × `(height + 15) / 16`。
-- 每帧一张 compute 的判据（`cs_6_8`，`[numthreads(8, 8, 1)]`，一个线程一个 tile）：
-  - 读 tile 四角的深度：`rel = (dmax - dmin) / max(dmin, 1e-4)`
-  - `extreme`：`dmin ≤ 1e-5`、`dmax ≥ 0.99999`（近/远平面）或出现 NaN
-  - `edge`：`rel > edgePermille × 0.001`（默认 `EDGE_PERMILLE = 50`，即 5% 相对深度差）
-  - `moving`：运动矢量长度 > `MOTION_PIXELS`（默认 8 像素/帧）
-  - 默认速率 `2X2`；`extreme || edge || moving` 任一成立 → 1X1。
-  - 也就是说：**只有既平坦又静止的 tile 才允许变粗**。
-- 强制全细（`gPad` bit0）：每个 tile 都写 1X1 并且立即返回。
-  触发源：进出世界（登录/退出事件）、相机跳变（一帧位移 > 8.0 方块或转角 > 30.0 度）、
-  资源刚重建、上一次 compute 失败。
-- 时间钳制（`gPad` bit1）：`rate = min(rate, 上一帧同 tile 的档位)`。
-  枚举值按面积单调递增，取 min 就是「不比上一帧更粗」，
-  用来消除静态镜头下边缘的呼吸感；代价是一张额外的 ping-pong 图像。
-- 两张图像 ping-pong（`images[2]`，各自一张 SRV，`views[2]`）：
-  上一帧的图既作为 `t2` 读入，当前帧写另一张；写完后 `historyValid = !forceFine`，
-  一旦强制全细就作废历史。
+- 每个 tile 的边长来自实际设备的 `ShadingRateImageTileSize`；网格尺寸按实际世界附件向上取整。
+- `VrsClassify` 工作图使用 `lib_6_9`、64 线程广播节点，一个线程处理一个 tile。
+  在当前 tile 的 3×3 采样位置及一像素保护边界向上一帧深度反查，最多四次局部校正；
+  深度采用有效 2×2 邻域插值，重投影误差必须不超过 0.75 个当前附件像素。
+  相机旋转、camera-relative 原点差与实际 raster jitter 都包含在双向 clip 映射中，
+  原点先用 double 相减再形成 float GPU 矩阵，屏幕 UV 原点为左上、深度为 reversed D3D `[0,1]`。
+  任一采样越界、没有有效深度、跨深度断层、不收敛或运动超过阈值均使当前候选保持 1X1；
+  tile 内采样深度的相对差也必须不超过 `edgePermille × 0.001`（默认 5%），才能候选为 2X2。
+- 只读取紧邻上一真实世界帧的深度，要求 world epoch、资源版本、history generation、实际附件、尺寸和格式一致。
+  native 按上述双向映射读取历史，不再要求相机矩阵和 raster jitter 与上一帧完全相等。
+  相机 cut（一帧位移 > 8.0 方块或转角 > 30.0 度）、历史重置和不兼容输入直接走细着色，不派发虚构的全细图像。
+- 时间钳制使用独立候选历史：连续两次兼容候选都允许变粗才写 2X2，否则输出 1X1。
+  上一候选按反查位置读取，当前候选独立写入；不会把最终输出反复 `min` 后使 tile 永久无法变粗。
+  flags bit0 表示兼容深度，bit1 表示启用时间钳制，bit2 表示 motion 有效，bit3 表示候选历史有效。
+- 最终图与候选图各有两张 `R8_UINT` ping-pong；每个 tile 的两个当前输出都被完整写入。
+  候选历史作为 `t2`，最终图为 `u0`，当前候选为 `u1`；输入视图由 native frameprep 管理。
+  不兼容输入作废历史；启用钳制后的首次有效派发只建立候选，最终输出保持 1X1。
 - 深度来源：**复制**主深度到一张自己持有的快照纹理（必须用同一格式 `D32_FLOAT`；
   换 `R32_FLOAT` 会直接 `format mismatch`）。HLSL 里按 `Texture2D<float>` + `Load` 读。
-  - 复制发生在每帧清除之前，此时主深度还是上一帧的最后一笔 —— 这正是着色率图想要的「上一帧画面」。
+  - 复制发生在当前世界绘制完成、GUI 与清深度之前，供下一真实世界帧读取。
 - 运动矢量来自速度通道（`D3D12Velocity.previousMotionView()`）。
-  通道没开（既没 SMAA/TAA 也没 DLSS）时退化成只看深度：`motionPixels = Int.MAX_VALUE`，
-  并把深度视图当第二张 SRV 绑上去（仍然满足着色器签名）。
-- 每帧命令序列：开命令列表 → 复制深度 → 一次 compute 派发
-  （组数 `(tilesX + 7) / 8, (tilesY + 7) / 8`）→ 提交 → 交换写指针。
-- 挂点：帧图构建的 execute 开头（`@Synchronized`）。以下任一情况直接返回：
+  必须匹配 capture 时的实际纹理句柄；缺失时关闭 motion flag，使用 depth-only 分类，不把原因一律解释为通道未开启。
+- 每帧顺序：native `BeginFrame` 固定本帧身份 → 兼容性检查 → 声明真实 depth/motion 输入 → Work Graph 派发 → 本帧地形绑定图像 → 世界完成时记录新深度快照。
+- 挂点：`VanillaFrameCoordinator.worldPassStarted` 内的 `BeginFrame` 成功之后（`@Synchronized`）。以下任一情况直接返回：
   失败闩锁已置、VRS 非 AUTO、`[vrs] sri` 关、主深度不是可读的 GPU 纹理。
-- 失败策略：任何一步失败都置 `failed = true`（**永久自关**），
-  之后只剩逐图元距离档位 —— 与速度通道的处理一致：宁可少省，不要画面坏掉。
+- 创建或派发失败设置失败状态；世界帧按统一 abort/reset 传播原错误。没有可用 SRI 时地形作用域明确选择 1X1。
+- 该路径属于历史屏幕空间估计：保护边界与邻域检查能拒绝缺少历史支持的采样，
+  但不能证明未出现在历史中的新表面或独立运动对象的当前可见性；motion 覆盖仍受实际生产者限制。
+  实际收益和画质必须由场景与 GPU 采集确认，不能从派发成功推导。
 
 ### 3.4 组合器与作用域
 
@@ -435,10 +445,10 @@ mip 会选得偏高（更模糊）。
 
 | 位置 | 失效表现 | 回退 |
 | --- | --- | --- |
-| mesh 能力查询 | `isSupported()` 为假 | 地形整批不画 + ERROR（无 IMR 回退） |
-| AS 生成 | 缺 camera / matrix uniform，或生成失败 | AS/MS 变体不可用；选中时拒绝整批并报告错误 |
-| AS PSO | 创建失败 | AS/MS 变体不可用，不自动切换 |
-| MS PSO | 创建失败 | mesh 句柄 0 → 地形整批不画 + ERROR |
+| 地形能力查询 | mesh / WG Tier 1.0 / SM 6.9 不满足 | 地形开启时在设备创建阶段拒绝启动 |
+| 原版 MDI 路由 | 原版 indirect 能力不可用 | D3D12 地形开启时明确拒绝，不能绕过工作图 |
+| 工作图生成 | 缺 camera / matrix uniform，或生成失败 | 所需图不可用，预热/绘制校验拒绝 |
+| WG / visible MS | 创建失败 | 明确报告错误，不自动切换 |
 | 段表 / meshlet 表 | 任一段缺数据 | 整批返回 null（不部分派发） |
 | VRS 预检 | native 拒绝 | 恒 1X1（一次性闩锁） |
 | 着色率图 | 任一步失败 | 永久自关，退回逐图元距离档位 |
@@ -474,14 +484,13 @@ mip 会选得偏高（更模糊）。
 - 关键日志：
   - `mesh support=… reason=…`（能力查询，带 native 给的原因字符串，缓冲 512 B）
   - `MDI terrain candidate '…' terrain=… rate=…`（名字白名单取证）
-  - `meshlet dispatch: draws=… meshlets=… layer=… totals[…]`（每 2 秒）
-  - `terrain batch not drawn (mesh path unavailable): …`（ERROR，地形不见的第一现场）
+  - `Terrain requirements unavailable: …`（设备创建时列出缺失能力）
+  - `Terrain Work Graph requires vanilla indirect draw support`（原版路由能力不满足）
+  - `Terrain Work Graph inputs or pipeline are unavailable`（批次捕获、容量或管线缺失）
   - `main render target attachments <w>x<h> -> <w>x<h> (renderScale=<n>%)`
   - `VRS combiners = MIN / PASSTHROUGH.`（启动时推一次）
-- 诊断开关：`[debug] meshDiagnostics`（NONE / CLEAR / PASS）做一次性回读隔离测试，
-  用来区分「回读路径坏了」与「这一趟根本没落到纹理上」；`[debug] selfTestMesh`
-  做完整的 DXC 编译 + mesh PSO + DispatchMesh + 回读自检；
-  `[debug] selfTestCompute` 是着色率图依赖的 compute 路径自检。
+- 行为验证不进入游戏启动链；需要验证资源状态、工作图或回读时，使用 `src/probes/` 下的
+  独立探针，并把硬件/场景结论记录在对应报告中。
 
 ---
 
@@ -491,18 +500,15 @@ mip 会选得偏高（更模糊）。
 
 | 表 | 键 | 默认 | 含义 |
 | --- | --- | --- | --- |
-| mesh | `terrain` | `true` | 地形走 mesh 管线（唯一路径）。需 12_2 / tier 1；关闭后地形不画，只用于隔离回归 |
-| mesh | `terrainCull` | `false` | 热切换缓存的 MS-only / AS/MS PSO；开启时做 6 向背面掩码与视锥剔除 |
+| mesh | `terrain` | `true` | 启用时强制 MDI/WG 地形路径并检查硬能力；关闭时保留原版 indexed-indirect 路径，不作为 Work Graph 失败回退 |
+| mesh | `terrainCull` | `false` | 热更新工作图常量；开启时做 section/meshlet 视锥与 6 向背面掩码剔除 |
 | mesh | `quadsPerMeshlet` | `16` | 可选 16/32/64，只影响新上传几何；旧几何保留原组大小，混合批次选择足够容量的 PSO |
 | vrs | `terrainNearBlocks` | `32.0`（0..512） | 比这更近的段恒 1X1 |
 | vrs | `terrainFarBlocks` | `96.0`（0..2048） | 远带的起点，应明显大于近带（约取视距一半可让 2X2 边缘避开地平线） |
 | vrs | `sri` | `true` | 每帧生成 Tier 2 着色率图；关闭后只剩逐图元距离带 |
 | vrs | `sriEdgePermille` | `50`（0..1000） | 判为边的深度对比阈值，1000 = 关闭该项 |
 | vrs | `sriMotionPixels` | `8`（0..256） | 判为运动的像素阈值，仅在速度通道开启时生效 |
-| vrs | `sriTemporalClamp` | `true` | 不允许比上一帧更粗；代价是一张额外 ping-pong 图 |
-| debug | `meshDiagnostics` | `NONE` | `CLEAR` / `PASS` 一次性回读隔离测试 |
-| debug | `selfTestMesh` | `false` | mesh 自检（在启动路径之外） |
-| debug | `selfTestCompute` | `false` | compute 自检（着色率图的地基） |
+| vrs | `sriTemporalClamp` | `true` | 连续两个兼容候选才变粗；使用独立候选历史 |
 
 另外两项在**视频设置**里，不写进 toml：渲染比例滑条（`options.txt` 的 `dxrMcRenderScale`
 / `dxrMcRenderScaleDlss`）与 VRS 档位（`options.txt` 的 `dxrMcShadingRate`）。
@@ -519,6 +525,7 @@ mip 会选得偏高（更模糊）。
 | `render/terrain/mesh/D3D12MeshletBuilder.kt` | CPU 单遍切 meshlet：量化 AABB、方向掩码、16 B 打包 |
 | `render/terrain/mesh/D3D12MeshletResidency.kt` | 静态 DEFAULT atlas 的驻留、压缩增长与 checked-copy 发布 |
 | `render/terrain/mesh/D3D12MeshletShader.kt` | 生成 MS/AS 的 HLSL 文本（AS 剔除、算术索引、可选的逐图元档位） |
+| `render/terrain/mesh/D3D12TerrainWorkGraph.kt` | 能力与 MDI 路由策略、节点源码组装、候选准备与绘制租约 |
 | `render/terrain/mesh/D3D12MeshDrawCapture.kt` | 捕获原版每帧的 MDI 段列表，拼出段表与 meshlet 表 |
 | `render/terrain/mesh/D3D12MeshVertexDecode.kt` | 把 VS 输入结构逐字段翻译成 ByteAddressBuffer 解码代码 |
 | `render/terrain/mesh/D3D12SectionGeometry.kt`、`D3D12SectionGeometryOwner.kt` | 每个已编译网格的图层快照、代次与退休 |
@@ -527,7 +534,7 @@ mip 会选得偏高（更模糊）。
 | `render/vrs/D3D12ShadingRateImage.kt` | Tier 2 着色率图：16×16 tile 的逐帧 compute、ping-pong、失败闩锁 |
 | `render/resolution/D3D12RenderScale.kt` | 渲染比例滑条、附件尺寸换算、主目标重建、`options.txt` 两个键 |
 | `d3d12/command/D3D12RenderPassBackend.kt` | 地形识别、VRS 作用域包裹、meshlet 派发与前置条件检查 |
-| `d3d12/device/D3D12Device.kt` | MS-only / AS/MS 变体创建、缓存与热切换；地形采样器 `release()` 调用点 |
+| `d3d12/device/D3D12Device.kt` | 地形工作图与 visible MS 预编译入口；地形采样器 `release()` 调用点 |
 | `d3d12/device/D3D12AdapterInfo.kt` | 设备能力字段：`shadingRateTier` / `shadingRateTileSize` / `additionalShadingRates` |
 | `config/D3D12Settings.kt` | 把 `IllusionConfig` 解析成 `meshTerrain` / `meshTerrainCull` 等属性 |
 | `config/IllusionConfig.kt` | 配置定义与注释（`[mesh]` / `[vrs]` / `[debug]` 三张表） |

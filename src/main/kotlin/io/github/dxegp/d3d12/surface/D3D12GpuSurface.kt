@@ -12,11 +12,9 @@ import com.mojang.renderpearl.api.device.GpuSurface
 import com.mojang.renderpearl.backend.api.GpuSurfaceBackend
 import com.mojang.renderpearl.api.device.SurfaceException
 import com.mojang.renderpearl.api.textures.GpuTextureView
-import io.github.dxegp.diagnostics.D3D12FrameStats
 import io.github.dxegp.diagnostics.D3D12RenderProf
 import io.github.dxegp.render.presentation.D3D12GUISplit
 import io.github.dxegp.render.frame.vanilla.VanillaFrameCoordinator
-import io.github.dxegp.render.temporal.D3D12Temporal
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
 import io.github.dxegp.d3d12.command.D3D12CommandEncoderBackend
 import java.util.ArrayList
@@ -26,6 +24,11 @@ import java.util.ArrayList
  * blit 用当前命令编码器，present 按配置的 [GpuSurface.PresentMode] 走 vsync。
  */
 class D3D12GpuSurface(hwnd: Long) : GpuSurfaceBackend {
+    private companion object {
+        const val SURFACE_BLIT_PASS = 0x20003
+        const val STATE_SHADER_RESOURCE = 0xC0
+        const val STATE_COMMON = 0
+    }
     private val handle: Long
     private val presentModes: MutableList<GpuSurface.PresentMode> = ArrayList()
     private var closed = false
@@ -118,30 +121,33 @@ class D3D12GpuSurface(hwnd: Long) : GpuSurfaceBackend {
         val tex = D3D12GUISplit.presentSourceTexture(fallback)
         // 速度（运动矢量）pass 必须在本帧渲染完成、主深度仍有效时录进同一条命令列表。
         encoder.recordVelocityPass()
-        MCDR_ABI.D3D12BlitSurface(encoder.nativeHandle(), this.handle, tex.handle())
+        val version = VanillaFrameCoordinator.currentResourceVersion() ?: 1L
+        VanillaFrameCoordinator.recordDeclaredPresentationPass(
+            SURFACE_BLIT_PASS,
+            listOf(MCDR_ABI.VanillaResourceUse(
+                tex.handle(), version, access = 1,
+                requiredState = STATE_SHADER_RESOURCE, finalState = STATE_COMMON,
+            )),
+        ) {
+            MCDR_ABI.D3D12BlitSurface(encoder.nativeHandle(), this.handle, tex.handle())
+        }
         D3D12RenderProf.end(D3D12RenderProf.BLIT)
     }
 
-    /** 纯红色清空当前 back buffer（渲染循环自检用）。调用方需先 acquireNextTexture()；只录命令就返回。 */
-    fun clearToRed(encoder: D3D12CommandEncoderBackend) {
-        if (!ensureAcquired()) {
-            this.blitSkipped = true
-            return
-        }
-        MCDR_ABI.D3D12BlitSurface(encoder.nativeHandle(), this.handle, 0L)
-    }
-
     override fun present() {
+        val skipped = this.blitSkipped
         try {
             presentFrame()
+        } catch (failure: Throwable) {
+            VanillaFrameCoordinator.abortWorldRender(failure)
+            throw failure
         } finally {
-            VanillaFrameCoordinator.framePresented()
+            if (skipped) VanillaFrameCoordinator.retireUnpresentedFrame()
+            else VanillaFrameCoordinator.retireSubmittedDisplayFrame()
         }
     }
 
     private fun presentFrame() {
-        // 必须在任何"本帧"判断之前递增：即便本帧跳过 blit，下一帧仍算新一帧（时间性 jitter/历史只在帧首滚动）。
-        D3D12Temporal.onFramePresented()
         // 本帧跳过过 blit 就绝不 present：present 一张没写过的 back buffer 正是「上一帧叠在本帧上 / OSD 重影」；
         // native presentSurface() 也有一道同样的守卫（surface->blittedThisFrame），这里是纵深防御。
         if (this.blitSkipped) {
@@ -152,15 +158,6 @@ class D3D12GpuSurface(hwnd: Long) : GpuSurfaceBackend {
         D3D12RenderProf.begin(D3D12RenderProf.PRESENT)
         MCDR_ABI.D3D12PresentSurface(handle)
         D3D12RenderProf.end(D3D12RenderProf.PRESENT)
-        // F3 的 output 计数：这里是真正提交给交换链的地方（生成帧也得经过它）。D3D12FgPresented 按
-        // **当前生效的** provider 取数（XeSS-FG / FSR-FG 各自报），写死 DLSS-G 会让另两家恒为 1×。
-        val presented = MCDR_ABI.D3D12FgPresented()
-        D3D12FrameStats.onFramePresented(
-            if (presented > 0) presented else MCDR_ABI.D3D12DlssgPresentedFrames()
-        )
-        // 帧边界裁决「下一帧走 hudless 还是合成层」，必须在 present 之后：世界层去向要与下一帧 SR 行为
-        // 一致（SR 的挂点排在 prepareForGui 之前），同一帧里不能换模式。
-        D3D12GUISplit.armUiComposition()
     }
 
     override fun supportedPresentModes(): Collection<GpuSurface.PresentMode> {
@@ -174,6 +171,7 @@ class D3D12GpuSurface(hwnd: Long) : GpuSurfaceBackend {
         // 关闭会等 pending present / deviceWaitIdle；慢在这里表现为「窗口先灰几秒才消失」。
         val started = System.nanoTime()
         IllusionLogger.debugMessage("destroySurface begin")
+        VanillaFrameCoordinator.closeDisplayFrames()
         check(MCDR_ABI.D3D12DestroySurface(this.handle)) { "Surface still owns pending work: ${MCDR_ABI.D3D12LastError()}" }
         this.closed = true
         IllusionLogger.debugMessage("destroySurface took ${(System.nanoTime() - started) / 1_000_000} ms")

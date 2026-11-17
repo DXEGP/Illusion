@@ -365,7 +365,7 @@ open class D3D12VideoSettingsContent {
             providers += provider
         }
 
-        /** 撤销注册（热重载与测试用）。返回是否真的移除了一条。 */
+        /** 撤销注册；返回是否真的移除了一条。 */
         @JvmStatic
         fun removePageProvider(provider: PageProvider): Boolean = providers.remove(provider)
 

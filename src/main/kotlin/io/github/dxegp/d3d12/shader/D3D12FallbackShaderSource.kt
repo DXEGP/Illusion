@@ -26,6 +26,11 @@ object D3D12FallbackShaderSource {
         this.provider = value
     }
 
+    @JvmStatic
+    fun clearProvider() {
+        this.provider = null
+    }
+
     /** 按 `type.idConverter().idToFile(id)` 定位 vanilla 包内文件；读不到返回 null，由调用方照旧报错。 */
     @JvmStatic
     fun get(id: Identifier, type: ShaderType): String? {

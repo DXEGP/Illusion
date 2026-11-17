@@ -3,9 +3,7 @@
 本文说明 Blaze3D 的 GPU 抽象（`GpuBackend` / `GpuDevice` / `CommandEncoder` / `RenderPass` / 资源四件套）
 在 D3D12 上是怎么落地的：对象由谁持有、在哪一刻释放、内存怎么分块复用、哪些数值一旦改动就会立刻出错。
 
-范围：`Illusion\src\main\kotlin\io\github\dxegp\d3d12\` 下的 `backend\`、`render\adapter\`、`render\core\`
-三个包，以及它们调用的 C ABI（`MCDR.dll`）。**不展开**：GLSL→SPIR-V→HLSL→DXIL 的编译细节、
-呈现与后处理管线（SMAA/TAA/VRS/DLSS）、meshlet 几何构建算法、配置系统。
+范围：`Illusion\src\main\kotlin\io\github\dxegp\d3d12\` 的 backend、device、command 与 resource，以及它们调用的 C ABI（`MCDR.dll`）。GLSL→naga→HLSL→DXIL 的编译细节、呈现/后处理、meshlet 算法和配置系统分别由对应文档说明。
 
 本文所有数值与阈值都取自代码；代码没有写清楚的地方会显式标「代码中未明确」。
 
@@ -16,15 +14,14 @@
 先记住这三条，后面大部分设计都是它们的推论。
 
 1. **JVM 侧只做翻译与记账，GPU 状态全在 native。**
-   Kotlin 里没有一个 `ID3D12*` 指针，只有 `Long` 句柄；**没有公开的 barrier API**，资源状态由 native
-   在每个使用点（render pass 附件、拷贝、绑定顶点/索引缓冲、写描述符）自动 transition。
-   应用层不需要、也没有办法声明资源状态。
+   Kotlin 只持有不透明 `Long` 句柄。世界光栅、输入准备、后处理、GUI 和呈现源通过统一 pass 契约声明实际资源使用，native 规划并核对状态；SDK 私有资源由所属 adapter 管理。
+   底层 transition 仍由 native 在实际使用点执行，UPLOAD/READBACK heap 保持各自固定状态。
 2. **一个设备一个共享编码器。**
    `D3D12Device.createCommandEncoder()` 永远返回同一个 `D3D12CommandEncoderBackend` 实例，整帧的
    所有 pass 与帧中后处理都录进同一条命令列表。临时需求（例如截图回读）走
    `constructor()`（`device == null`）另建一条短命命令列表。
 3. **失败即崩溃，不回退。**
-   任何自检失败、管线创建失败都走 `D3D12Fatal.crash(...)`，抛出的是 `ReportedException` 而不是
+   设备初始化、能力契约或管线创建失败都走 `D3D12Fatal.crash(...)`，抛出的是 `ReportedException` 而不是
    `BackendCreationException`，所以原版「试用下一个候选后端」的循环不会把它吞掉。同时把
    `preferredGraphicsBackend` 重置为默认值，下次启动不会再选中 D3D12。
 
@@ -46,69 +43,64 @@
 
 ### 2.1 全景图
 
+```mermaid
+flowchart TD
+    Backend[D3D12Backend：组合业务与设备]
+    Device[D3D12Device：资源工厂与设备生命周期]
+    Compiler[VanillaPipelineCompiler：source / normal / flipY / shader 缓存]
+    Variants[VanillaPipelineVariants / TerrainPipelineCompiler]
+    Factory[VanillaCommandRecordingFactory：创建会话与释放地形采样器]
+    Encoder[D3D12CommandEncoderBackend：共享 FRAME 或一次性 UPLOAD]
+    Recording[VanillaCommandRecording：每 encoder 独立业务状态]
+    Transient[TransientMemory / SubmissionUploadArena：提交 fence 退休]
+    Pass[D3D12RenderPassBackend：绑定包与 direct / bulk / indirect]
+    Pipeline[D3D12CompiledRenderPipeline：PSO / 变体产物与关闭]
+    Native[MCDR_ABI → native 资源 / command context / queue / fence]
+    Backend --> Device
+    Backend --> Compiler
+    Backend --> Factory
+    Device --> Compiler
+    Device --> Factory
+    Device --> Encoder
+    Compiler --> Variants
+    Compiler --> Pipeline
+    Encoder --> Recording
+    Factory --> Recording
+    Encoder --> Transient
+    Encoder --> Pass
+    Recording --> Pass
+    Device --> Native
+    Encoder --> Native
+    Pass --> Native
+    Pipeline --> Native
 ```
-Blaze3D 接口层
-  GpuBackend ── D3D12Backend        getName / loadLibrary / createWindow / createDevice
-      │
-      │ createDevice()
-      ▼
-  GpuDeviceBackend ── D3D12Device   deviceInfo · timestampCtx · glslCompiler
-      ├── pipelineCache      : IdentityHashMap<RenderPipeline, D3D12CompiledRenderPipeline>
-      ├── pipelineCacheFlipY : HashMap<FlipYKey, D3D12CompiledRenderPipeline>   ← 值语义键
-      ├── shaderCache        : HashMap<ShaderCompilationKey, D3D12IntermediaryShaderModule>
-      ├── sharedCommandEncoder ─────► 全设备唯一，createCommandEncoder() 每次返回它
-      └── 资源工厂：createBuffer / createTexture / createTextureView / createSampler /
-                    createTimestampQueryPool / createSurface / compilePipeline
-      │
-      ▼
-  CommandEncoderBackend ── D3D12CommandEncoderBackend
-      ├── ctx : Long                   native CommandContext*
-      ├── transientMemory              UBO ring(3×4096B) + staging 池(3 块，512KB 起)
-      ├── currentRenderPass ────────► D3D12RenderPassBackend    每次 createRenderPass 新建
-      ├── pendingSubmit                异步渲染线程握手中（多帧飞行）
-      └── companion GLOBAL_CALLBACKS   设备级围栏回调队列
-      │
-      ├── createRenderPass() ───────► D3D12RenderPassBackend
-      │        renderArea · outputWidth/Height · hasDepth · colorTargetHandle · flipY
-      │        uniforms: Map<String, Any> · pendingVertexBuffers · pipeline
-      │
-      └── 资源：JVM 侧只持有 Long 句柄，真正的 D3D12 对象在 native
-               D3D12GpuBuffer              ──► native Buffer（UPLOAD / READBACK / DEFAULT）
-               D3D12GpuTexture             ──► native Texture（views 引用计数）
-                 └ D3D12GpuTextureView     ──► native View（baseMip + levelCount）
-               D3D12GpuSampler             ──► native Sampler
-               D3D12GpuQueryPool           ──► native QueryPool（读取阻塞）
-               D3D12GpuSurface             ──► native SwapChain（3 个 back buffer）
-               D3D12CompiledRenderPipeline ──► PSO（+ meshletPso / lineQuadPso）
 
-native 侧（MCDR.dll 进程内单例，JVM 看不到）
-  ID3D12Device · ID3D12CommandQueue · ID3D12Fence(queueFence) + queueFenceValue
-  drawHeap           shader-visible CBV_SRV_UAV，4 段 ring，每段 155648 槽
-  srvHeap 262144 · rtvHeap 2048 · frameRtvHeap 256 · dsvHeap 256 · samplerHeap 2048
-  gPendingDeletes    延迟删除队列，按围栏值结算
-  每 encoder 一个 CommandContext{ allocator, commandList, listOpen, fenceValue, drawHeapSlotBase }
-  可选：异步渲染线程 + 分区描述符分配器 + bundle 录制池
-```
+native command context 持有命令列表、allocator、descriptor pages 与 recording leases；queue fence 决定资源退休。readback 完成项归对应 context/submission，不使用设备全局回调队列。JVM 不创建分区描述符分配器或 bundle 录制池。
 
 ### 2.2 持有关系与释放责任
+
+当前 JVM 已移除无调用方的 `D3D12AsyncContext`、bundle/executor/prepass/分区描述符包装及相关录制配置。Native ABI7 的公开 bundle/allocator/executor 导出和实现仍为外部兼容保留；它们不代表当前原版绘制启用了 bundle worker。实际路径和验证边界见 [Work Graph 实施记录](../rendering/work-graph-implementation.md)。
 
 | 对象 | 由谁创建 | 谁长期持有 | 谁负责销毁 | 实际释放时机 |
 | --- | --- | --- | --- | --- |
 | `D3D12Backend` | 模组启动时注册进 Blaze3D | Blaze3D 的后端注册表 | 进程级，无需销毁 | 进程退出 |
 | `D3D12Device` | `D3D12Backend.createDevice` | 前端 `GpuDevice` | `D3D12Device.close()` | 窗口销毁之后、进程退出之前 |
 | 共享 encoder | `D3D12Device.createCommandEncoder`（首次） | `D3D12Device` | `D3D12Device.close()` 显式调 `D3D12DestroyCommandEncoder` | 设备关闭时 |
-| 一次性 encoder | 各处 `new D3D12CommandEncoderBackend()` | 调用方 | `close()`（内部会 `D3D12DestroyCommandEncoder`） | 用完即关 |
-| `D3D12RenderPassBackend` | encoder 的 `createRenderPass` | encoder 的 `currentRenderPass` | `submitRenderPass()` 或 encoder `close()` 兜底 EndPass | 每个 pass 结束 |
+| 一次性 encoder | device 的初始 buffer 上传，注入 UPLOAD 会话 | 调用方 | `close()`（内部会 `D3D12DestroyCommandEncoder`） | 用完即关 |
+| `D3D12RenderPassBackend` | 注入的 `VanillaCommandRecording` | encoder 的 `currentRenderPass` | `submitRenderPass()` 或 encoder `close()` 结束 native pass | 每个 pass 结束 |
+| `VanillaCommandRecording` | Backend 注入工厂，device 按 FRAME/UPLOAD scope 创建 | 对应 encoder | native context 完成并销毁后关闭登记资源 | meshlet atlas 与会话按同一时点释放，超时保留 |
 | `D3D12GpuBuffer` | device / `D3D12TransientMemory` | 调用方（transient 的由 frame 列表持有） | `close()` → `ID3D12DestroyResource` | 排进 `gPendingDeletes`，围栏通过后真正 `delete` |
 | `D3D12GpuTexture` | device | 调用方 | `close()`；**views > 0 时只置关闭标志** | 最后一个 view `close()` 之后 |
 | `D3D12GpuTextureView` | device | 调用方 | `close()` → `removeViews()` + 销毁视图句柄 | 同上（延迟到 GPU 空闲） |
-| `D3D12CompiledRenderPipeline` | `D3D12Device.compilePipeline` | `pipelineCache` / `pipelineCacheFlipY` | `clearPipelineCache()` 或资源重载 | 缓存清理时（含 meshlet/宽线变体） |
+| `VanillaPipelineCompiler` | Backend 构建设备时注入 | Device 的中立 `pipelines` 接口 | encoder 完成后 `pipelines.close()` | 先撤销 pending/缓存，再关闭变体编译、预热与 shader compiler |
+| `D3D12CompiledRenderPipeline` | `VanillaPipelineCompiler` 与变体编译业务 | 普通/flipY 缓存与 frontend 各自持租约 | compiler 清缓存或资源重载释放租约 | 最后一个租约释放时关闭全部产物 |
 | `D3D12GpuSampler` | device | 调用方 | `close()` | 立即 / 延迟删除 |
 | `D3D12GpuQueryPool` | device | 调用方 | `close()` | 延迟删除 |
 | `D3D12GpuSurface` | device `createSurface` | 前端窗口 | `close()` | 窗口销毁时（耗时会被记录，慢会表现为窗口灰几秒） |
-| `D3D12AsyncContext` | 设备 `init` 里的首次 `get()` | 单例 | `shutdown()`（先 `awaitTermination(2s)`） | 设备关闭时 |
+| 地形 bias sampler | `D3D12TerrainSampler.wrap` | 原版业务采样器缓存 | `VanillaCommandRecordingFactory.close()` | encoder context 成功完成并销毁后、设备销毁前 |
+| native `AsyncRenderer` | Backend 选择提交模式，Device 初始化 | native 设备 | `D3D12Device.close()` 检查 `D3D12DestroyAsyncRenderer()` | 实际提交/围栏所有权结算后 |
 
-一句话记法：**设备持有编码器与管线缓存；编码器持有瞬时内存与当前 pass；资源归调用方（前端）**。
+设备持有编码器与中立 compiler；compiler 持有编译业务缓存；编码器持有瞬时内存、业务会话与当前 pass；一般资源归调用方。
 transient 里靠 frame 列表持有的那些缓冲是唯一「不由前端持有」的例外。
 
 ### 2.3 不是对象的东西
@@ -132,23 +124,14 @@ transient 里靠 frame 列表持有的那些缓冲是唯一「不由前端持有
    知道的值推过去 —— 第一次 `pushToNative()` 实际上被**静默丢掉**，因为 ABI 句柄要等 `D3D12Device`
    构造时才加载，此时还是 `null`。这一条不写下来一定会被误认为「配置没生效」。
 2. `D3D12Backend.createDevice`：
-   1. `[debug] failDevice = true` 时先崩，用来验证崩溃路径本身；
-   2. `pushToNative()`（第一次，通常无效）；
-   3. `D3D12Device(EMBEDDED_SHADER_SOURCE)`，构造里依次：
-      `ID3D12CreateDevice` 探针 → `GetTimestampFrequency`（为 0 时按 1.0 处理并 warn）→
+   1. `pushToNative()`（第一次，通常无效）；
+   2. 注入 `VanillaCommandRecordingFactory`、`VanillaPipelineCompiler` 和 `D3D12SubmissionMode`，设备构造里依次：
+      `ID3D12CreateDevice` → `GetTimestampFrequency`（为 0 时按 1.0 处理并 warn）→
       解析 `ID3D12GetAdapterInfo` 的扁平 JSON 成 `D3D12AdapterInfo` → 组装 `DeviceInfo` →
-      `D3D12InitAsyncRenderer(1)`（若开了异步渲染线程，**必须在 `createCommandEncoder` 之前**）→
-      `D3D12AsyncContext.init()`（分区描述符堆 + bundle 池 + worker 池；任一失败自动退回单线程录制）；
-   4. `pushToNative()` 第二次 —— 那些 native 只在创建期读一次的开关（例如帧生成模式）靠这一次才到得了；
-   5. 自检链；
-   6. `clearPipelineCache()` 后返回设备。
-3. 自检链（顺序固定，后面的依赖前面的）：`selfTestJavaResources` → `selfTestCommandLayer` →
-   `selfTestPipelines` → 可选 `selfTestMesh` / `selfTestCompute` + `selfTestShadingRate` /
-   `selfTestMeshDiag` / `selfTestSurface`。任一步抛异常都会 `device.close()` 后再抛，不会留下半初始化
-   设备。
-4. **自检结束后必须清空管线缓存**：自检用的是内嵌 GLSL（只覆盖 `core/gui` 与
-   `core/position_tex_color`），不清缓存的话真实 shader 永远命中这些假条目，屏幕是紫色。
-5. 创建窗口后 `createSurface(hwnd)` → `configure(w, h, presentMode)`（内部 `D3D12ConfigureSurface`，
+      `D3D12InitAsyncRenderer(1)`（若开了异步渲染线程，**必须在 `createCommandEncoder` 之前**）；当前没有 JVM bundle owner 初始化；
+   3. `pushToNative()` 第二次 —— 那些 native 只在创建期读一次的开关（例如帧生成模式）靠这一次才到得了；
+   4. 能力契约检查通过后直接返回设备；行为验证在 `src/probes/` 的独立进程中运行，不进入启动链。
+3. 创建窗口后 `createSurface(hwnd)` → `configure(w, h, presentMode)`（内部 `D3D12ConfigureSurface`，
    失败抛 `SurfaceException`）→ 第一次 `acquireNextTexture()` 只是登记「下帧要拿」，见 §3.2。
 6. 第一次 `createCommandEncoder()`：native 侧建 CommandContext 并**立刻** `D3D12BeginCommandList`
    （begin 幂等：`listOpen == 1` 时跳过 Reset）。
@@ -220,7 +203,7 @@ submit() → settlePendingSubmit() → D3D12BeginCommandList（幂等）→ D3D1
 | 普通资源 `close()` | Kotlin → `ID3D12DestroyResource(handle)` | 句柄立刻置 0（幂等），真正 `delete` 走延迟删除 |
 | 纹理还有 view | `D3D12GpuTexture.close()` 只看计数 | 计数归零的那次 `removeViews()` 才真正发起销毁 |
 | 管线 | `D3D12CompiledRenderPipeline.close()` | **先取走 handle 再归零**，然后 DestroyPipeline |
-| 管线缓存 | `D3D12Device.clearPipelineCache()` | 逐条 close 后清空三张缓存；资源重载时前端也会逐条 close |
+| 管线缓存 | `VanillaPipelineCompiler` 的 reload / close | 缓存与 frontend 各自释放租约，最后一个租约关闭 native 产物 |
 | 瞬时缓冲 | `transientMemory` 的 frame 列表 | `rotate()` 时淘汰超过 2 帧（`FRAMES_IN_FLIGHT`）的 frame |
 | 交换链 | `D3D12GpuSurface.close()` | 窗口销毁时；耗时被打点 |
 | 设备 | `D3D12Device.close()` | 见 §3.8 的固定顺序 |
@@ -284,14 +267,16 @@ val token = MCDR_ABI.D3D12GetFenceValue(ctx) + 1
 
 ### 3.8 设备关闭的固定顺序
 
-```
-D3D12TerrainSampler.release()
-共享 encoder.close()  →  MCDR_ABI.D3D12DestroyCommandEncoder(nativeHandle)
-clearPipelineCache()
-glslCompiler.close()
-D3D12AsyncContext.shutdown()  →  awaitTermination(2s)  →  D3D12DestroyAsyncRenderer()
-D3D12DestroyDevice()          →  必须趁 dxgi.dll 还活着
-D3D12AdapterInfo.current = null
+```mermaid
+flowchart TD
+    Encoder[共享 encoder.close：结算 CPU 提交与 GPU fence]
+    Context[销毁 native context，再关闭登记资源与独立业务会话]
+    Recording[关闭录制工厂：释放地形采样器]
+    Compiler[pipelines.close：撤销重载与缓存，关闭变体 / 预热 / 编译器]
+    Async[DestroyAsyncRenderer：检查所有权已释放]
+    Device[DestroyDevice：DXGI 仍存活时释放]
+    State[清空设备初始化状态与 adapter 信息]
+    Encoder --> Context --> Recording --> Compiler --> Async --> Device --> State
 ```
 
 两处不能改：
@@ -389,11 +374,11 @@ copyBufferToTexture(...)   // 必须先 ensureListOpen()：分配 staging 不录
 ### 4.5 读回路径
 
 - `copyTextureToBuffer(tex, dst, offset, callback, mip)`：目标必须是 READBACK 堆缓冲
-  （`USAGE_MAP_READ`），回调进 `GLOBAL_CALLBACKS`。`device == null`（一次性编码器）时立刻
-  `submit()`，随后同步跑回调。
+  （`USAGE_MAP_READ`），回调归本 encoder 的 pending/submitted 队列，提交时绑定实际 fence。`device == null`（一次性编码器）时立刻
+  `submit()`，成功等待该 fence 后跑回调。
 - `D3D12GpuQueryPool` 的读取是**阻塞**的：native 把时间戳 resolve 到 readback 缓冲、提交、等围栏，
   然后返回。它不适合放在热路径上按帧调用。
-- 截图路径的读回回调必须挂在设备级全局队列，见 §5。
+- 其他 encoder 的提交不能提前触发此回调；失败或超时保留对应提交与回读资源。
 
 ### 4.6 mapped 内存的约束
 
@@ -419,32 +404,32 @@ copyBufferToTexture(...)   // 必须先 ensureListOpen()：分配 staging 不录
 | 4 | `drawHeap` 容量 | 每帧段 `131072 + 24576 = 155648` 槽，**4 段**，共 **622592** 槽（shader-visible 上限 1,000,000） | 段内耗尽 → `draw descriptor heap exhausted` | `d3d12_device.cpp:192-199` |
 | 5 | 帧段号 | `drawHeapSlotBase = (fenceValue % 4) * 155648` | 槽位算错会覆盖别的帧的描述符 | `d3d12_device.cpp:4000` |
 | 6 | 其余描述符堆 | SRV 262144 · RTV 2048 · 帧 RTV 256 · DSV 256 · sampler 2048 | 溢出直接创建失败 | `d3d12_device.cpp:192-196` |
-| 7 | 异步 worker 分区 | 每分区 **24576** 槽（8 worker ⇒ 3072 槽/帧/worker） | 并行 bundle 分配失败 → 回退串行 | `kAsyncWorkerSlotsPerSection` |
-| 8 | 单 bundle 上限 | 绘制数 ≤ **512**（`SERIAL_BUNDLE_MAX_DRAWS`），SRV 槽位需求 ≤ **2048** | 超限就升级为真并行或回退串行 | `D3D12RenderPassBackend` |
-| 9 | 并行最小批量 | 少于 **24** 次绘制不走并行（`PARALLEL_MIN_DRAWS`） | 调度开销大于收益 | 同上 |
+| 7 | 保留的 native 分区 allocator | 属于 ABI7 兼容实现，当前 JVM 不创建 | 不用于当前 draw 负载或上限判断 | native async descriptor 模块 |
+| 8 | 当前批量绘制 | 有序 multiDraw ABI，motion 保留逐项绑定 | 没有 JVM bundle 拆分或512-draw规则 | `D3D12RenderPassBackend` |
+| 9 | 批次顺序 | 保留原 SPI draw 顺序与各项参数，不按旧 worker 阈值拆分 | 重排会改变透明和有序内容语义 | `D3D12RenderPassBackend` / `abi_draw.cpp` |
 | 10 | 描述符分配 count | 分配器把 `count == 0` 视为失败，调用方必须 `coerceAtLeast(1)` | 无 SRV 的批次被误判为分配失败 | 同上 |
-| 11 | barrier 规则 | JVM 侧**没有** barrier API；唯一例外是异步 bundle 的预过渡（`AsyncPrepareCBVBuffers` → `VERTEX_AND_CONSTANT_BUFFER`、`AsyncPrepareIndexBuffers` → `INDEX_BUFFER`、`AsyncPrepareTextureViews` → `SHADER_RESOURCE`），全部在**主列表**做 | bundle 内出现 `ResourceBarrier` 是非法的（D3D12 明确禁止） | `MCDR_ABI.kt` |
+| 11 | barrier 规则 | native 按实际附件和 SRV/IA/indirect 范围转换；普通输入由 scheduler 导入 | JVM 不调用闲置 bundle prepass；保留的 native bundle 仍不得录制 ResourceBarrier | native device / vanilla scheduler |
 | 12 | 命令列表线程 | 一条命令列表只能由创建它的线程录制；异步渲染线程只 Close/Execute/Present | 数据竞争、整帧命令被丢弃、窗口狂闪 | `D3D12CommandEncoderBackend.submit` |
-| 13 | `frameSlot` 读取时机 | 必须在命令列表 begin **之后**（`D3D12AsyncCurrentFrameSlot`） | 读到上一帧的段号，描述符写错段 | `D3D12AsyncContext` |
+| 13 | descriptor/frame 槽所有权 | 由实际 native command context 与 fence 管理 | JVM 已移除闲置 AsyncCurrentFrameSlot 包装 | native device |
 | 14 | 围栏回调线程 | native 的监视线程；**不得抛异常**（异常逃出 upcall 会终止 JVM） | 进程级崩溃，没有 Java 栈 | `D3D12FenceCallback` |
 | 15 | RTV 的 mip | 每个附件按 `colorMips[i]` 绑真实 mip，不能恒绑 mip0 | 图集 mip 链永远不写入 | `createRenderPass` |
 | 16 | clear flag | `0 = LOAD`，`1 = CLEAR`；`clearColors` 长度 = 附件数 × 4 | 该清的没清 / 该保留的被抹 | `D3D12BeginRenderPass` |
 | 17 | 索引格式 | `D3D12SetIndexBuffer(ctx, buf, indexType)`：`0 = R16_UINT`，`1 = R32_UINT` | 大网格索引错位 | `MCDR_ABI` |
 | 18 | flipY 判定 | 附件 0 纹理 `usage == 13`，即 `COPY_DST + TEXTURE_BINDING + RENDER_ATTACHMENT`（1+4+8）；**绝不能是 15**（再多一个 `COPY_SRC`） | 主 pass 被误判成图集 pass → 图标镜像、裁剪区错乱 | `createRenderPass` |
 | 19 | 顶点缓冲槽位 | 绑定时若 `vertexSize == 0` 会挂起，`setPipeline` 后按管线布局落实；布局里也没有就丢弃 | 该批次缺顶点流、几何消失 | `setVertexBuffer` |
-| 20 | 宽线 | D3D12 的 `LINELIST` 恒为 1 px；宽线靠额外的 `TRIANGLES` 变体 PSO | 没建变体时选中框只剩 1 px | `D3D12Device.compilePipeline` |
+| 20 | 宽线 | D3D12 的 `LINELIST` 恒为 1 px；宽线靠额外的 `TRIANGLES` 变体 PSO | 没建变体时选中框只剩 1 px | `VanillaPipelineVariants.compile` |
 | 21 | 交换链缓冲数 | **3**（`kSurfaceBufferCount`，对齐官方 `minImageCount = max(3, min)`） | 与官方约定不符（后果代码中未明确） | `mcdr_device.cppm:1499` |
 | 22 | 描述符堆重绑 | native 在 begin 与每次 push 时都 `SetDescriptorHeaps({drawHeap})` | 只绑一次会在帧中途丢堆 | `d3d12_device.cpp` |
-| 23 | 异步 allocator ring | 4 帧轮转（`kFramesInFlight = 4`），与 `fenceValue % 4` 同步 | 复用未完成的 allocator → 命令列表语义损坏 | `d3d12_async_executor.cppm:40` |
-| 24 | `pushConstants` | 无根常量路径，直接忽略并只 warn 一次 | 依赖它的 shader 拿到脏常量 | `D3D12RenderPassBackend.pushConstants` |
+| 23 | 保留的 native executor | ABI7 兼容实现，当前 JVM 没有创建/录制调用方 | 不能以其 allocator ring 描述活跃 encoder | native async executor 模块 |
+| 24 | `pushConstants` | 长度必须与 pipeline 声明完全一致，复制本次输入并在 draw/bulk 中提交实际 root constants | 长度或布局不匹配直接报错 | `D3D12RenderPassBackend.pushConstants` |
 
 以下五条写法与上表数值同等严格：
 
-- **拷贝完成回调必须挂到设备级全局队列 `GLOBAL_CALLBACKS`**：任何一次 `submit()` 都会抽干它；挂在单个编码器上的调用若不提交，回调永不执行，READBACK 缓冲每次泄漏。
+- **拷贝完成回调归实际 encoder/submission**：对应 fence 成功完成后执行，一次性回读自行提交并等待；其他 context 提交不能触发它。
 - **先 `setPipeline()` 再 `pushDescriptors()`**：绑定表是「条目序号 → register 序号」，由管线布局决定；没有管线时只能记日志跳过（SKIP）。
 - **meshlet 先换 PSO 再 `pushDescriptors()`**：`SetGraphicsRootSignature` 会清掉已绑的根描述符表，顺序反了地形整片消失且不报错。
 - **`copyBufferToTexture()` 先 `ensureListOpen()`**：分配 staging 不录制命令，帧外（资源重载）调用不自查就会命中 `dx12CopyBufferToTexture: no open command list`。
-- **管线 `close()` 先取走 handle 再归零**：`DestroyPipeline` 不幂等，重复销毁同一指针是原生 double free（退出码 `0xC0000374`）。
+- **管线 `close()` 逐个成功销毁后清空句柄**：关闭在同一实例上串行，失败项保留；最后租约只在全部产物成功关闭后移除，避免重试时重复释放已成功产物。
 
 ---
 
@@ -496,9 +481,9 @@ copyBufferToTexture(...)   // 必须先 ensureListOpen()：分配 staging 不录
 | 查询越界 | `IndexOutOfBoundsException("Query range … exceeds pool size …")` |
 | surface 配置/获取失败 | `SurfaceException("Failed to configure DX12 surface to WxH")`、`"Failed to acquire DX12 back buffer (deferred)"` |
 | 不支持的绘制重载 | `UnsupportedOperationException("… is not supported by the D3D12 backend")` |
-| 自检失败 | `D3D12Fatal.crash("DX12 self-test failed: $t")` → `ReportedException` |
+| 初始化失败 | `D3D12Fatal.crash("DX12 initialization failed: $t")` → `ReportedException` |
 
-唯一「硬失败但先不抛」的地方是自检与 `D3D12Fatal`：它们需要先 `device.close()` 再把异常交给崩溃
+唯一「硬失败但先不抛」的地方是设备初始化与 `D3D12Fatal`：它们需要先 `device.close()` 再把异常交给崩溃
 报告，顺序反了会留下半初始化的设备。
 
 ---
@@ -509,10 +494,10 @@ copyBufferToTexture(...)   // 必须先 ensureListOpen()：分配 staging 不录
 
 | 文件 | 一句话职责 |
 | --- | --- |
-| `d3d12/backend/D3D12Backend.kt` | 后端入口：建窗口、建设备、跑自检链、失败即崩 |
+| `d3d12/backend/D3D12Backend.kt` | 后端入口：建窗口、建设备、能力契约检查、失败即崩 |
 | `d3d12/command/D3D12CommandEncoderBackend.kt` | 命令列表生命周期、清屏/拷贝、帧提交（同步与异步）、帧中后处理入口 |
-| `d3d12/command/D3D12RenderPassBackend.kt` | pass 录制：绑定表、顶点/索引缓冲、scissor、绘制、并行 bundle、meshlet 派发 |
-| `d3d12/backend/D3D12CompiledRenderPipeline.kt` | 已编译管线：PSO 句柄、meshlet 与宽线变体、绑定条目推导 |
+| `d3d12/command/D3D12RenderPassBackend.kt` | pass 录制：绑定表、顶点/索引缓冲、scissor、有序批量绘制、meshlet 派发 |
+| `d3d12/backend/D3D12CompiledRenderPipeline.kt` | 已编译管线：PSO/mesh/WG/motion/宽线产物与关闭，复用最终绑定表 |
 | `d3d12/backend/D3D12PipelineBridge.kt` | 按 `pipeline.location` 找回 `RenderPipeline` 与 `ShaderSource` 的旁路表 |
 | `d3d12/backend/D3D12BindGroupEntry.kt` | 绑定条目 → HLSL register 序号的映射（CBV/SRV/texel buffer） |
 | `d3d12/command/D3D12FenceCallback.kt` | 全库唯一的 FFM upcall 接口（围栏回调） |
@@ -521,7 +506,10 @@ copyBufferToTexture(...)   // 必须先 ensureListOpen()：分配 staging 不录
 | `diagnostics/D3D12Fatal.kt` | 致命错误出口：写报告并抛 `ReportedException`，绕过候选后端回退 |
 | `render/presentation/D3D12GUISplit.kt` | GUI/世界层拆分：决定 blit 源纹理，present 后重置合成状态 |
 | `render/temporal/D3D12Temporal.kt` | 时间性 jitter：拦截 UBO 写入、逐帧滚动偏移 |
-| `d3d12/device/D3D12Device.kt` | 设备门面：资源工厂、管线缓存、着色器编译、关闭顺序 |
+| `d3d12/device/D3D12Device.kt` | 设备门面：资源工厂、共享 encoder、编译 SPI 委托与关闭顺序 |
+| `render/compilation/VanillaPipelineCompiler.kt` | 原版 source/shader/pipeline 缓存、预热、重载、descriptor 与顶点输入翻译 |
+| `render/compilation/VanillaPipelineVariants.kt` | motion、宽线与地形变体编排 |
+| `render/terrain/mesh/TerrainPipelineCompiler.kt` | 地形 shader/PSO/WG 编译及产物移交 |
 | `d3d12/device/D3D12AdapterInfo.kt` | 适配器信息（手写 JSON 解析）与 F3 显示数据源 |
 | `diagnostics/D3D12RenderProf.kt` | 阶段计时（每 300 帧一行），供 Java mixin 静态调用 |
 | `d3d12/resource/D3D12TransientMemory.kt` | 瞬时内存：UBO ring、staging 块分配器、帧列表与回收 |
@@ -530,9 +518,9 @@ copyBufferToTexture(...)   // 必须先 ensureListOpen()：分配 staging 不录
 | `d3d12/resource/D3D12GpuTextureView.kt` | 纹理视图（带 `baseMip`） |
 | `d3d12/surface/D3D12GpuSurface.kt` | 交换链：配置、延迟获取、blit、present |
 | `d3d12/resource/D3D12GpuQueryPool.kt` | 时间戳查询池（读取是阻塞的） |
-| `d3d12/command/D3D12AsyncContext.kt` | 异步录制上下文：分区描述符、bundle 池、worker 池 |
+| native `AsyncRenderer` | 设备拥有的实际提交/呈现线程；与已移除的 JVM bundle owner 分开 |
 | `d3d12/shader/D3D12GpuSampler.kt` | 采样器对象 |
-| `d3d12/shader/D3D12ShaderCompiler.kt` | GLSL→SPIR-V→HLSL→DXIL 的编译入口 |
+| `d3d12/shader/D3D12ShaderCompiler.kt` | GLSL→naga→HLSL 的转换、阶段链接和 binding 布局 |
 | `d3d12/shader/D3D12IntermediaryShaderModule.kt` | 中间着色器模块：缓存已翻译的 HLSL 并给顶点属性分配槽位 |
 | `d3d12/ffi/MCDR_ABI.kt` | 全部 C ABI 绑定（FFM downcall + 唯一 upcall 存根） |
 | `d3d12/ffi/MCDR_PipelineDesc.kt` | 图形/计算管线描述的 native 侧布局 |
@@ -563,11 +551,11 @@ copyBufferToTexture(...)   // 必须先 ensureListOpen()：分配 staging 不录
 本文覆盖的是「后端与设备 / 资源层」。管线编译链、呈现与后处理、meshlet 几何构建各有独立文档，
 交叉处只保留接口约定。
 
-## 自检与设备关闭
+## 设备创建与关闭
 
-`diagnostics.BackendSelfTests` 拥有资源、command、pipeline、mesh、compute、SRI、surface 检查。
 `d3d12.shader.D3D12BootstrapShaderSource` 提供资源包加载前的内嵌 shader 源。
-`D3D12Backend` 仅负责创建顺序、配置推送、自检入口、失败关闭与管线缓存清理。
+`D3D12Backend` 负责创建顺序、配置推送、编译/录制业务组合、能力契约与失败关闭；行为验证由 `src/probes/`
+中的独立程序承担，不在业务初始化路径里创建测试资源或提交测试命令。
 设备关闭先结算 encoder 的异步提交并结束列表，再等待已提交 fence 完成、销毁 encoder，最后关闭超分计时池。
 encoder 实例通过 `AutoCloseable` 集合持有随 command context 退休的资源；device 不引用超分业务类。
 一次性 encoder 在自身 `close()` 执行同一退休路径，共享 encoder 由设备关闭触发退休。

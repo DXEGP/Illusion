@@ -36,6 +36,7 @@ class MCDRMeshPipelineDesc {
         private val OFF_POLYGON: Long = offMesh("polygonMode")
         private val OFF_BINDING_COUNT: Long = offMesh("bindingCount")
         private val OFF_BINDINGS: Long = offMesh("bindings")
+        private val OFF_RASTER_MOTION: Long = offMesh("rasterMotion")
 
         private val OFF_CT_FORMAT: Long = offColor("format")
         private val OFF_CT_WRITE_MASK: Long = offColor("writeMask")
@@ -84,6 +85,7 @@ class MCDRMeshPipelineDesc {
 
     var cullEnabled: Boolean = false
     var polygonMode: Int = 0
+    var rasterMotion: Boolean = false
 
     val colorTargets: MutableList<MCDRPipelineDesc.ColorTarget> = ArrayList()
     val bindings: MutableList<MCDRPipelineDesc.Binding> = ArrayList()
@@ -144,7 +146,7 @@ class MCDRMeshPipelineDesc {
 
         desc.set(MCDRLayout.I32, OFF_COLOR_COUNT, colorTargets.size)
         if (colorTargets.isNotEmpty()) {
-            val array = arena.allocate(MCDRLayout.COLOR_TARGET, colorTargets.size.toLong())
+            val array = arena.allocateFfmArray(colorTargets.size, MCDRLayout.COLOR_TARGET)
             for (i in 0 until colorTargets.size) {
                 writeColorTarget(array, i * MCDRLayout.COLOR_TARGET.byteSize(), colorTargets[i])
             }
@@ -161,10 +163,11 @@ class MCDRMeshPipelineDesc {
 
         desc.set(MCDRLayout.I32, OFF_CULL, if (cullEnabled) 1 else 0)
         desc.set(MCDRLayout.I32, OFF_POLYGON, polygonMode)
+        desc.set(MCDRLayout.I32, OFF_RASTER_MOTION, if (rasterMotion) 1 else 0)
 
         desc.set(MCDRLayout.I32, OFF_BINDING_COUNT, bindings.size)
         if (bindings.isNotEmpty()) {
-            val array = arena.allocate(MCDRLayout.PIPELINE_BINDING, bindings.size.toLong())
+            val array = arena.allocateFfmArray(bindings.size, MCDRLayout.PIPELINE_BINDING)
             val stride = MCDRLayout.PIPELINE_BINDING.byteSize()
             for (i in 0 until bindings.size) {
                 val base = i * stride

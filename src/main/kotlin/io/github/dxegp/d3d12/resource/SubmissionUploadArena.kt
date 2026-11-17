@@ -35,7 +35,8 @@ internal class SubmissionRetirement<Resource>(
 
     fun drainAfterCompletion() {
         while (submitted.isNotEmpty()) {
-            for (resource in submitted.removeFirst().second) retire(resource)
+            for (resource in submitted.first().second) retire(resource)
+            submitted.removeFirst()
         }
         for (resource in recording) retire(resource)
         recording.clear()
@@ -108,7 +109,6 @@ internal class SubmissionUploadArena<Resource>(
     }
 
     fun closeAfterCompletion() {
-        if (closing) return
         closing = true
         retirement.drainAfterCompletion()
         for (page in available) release(page.resource)

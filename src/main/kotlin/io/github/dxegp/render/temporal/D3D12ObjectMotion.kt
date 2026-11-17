@@ -7,6 +7,7 @@ import kotlin.math.max
 import java.lang.ref.WeakReference
 import java.util.WeakHashMap
 import net.minecraft.client.renderer.entity.state.EntityRenderState
+import io.github.dxegp.render.frameprep.MotionGuideCoverage
 
 /**
  * Per-object motion vectors, CPU side: this frame's object snapshot collection.
@@ -45,6 +46,26 @@ object D3D12ObjectMotion {
     const val FIELD_HALF_Z: Int = 10
     const val FIELD_YAW: Int = 11
 
+    /** Stable identity for the extracted entity draw candidate. Parts are not exposed by vanilla here. */
+    internal data class DrawIdentity(val entityId: Int, val drawId: Long, val partId: String? = null)
+
+    internal data class TransformPair(
+        val currentX: Double,
+        val currentY: Double,
+        val currentZ: Double,
+        val previousX: Double?,
+        val previousY: Double?,
+        val previousZ: Double?,
+    )
+
+    internal data class EntityGuide(
+        val identity: DrawIdentity,
+        val transform: TransformPair,
+        val coverage: MotionGuideCoverage,
+        val partCoverage: MotionGuideCoverage = MotionGuideCoverage.PART_TRANSFORM_UNAVAILABLE,
+        val rasterCoverage: MotionGuideCoverage = MotionGuideCoverage.RASTER_COVERAGE_UNAVAILABLE,
+    )
+
     /**
      * One object at world-space absolute position — the camera subtraction happens in [writeWorldRows].
      */
@@ -69,12 +90,36 @@ object D3D12ObjectMotion {
         val width: Float, val height: Float)
     private val extracted = WeakHashMap<EntityRenderState, ExtractedPose>()
 
+    private val entityIdentities = WeakHashMap<Entity, DrawIdentity>()
+    private val currentGuides = LinkedHashMap<Int, EntityGuide>()
+
     @Synchronized
     fun captureExtracted(entity: Entity, state: EntityRenderState) {
         val minecraft = Minecraft.getInstance()
         val world = minecraft.level ?: return
-        extracted[state] = ExtractedPose(WeakReference(entity), world, minecraft.frameTimeNs,
+        extracted[state] = ExtractedPose(WeakReference(entity), world, D3D12Temporal.renderFrameTimeNanos,
             state.x, state.y, state.z, state.boundingBoxWidth, state.boundingBoxHeight)
+    }
+
+    @Synchronized
+    internal fun entityGuides(): List<EntityGuide> = currentGuides.values.toList()
+
+    @Synchronized
+    internal fun extractedEntity(state: EntityRenderState): Entity? {
+        val minecraft = Minecraft.getInstance()
+        val pose = extracted[state] ?: return null
+        return pose.entity.get()?.takeIf {
+            pose.world === minecraft.level && pose.stamp == D3D12Temporal.renderFrameTimeNanos
+        }
+    }
+
+    @Synchronized
+    internal fun motionGuideCoverage(): MotionGuideCoverage = when {
+        currentGuides.values.any { it.coverage == MotionGuideCoverage.INVALID } -> MotionGuideCoverage.INVALID
+        currentGuides.values.any { it.coverage == MotionGuideCoverage.ENTITY_TRANSLATION_AABB_APPROXIMATION } ->
+            MotionGuideCoverage.ENTITY_TRANSLATION_AABB_APPROXIMATION
+        currentGuides.isNotEmpty() -> MotionGuideCoverage.INVALID
+        else -> MotionGuideCoverage.CAMERA_ONLY
     }
 
     /** Snapshot rolled by [writeWorldRows], at most once per frame (later calls must reuse it). */
@@ -102,7 +147,7 @@ object D3D12ObjectMotion {
         val level = minecraft.level ?: return
         for (state in minecraft.gameRenderer.gameRenderState().levelRenderState.entityRenderStates) {
             val pose = extracted[state] ?: continue
-            if (pose.world !== level || pose.stamp != minecraft.frameTimeNs || state.isInvisible) continue
+            if (pose.world !== level || pose.stamp != D3D12Temporal.renderFrameTimeNanos || state.isInvisible) continue
             val entity = pose.entity.get() ?: continue
             harvest(entity, pose)
         }
@@ -121,7 +166,17 @@ object D3D12ObjectMotion {
             return
         }
         val previous = previousPoses.put(id, RenderPose(WeakReference(entity), frameNumber, x, y, z))
-        if (previous == null || previous.entity.get() !== entity || previous.frame != frameNumber - 1L) return
+        val compatible = previous != null && previous.entity.get() === entity && previous.frame == frameNumber - 1L
+        val identity = entityIdentities.getOrPut(entity) {
+            DrawIdentity(id, id.toLong(), null)
+        }
+        currentGuides[id] = EntityGuide(
+            identity,
+            TransformPair(x, y, z, previous?.takeIf { compatible }?.x,
+                previous?.takeIf { compatible }?.y, previous?.takeIf { compatible }?.z),
+            if (compatible) MotionGuideCoverage.ENTITY_TRANSLATION_AABB_APPROXIMATION else MotionGuideCoverage.INVALID,
+        )
+        if (!compatible) return
         if (currentSnapshots.size >= MAX_OBJECTS && !currentSnapshots.containsKey(id)) {
             overflowCount++
             if (lastOverflowLoggedFrame != frameNumber) {
@@ -153,20 +208,26 @@ object D3D12ObjectMotion {
     fun beginFrame() {
         currentSnapshots.clear()
         frameNumber++
+        currentGuides.clear()
         previousPoses.entries.removeIf { it.value.frame < frameNumber - 1L || it.value.entity.get() == null }
         val minecraft = Minecraft.getInstance()
-        extracted.entries.removeIf { it.value.world !== minecraft.level || it.value.stamp != minecraft.frameTimeNs }
+        extracted.entries.removeIf {
+            it.value.world !== minecraft.level || it.value.stamp != D3D12Temporal.renderFrameTimeNanos
+        }
     }
 
     /** Clears everything (world exit / teleport / device shutdown). */
     @Synchronized
     fun reset() {
+        D3D12RasterMotionCapture.reset()
         currentSnapshots.clear()
         previousPoses.clear()
         writeSnapshots = emptyMap()
         lastConsumedFrame = -1L
         frameNumber = 0L
         overflowCount = 0L
+        entityIdentities.clear()
+        currentGuides.clear()
     }
 
     /**

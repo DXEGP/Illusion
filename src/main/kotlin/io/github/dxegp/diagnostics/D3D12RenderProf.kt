@@ -1,14 +1,12 @@
 package io.github.dxegp.diagnostics
 
 
-import io.github.dxegp.d3d12.ffi.MCDR_ABI
 import io.github.dxegp.d3d12.shader.D3D12StackSampler
 import java.lang.management.ManagementFactory
 import java.util.Locale
 
 /**
  * 渲染线程分段计时：mixin 在目标方法 HEAD/RETURN 调 begin/end，每 [INTERVAL] 帧输出一次均值。
- * 关闭时每个埋点只是一次 static final boolean 判断，运行期无额外开销（`MCDR_ABI.PROF`）。
  *
  * 互操作硬约束：本类是 Java mixin 的埋点目标，它们以 `D3D12RenderProf.begin(x)` /
  * `D3D12RenderProf.RENDER_GROUP` 这种**静态**形式访问，所以方法必须 `@JvmStatic`、
@@ -17,7 +15,7 @@ import java.util.Locale
 object D3D12RenderProf {
 
     @JvmField
-    val ENABLED: Boolean = MCDR_ABI.PROF
+    val ENABLED: Boolean = RenderProfiling.enabled
 
     private const val INTERVAL = 300
 
@@ -68,10 +66,42 @@ object D3D12RenderProf {
     private var accIntervalNs = 0L
     private var frames = 0
     private var samplerStarted = false
+    private var indexedDrawCalls = 0L
+    private var indexedDrawNanos = 0L
+    private var multiDrawBatches = 0L
+    private var multiDrawCount = 0L
+    private var multiDrawNanos = 0L
 
     // 本区间内 GC 次数/耗时增量 + 当前堆占用，用于判断是否有分配风暴。
     private var gcCountBase = -1L
     private var gcTimeBase = -1L
+
+    internal fun recordIndexedDraw(started: Long) {
+        if (started == 0L) return
+        indexedDrawCalls++
+        indexedDrawNanos += System.nanoTime() - started
+    }
+
+    internal fun recordMultiDraw(drawCount: Int, started: Long) {
+        if (started == 0L) return
+        multiDrawBatches++
+        multiDrawCount += drawCount
+        multiDrawNanos += System.nanoTime() - started
+    }
+
+    internal fun logRasterDrawTiming(frameCount: Int) {
+        val inverseFrames = 1.0 / frameCount
+        IllusionLogger.debugMessage("core: batches/frame=${multiDrawBatches * inverseFrames}"
+            + " draws/frame=${multiDrawCount * inverseFrames}"
+            + " batchPath=${ms(multiDrawNanos * inverseFrames)}ms"
+            + " drawIndexedCalls/frame=${indexedDrawCalls * inverseFrames}"
+            + " drawIndexed=${ms(indexedDrawNanos * inverseFrames)}ms")
+        indexedDrawCalls = 0L
+        indexedDrawNanos = 0L
+        multiDrawBatches = 0L
+        multiDrawCount = 0L
+        multiDrawNanos = 0L
+    }
 
     @JvmStatic
     fun begin(stage: Int) {

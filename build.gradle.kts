@@ -36,6 +36,10 @@ sourceSets.named("main") {
     resources.exclude("src/generated/**/.cache") // datagen cache files
 }
 
+sourceSets.create("tests") {
+    kotlin.srcDir("src/probes")
+}
+
 repositories {
     // Add here additional repositories if required by some of the dependencies below.
     maven {
@@ -56,6 +60,45 @@ java {
 kotlin {
     
 }
+
+val checkD3D12Dependencies = tasks.register("checkD3D12Dependencies") {
+    group = "verification"
+    description = "Checks device, command recording, shader compilation and FFM dependency direction."
+    val sourceRoot = layout.projectDirectory.asFile
+    val boundarySources = files(
+        "src/main/kotlin/io/github/dxegp/d3d12/ffi/MCDR_ABI.kt",
+        "src/main/kotlin/io/github/dxegp/d3d12/device/D3D12Device.kt",
+        "src/main/kotlin/io/github/dxegp/d3d12/device/D3D12SubmissionMode.kt",
+        "src/main/kotlin/io/github/dxegp/d3d12/command/D3D12CommandEncoderBackend.kt",
+        "src/main/kotlin/io/github/dxegp/d3d12/command/D3D12CommandRecording.kt",
+        "src/main/kotlin/io/github/dxegp/d3d12/command/D3D12RenderPassBackend.kt",
+        "src/main/kotlin/io/github/dxegp/d3d12/command/D3D12RasterPassPolicy.kt",
+        "src/main/kotlin/io/github/dxegp/d3d12/backend/D3D12CompiledRenderPipeline.kt",
+        "src/main/kotlin/io/github/dxegp/d3d12/shader/D3D12PipelineVariants.kt",
+        "src/main/kotlin/io/github/dxegp/d3d12/shader/D3D12PipelineCompiler.kt",
+        "src/main/kotlin/io/github/dxegp/d3d12/shader/D3D12ShaderCompiler.kt",
+        "src/main/kotlin/io/github/dxegp/d3d12/shader/ShaderConversionCache.kt",
+        "src/main/kotlin/io/github/dxegp/d3d12/shader/CompletedCompilationCache.kt",
+    )
+    inputs.files(boundarySources)
+    doLast {
+        val forbiddenDependency = Regex("""\bio\.github\.dxegp\.(?:render|config)\b""")
+        val violations = boundarySources.files.flatMap { source ->
+            source.readLines().mapIndexedNotNull { index, line ->
+                val code = line.substringBefore("//").trimStart()
+                if (code.startsWith("*") || code.startsWith("/*") || !forbiddenDependency.containsMatchIn(code)) null
+                else "${source.relativeTo(sourceRoot).invariantSeparatorsPath}:${index + 1}: ${line.trim()}"
+            }
+        }
+        check(violations.isEmpty()) {
+            "Device, command recording, shader compilation and FFM must receive render/config decisions through their public contracts:\n" +
+                violations.joinToString("\n")
+        }
+    }
+}
+
+tasks.named("compileKotlin") { dependsOn(checkD3D12Dependencies) }
+tasks.named("check") { dependsOn(checkD3D12Dependencies) }
 
 val earlyService = sourceSets.create("earlyService") {
     java.srcDir("src/main/java")
@@ -79,19 +122,6 @@ tasks.named<KotlinCompile>("compileEarlyServiceKotlin") {
     )
 }
 
-// DXRMC 自检开关：用 providers API 读取（可被配置缓存追踪），`-P` 与 `-D` 两种写法都接受。
-// Loom 的 run config 不会自动继承 Gradle 进程的系统属性，必须显式转发到游戏 JVM。
-//
-// 注意：这些开关现在的正式入口是 NeoForge 配置（`config/dxr_mc-client.toml` 的 `[renderer]` /
-// `[dlss]` / `[debug]`，游戏内「模组 → Illusion → 配置」）。下面的转发只是让老的
-// `gradlew runClient -P...` 命令行继续可用：配置项留在默认值时才会采纳这里传的值，并且会打一行
-// WARN 提示迁移（解析层见 `D3D12Settings.kt`）。
-val dxrmcSelfTestMesh = providers.gradleProperty("dxrmc.selfTestMesh")
-    .orElse(providers.systemProperty("dxrmc.selfTestMesh")).getOrElse("false")
-val dxrmcSelfTestSurface = providers.gradleProperty("dxrmc.selfTestSurface")
-    .orElse(providers.systemProperty("dxrmc.selfTestSurface")).getOrElse("false")
-val dxrmcFailDevice = providers.gradleProperty("dxrmc.failDevice")
-    .orElse(providers.systemProperty("dxrmc.failDevice")).getOrElse("false")
 // P74：致命错误弹窗抑制开关（自动化运行用；正常游玩不要设置，保持可见弹窗）。
 val dxrmcNoPopup = providers.gradleProperty("dxrmc.noPopup")
     .orElse(providers.systemProperty("dxrmc.noPopup")).getOrElse("false")
@@ -114,13 +144,6 @@ val dxrmcTemporalJitterDlss = providers.gradleProperty("dxrmc.temporal.jitter.dl
 val dxrmcTemporalVelocity = providers.gradleProperty("dxrmc.temporal.velocity")
     .orElse(providers.systemProperty("dxrmc.temporal.velocity")).getOrElse("false")
 // P76f 判别实验：给上一帧视图矩阵人为加固定旋转（静止也能测出 mv 是否真的在写）。
-// 自动化取证：`-Pdxrmc.quickPlayWorld=<存档名>` 让客户端启动后直接进单人世界（无人值守截图/复现用）。
-// 空字符串 = 不传（普通游玩保持手动进世界）。
-// P300 验收：会话中途改设置的自动化钩子（只给自动化跑测试用，不是功能入口）。
-// `gradlew runClient -Pdxrmc.selfTest=fg-on@20,fg-off@400` —— tick 从进入世界那刻开始算。
-// A6（中途关帧生成）与 A11（中途把超分换成 XeSS）靠它才跑得起来：脚本改不了运行中的状态。
-val dxrmcSelfTest = providers.gradleProperty("dxrmc.selfTest")
-    .orElse(providers.systemProperty("dxrmc.selfTest")).getOrElse("")
 val dxrmcQuickPlayWorld = providers.gradleProperty("dxrmc.quickPlayWorld").getOrElse("")
 // P108z：DLSS 输出纹理的"交接"（handover）—— **默认开启**。
 //
@@ -154,14 +177,6 @@ neoForge {
                 systemProperty("dxrmc.sharpen", sharpenOverride)
             }
 
-            // Loom 的 run config 不会自动继承 Gradle 进程的系统属性，必须显式转发。
-            // P72 mesh shader 自检开关：`gradlew runClient -Ddxrmc.selfTestMesh=true`（或 -P 形式）。
-            systemProperty("dxrmc.selfTestMesh", dxrmcSelfTestMesh)
-            // 同理转发 surface 自检开关（真实窗口交换链自检，默认关闭）。
-            systemProperty("dxrmc.selfTestSurface", dxrmcSelfTestSurface)
-            // P73 失败策略的测试钩子：`gradlew runClient -Ddxrmc.failDevice=true` 让 D3D12 后端
-            // 在第一步失败，验证"不再回退 + 还原 preferredGraphicsBackend + 崩溃报告带说明"。
-            systemProperty("dxrmc.failDevice", dxrmcFailDevice)
             // P74 致命错误弹窗：默认可见（用户要求，m02777）；自动化运行用 `-Pdxrmc.noPopup=true` 关掉，
             // 否则 MessageBox 会一直阻塞等待点击。
             systemProperty("dxrmc.noPopup", dxrmcNoPopup)
@@ -175,9 +190,6 @@ neoForge {
             systemProperty("dxrmc.temporal.velocity", dxrmcTemporalVelocity)
             // P108z 验收：DLSS 输出纹理交接（默认 off；handover 只用于验证 NGX 是否真的写入）。
             systemProperty("dxrmc.dlssOutput", dxrmcDlssOutput)
-            // P300 验收：会话中途改设置的自动化钩子（空 = 不启用）。
-            systemProperty("dxrmc.selfTest", dxrmcSelfTest)
-
             // DXRMC：native 侧的诊断环境变量。必须显式转发 —— Loom 的 run config 不继承
             // shell 环境（实测 `$env:DX12_NATIVE_LOG_FILE` 到不了客户端）。
             //   -Pdxrmc.nativeLog=<path>   -> DX12_NATIVE_LOG_FILE（逐行 fflush 的 native 日志镜像）
@@ -216,13 +228,6 @@ neoForge {
             // DXRMC：把选定的环境变量显式转给 runClient 的 JVM。Loom 的 run config **不继承**
             // shell 环境（Gradle 守护进程持有它自己启动时的环境），所以 `$env:X=…` 常常到不了
             // JavaExec 子进程 —— `-P` 走 Gradle 命令行则一定生效。
-            // `-Pdxrmc.dxcDir=<空目录>` 可用来验证"三站都找不到 DXC"这条路径（P67）。
-            // `-Pdxrmc.dxcDisable=1` 让 native 的 DXC 探测直接返回空（三站全不查）。
-            // 2026-10-25 起（P216）没有 DXC 不再回退 D3DCompile/SM 5.1：图形管线直接报错，
-            // 所以这两个旋钮现在的用途是"验证失败路径本身"。
-            if (providers.gradleProperty("dxrmc.dxcDisable").isPresent) {
-                environment("MCDR_DXC_DISABLE", providers.gradleProperty("dxrmc.dxcDisable").get())
-            }
             if (providers.gradleProperty("dxrmc.dxcDir").isPresent) {
                 environment("MCDR_DXC_DIR", providers.gradleProperty("dxrmc.dxcDir").get())
             }
@@ -377,7 +382,7 @@ tasks.named<ProcessResources>("processResources") {
 //
 // Build the native half first (Visual Studio 2026 / MSVC v145, C++23):
 //   msbuild MCDR\MCDR.vcxproj /p:Configuration=Release /p:Platform=x64
-val mcdrNativeDir = file("../MCDR")
+val mcdrNativeDir = file(providers.gradleProperty("mcdrNativeRoot").getOrElse("../MCDR"))
 val mcdrNativeConfigs = listOf("x64_Release", "x64_Debug")
 
 val copyNative = tasks.register("copyNative") {

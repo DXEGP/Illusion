@@ -21,11 +21,13 @@ MCDR 的 DXC/Agility 运行库继续按既有资源清单打包。先构建相�
 
 | 所有者 | 输入与输出 |
 | --- | --- |
-| `D3D12Device` | 源码获取、按 id/stage/defines 缓存、管线/PSO 生命周期 |
+| `VanillaPipelineCompiler` | 源码获取、按真实 source/generation/id/stage/defines 缓存、normal/flipY 管线缓存、预热/重载事务与租约 |
+| `VanillaPipelineVariants` / `TerrainPipelineCompiler` | motion、宽线和地形 shader/PSO/WG 变体资格与创建，完成后移交 compiled pipeline |
 | `D3D12ShaderCompiler` | 宏/include、共享绑定表、阶段链接、坐标选项；输出编译产物 |
 | `NagaShaderProcessor` | 转换请求与 manifest 的类型化适配，不管理设备或 GPU 资源 |
 | `MCDR_ABI` / 内部 `NagaLibrary` | 唯一 FFM 门面与三函数 ABI 传输、内存所有权 |
 | `NativeLibraryResources` | 从 classpath 解包必需资源，不反向初始化 ABI |
+| `ShaderDumps` | 按配置输出 HLSL；编译器只调用中立输出接口 |
 | `NagaVertexAdapter` | 将当前 naga 顶点入口适配为 mesh generator 的输入，不在 terrain 内识别编译器私有结构名 |
 | native shader/device | DXC、DXIL 缓存、根签名、PSO 与实际资源视图 |
 
@@ -35,13 +37,15 @@ MCDR 的 DXC/Agility 运行库继续按既有资源清单打包。先构建相�
 
 ## 3. 源码、宏与 include
 
-`D3D12Device` 首先向 `ShaderSource` 请求源；资源尚未发布时使用 `D3D12FallbackShaderSource` 捕获的原版启动源。这是源码生命周期适配，仍只调用 naga。
+`VanillaPipelineCompiler` 首先向该任务真实的 `ShaderSource` 请求源；资源尚未发布时使用 `D3D12FallbackShaderSource` 捕获的原版启动源。重载准备中的来源与已发布来源分开登记，lazy flipY 使用对应 pipeline 的已发布来源。这是源码生命周期适配，仍只调用 naga。
 `ShaderDefines` 放在 `#version` 之后；全局注入 `RENDERPEARL_DEPTH_IS_ZERO_TO_ONE`，让原版 reversed-Z/0..1 深度分支成立。
 `gl_VertexID` 等方言处理归转换器所有。
 
-`#include <namespace:path>` 由宿主资源解析器展开，优先读取当前资源包；原版 `ShadercIncludeResult` 仅用于原版 include 缓存互操作，不调用其编译器。
+`#include <namespace:path>` 由宿主展开，资源重载优先使用当前事务的 `ShaderSource` 快照；不从尚未切换的旧 resource manager 拼入 include。原版 `ShadercIncludeResult` 仅用于 include 缓存互操作，其 UTF-8 缓冲按 `content_length` 解码，不假设零结尾，也不调用其编译器。normal/flipY 与地形 WG 的版本化预热、frontend/device 租约和 frameprep 程序发布见 [实施记录](../rendering/work-graph-implementation.md)。
 展开最多 16 层、累计源码预算 8 MiB；未找到 include 或越界均报告编译错误。
 宿主文本展开不分析条件宏，原版 include 使用自己的防重守卫。社区包的 VFS/条件 include 运行时尚未实现，不把此原版适配当作整包解析器。
+
+OIT FEATURE 的 capture 同时认证原版 fragment 和完整展开的 ENTITY、ITEM、PARTICLE vertex 源码，包含光照等 helper 函数；规范化时只移除已核对的 compiler/pipeline define 前缀。vertex 与 fragment 的 profile 必须一致，helper 或额外 uniform 改变后停止该管线的 FEATURE records capture，仍保留实际颜色与未记录覆盖。capture 缓存 schema 为 `/5`，普通 raster motion 的顶点认证规则保持原契约。draw 还需匹配 ExecuteInfo 的真实拓扑、索引和来源事实，源码认证不代替 draw 身份校验。
 
 ## 4. 资源绑定
 
@@ -86,7 +90,9 @@ VS/PS 和生成的 MS/AS 均由 DXC 产生 SM6.9 DXIL，具体地形执行约束
 
 ## 7. 缓存与错误
 
-设备的 source cache 按 id/stage/defines 保存模块，pipeline cache 保存布局和 flipY 变体，资源重载清理对应缓存。
+`VanillaFrameCoordinator` 是帧资源版本的唯一 owner。`prepareResourceReload()` 在帧间计算下一版本并保留本次候选；`VanillaPipelineCompiler.publishPipelineReload` 安装可恢复的 frontend、成功提交同代 native programs 后，由候选发布 `resourceVersion`。即使主颜色、深度附件和尺寸不变，下一真实帧也采用新版本；失败或撤销的重载保持旧版本，下一帧按版本比较撤销旧 motion、VRS 和重建历史兼容。完整发布与旧资源清理契约见 [实施记录](../rendering/work-graph-implementation.md#g-重载与预热边界)。
+
+`VanillaPipelineCompiler` 的 source cache 按真实 source identity、generation、id/stage/defines 保存模块，pipeline cache 保存普通与 flipY 变体。重载 token 校验所属 compiler，新代际撤销旧 pending；缓存与 frontend 各持独立租约，成功发布才更换活动缓存。设备只通过中立 compiler 接口转交 SPI 调用。
 库不保存跨调用 IR；每次转换独立持有数据，原模块不会因另一条管线重绑定而被修改。
 native DXIL 缓存拥有最终 DXC 产物；生成源码变化自然改变其内容键。
 
@@ -104,5 +110,8 @@ native DXIL 缓存拥有最终 DXC 产物；生成源码变化自然改变其内
 | `d3d12/shader/D3D12IntermediaryShaderModule.kt` / `D3D12CompiledShader.kt` | 源模块与管线编译产物 |
 | `d3d12/shader/NagaVertexAdapter.kt` | naga 顶点函数到 mesh 入口 |
 | `d3d12/ffi/NagaLibrary.kt` / `MCDR_ABI.kt` | 编译器 C ABI 传输与唯一公开出口 |
-| `d3d12/device/D3D12Device.kt` | 管线缓存、最终顶点布局、native PSO |
+| `render/compilation/VanillaPipelineCompiler.kt` | 管线/source 缓存、重载/预热、最终顶点布局与 native PSO |
+| `render/compilation/VanillaPipelineVariants.kt`、`render/terrain/mesh/TerrainPipelineCompiler.kt` | 业务变体与地形 WG 编译 |
+| `d3d12/shader/D3D12PipelineCompiler.kt`、`D3D12PipelineVariants.kt` | 设备/录制侧使用的中立编译契约 |
+| `diagnostics/ShaderDumps.kt` | 可选 HLSL 文件输出 |
 | `d3d12/backend/D3D12CompiledRenderPipeline.kt` | 持有并复用最终绑定表 |

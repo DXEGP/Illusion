@@ -11,7 +11,7 @@
 Illusion（幻光影现）是 Minecraft NeoForge 模组，把渲染后端换成自研的 **Direct3D 12** 实现：
 
 - JVM 侧是 Kotlin，实现了 Blaze3D 的 GPU 抽象（`GpuDevice` / `CommandEncoder` / `RenderPass` …）。
-- native 侧是 C++23 动态库 **MCDR**（同一仓库的 `MCDR\` 目录），通过 **Java FFM API** 调用，
+- native 侧是相邻 MCDR 工程的 C++23 动态库，通过 **Java FFM API** 调用，
   **不使用 JNI**。
 - 高级特性：DLSS / FSR / XeSS 超分，DLSS-G / FSR-FG / XeSS-FG 帧生成，NVIDIA Reflex，
   TAA / SMAA，mesh shader（meshlet），VRS 与渲染比例；光线追踪**尚未实现**。
@@ -21,18 +21,21 @@ Illusion（幻光影现）是 Minecraft NeoForge 模组，把渲染后端换成�
 现有代码使用 `io.github.dxegp` 包根；`RenderPipeline`、场景增量和集中式 RTX 管线尚未实现。
 以下业务目录对应当前可编译的 main 功能，未来接线契约见 `rendering/README.md`。
 
-当前完成包职责分类与资源所有者拆分，尚未形成无环的渲染领域契约。
-`config.D3D12Settings` 推送 native 配置，`d3d12.ffi.MCDR_ABI.PROF` 仍读取该配置；这条现有双向依赖仍需在未来接线中处理。
+当前已接入原版完整帧与 PreparedFrame 契约，以及每 encoder 独立的业务录制会话。
+`render.config.RenderConfiguration` 统一 requested/applied/persistent；真实候选经过 FG Prepare、SR Prepare 和组合 Commit 后发布世界附件，再同步 Option/UI。完整 Published 更新 persistent，save 通过 settingsToSave 读取它，临时 resize 配置不覆盖保存值，契约见 [渲染配置](rendering/render-configuration.md)。`VanillaWorldOutput` 分配资源并提交事实，native `prepareWorldOutput` 拥有逐帧 AA/SR、曝光、mask、evaluate 与 SceneDisplay 输出。Backend 注入编译业务、录制工厂与提交模式，设备、通用 encoder/pass、编译产物/转换缓存和 FFM 核心的依赖由编译前检查约束。当前帧接线与剩余工作见 [原版 D3D12 架构](misc/vanilla-d3d12-architecture.md)。
 
 | 包 | 当前职责 |
 | --- | --- |
 | `bootstrap.earlywindow.service` | 早期服务、窗口租约与加载屏；外层服务容器通过标准 Jar-in-Jar 携带普通核心模组 |
 | `config`、`client.settings`、`client.compat` | NeoForge 配置快照、设置界面与原版选项兼容 |
-| `diagnostics` | 日志、崩溃、性能统计、PIX 与 `BackendSelfTests` 自检资源 |
+| `diagnostics` | 日志、崩溃、性能统计与 PIX；行为探针位于 `src/probes/` |
 | `d3d12.ffi` | 唯一 FFM 门面、ABI 布局与 `NativeLibraryResources` 解包支持 |
 | `d3d12.backend/device/command/resource/surface/shader` | Blaze3D 适配、设备与 GPU 资源生命周期 |
 | `render.antialiasing/temporal/resolution/vrs` | AA、时间数据、比例与 VRS |
-| `render.terrain`、`.terrain.mesh` | 当前地形采集、采样器与 meshlet 路线 |
+| `render.config` | requested/applied/persistent、真实配置候选和组合发布 |
+| `render.frame.vanilla` | 完整帧与 PreparedFrame 发布、录制会话、地形/motion/VRS 的 pass 策略 |
+| `render.compilation` | 原版源码/管线编译、业务变体、缓存、版本化预热与重载发布 |
+| `render.terrain`、`.terrain.mesh` | 当前地形采集、采样器与 meshlet 路线；真实 capture 才建立 prepared facts，tile producer 按 section 保存 schema 2 事实 |
 | `render.reconstruction`、`.reconstruction.dlss` | 超分与独立 GPU/CPU 计时所有者 |
 | `render.presentation`、`.framegen`、`.latency` | HDR、GUI 分层、帧生成与 Reflex |
 | `mixin.<domain>` | 原版注入与 accessor，转交对应业务 |
@@ -48,10 +51,12 @@ early-service 独立 source set 与核心模组分开编译，窗口共享类型
 | --- | --- | --- |
 | [`rendering/README.md`](rendering/README.md) | 集中渲染器目标契约：业务封装、世界增量、Kotlin mixin、FFM、能力/资产/生命周期；尚未实现 | 实施新渲染器的 JVM 接线 |
 | [`rendering/vanilla-work-graph-plan.md`](rendering/vanilla-work-graph-plan.md) | 原版光栅 Work Graph 架构方案：提交寿命、批量 ABI、GPU 地形工作分发、AA/SR 与呈现 | 实施当前光栅路径优化，不涉及光追 |
+| [`rendering/transmittance-tile-execution.md`](rendering/transmittance-tile-execution.md) | 四子样本透明 tile 的阶段顺序、内容租约、stage 输出映射与归一化输出契约 | 改 OIT terrain producer、Work Graph 分桶或 tile replay |
+| [`rendering/render-configuration.md`](rendering/render-configuration.md) | requested → prepared → applied 配置契约、FG/SR 提交与世界输出归属 | 改配置、尺寸、超分或帧生成接线 |
 | [rendering/redstone plan.md](<rendering/redstone plan.md>) | FSR RR/RC/SR/FG 调查、业务边界、输入契约与接入计划 | 接入 Redstone 与统一神经缓存 |
 | [`superresolution/README.md`](superresolution/README.md) | 超分总览：后端抽象、渲染比例、超分掩码 | 改升采样、加新超分后端 |
 | [`superresolution/dlss.md`](superresolution/dlss.md) | DLSS / DLAA 专项：NGX、preset、输出纹理 | 动 DLSS 路径、排查 NGX 初始化 |
-| [`framegen/README.md`](framegen/README.md) | 帧生成与 Reflex：hudless 捕获、UI 合成、限帧 | 改插帧、改呈现时序 |
+| [`framegen/README.md`](framegen/README.md) | 帧生成与 Reflex：晚期显示帧、UI 合成、限帧 | 改插帧、改呈现时序 |
 | [`antialiasing/README.md`](antialiasing/README.md) | TAA / SMAA / 后期锐化：历史缓冲、速度缓冲 | 残影、抖动、GUI 拆分问题 |
 | [`mesh&vrs/README.md`](mesh&vrs/README.md) | mesh shader（meshlet）与 VRS / 渲染比例 | 地形管线、性能取舍 |
 | [`shaders/README.md`](shaders/README.md) | naga 编译链、manifest 绑定、阶段链接、RAW buffer 与 mesh 入口 | 构建编译器、编译失败、绑定错位 |

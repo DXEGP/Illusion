@@ -1,35 +1,36 @@
 package io.github.dxegp.render.reconstruction
 
 import com.mojang.renderpearl.api.GpuFormat
+import com.mojang.renderpearl.api.textures.GpuTexture
 import io.github.dxegp.Illusion
 import io.github.dxegp.d3d12.command.D3D12CommandEncoderBackend
+import io.github.dxegp.d3d12.device.D3D12Device
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
+import io.github.dxegp.d3d12.ffi.MCDRLayout
 import io.github.dxegp.d3d12.resource.D3D12GpuTexture
 import io.github.dxegp.d3d12.resource.D3D12GpuTextureView
-import io.github.dxegp.render.temporal.D3D12Temporal
-import net.minecraft.client.Minecraft
-import io.github.dxegp.render.frameprep.ProviderMaskSemantic
 import io.github.dxegp.render.frame.vanilla.VanillaFrameCoordinator
+import io.github.dxegp.render.frame.vanilla.VanillaFrameInputResources
+import io.github.dxegp.render.frame.vanilla.VanillaFrameInputs
+import java.lang.foreign.MemoryLayout.PathElement.groupElement
+import java.lang.foreign.MemorySegment
+import java.lang.foreign.ValueLayout.*
+import org.joml.Matrix4f
 
-/** Builds the FSR reactive/XeSS responsive mask from OIT wavelet attachments. */
-object D3D12SrMask {
+object D3D12SrMask : AutoCloseable {
     private const val MAX_MASK = 900
     private const val ATTACHMENTS = 2
 
+    private var owner: D3D12CommandEncoderBackend? = null
     private var output: D3D12GpuTexture? = null
+    private var compositionOutput: D3D12GpuTexture? = null
     private var sourceTextures = arrayOfNulls<D3D12GpuTexture>(ATTACHMENTS)
+    private var sourceCopies = arrayOfNulls<D3D12GpuTexture>(ATTACHMENTS)
     private var attachments = 0
     private var width = 0
     private var height = 0
     private var sourceVersion = 0L
-    private var capturedWorldEpoch = 0L
-    private var capturedRealFrameId = 0L
-    private var capturedViewportVersion = 0L
-    private var capturedWorld: Any? = null
-    private var capturedFrameTime = Long.MIN_VALUE
-    private var capturedHistoryGeneration = Long.MIN_VALUE
-    private var capturedView: FloatArray? = null
-    private var failure: String? = null
+    private var capturedFrame: VanillaFrameInputs? = null
 
     /** Calling this with no usable attachments invalidates the prior capture. */
     @JvmStatic
@@ -45,22 +46,25 @@ object D3D12SrMask {
         attachments = 0
         width = 0
         height = 0
-        capturedWorldEpoch = worldEpoch
-        capturedRealFrameId = realFrameId
-        capturedViewportVersion = viewportVersion
-        val minecraft = Minecraft.getInstance()
-        capturedWorld = minecraft.level
-        capturedFrameTime = minecraft.frameTimeNs
-        capturedHistoryGeneration = D3D12Temporal.historyGeneration
-        capturedView = D3D12Temporal.currentCameraView()?.copyOf()
-        if (worldEpoch <= 0 || realFrameId <= 0 || viewportVersion <= 0 || capturedWorld == null) {
-            failure = "OIT capture has no valid frame identity"
+        val frame = VanillaFrameCoordinator.currentFrame()
+        capturedFrame = frame
+        if (frame == null || worldEpoch != frame.identity.worldEpoch ||
+            realFrameId != frame.identity.realFrameId || viewportVersion != frame.identity.resourceVersion) {
             return
         }
+        if (!frame.settings.providerMasks ||
+            (frame.settings.reconstructionBackend != MCDR_ABI.SR_BACKEND_FSR &&
+                frame.settings.reconstructionBackend != MCDR_ABI.SR_BACKEND_XESS)) {
+            return
+        }
+        val sources = ArrayList<D3D12GpuTexture>(ATTACHMENTS)
         for (view in views) {
             if (attachments >= ATTACHMENTS) break
             val texture = view.texture() as? D3D12GpuTexture ?: continue
             if (texture.isClosed()) continue
+            check(view.baseMip() == 0 && texture.getMipLevels() == 1 && texture.getDepthOrLayers() == 1) {
+                "OIT coefficient capture requires a single base-mip attachment"
+            }
             val candidateWidth = texture.getWidth(0)
             val candidateHeight = texture.getHeight(0)
             if (candidateWidth <= 0 || candidateHeight <= 0) continue
@@ -72,97 +76,140 @@ object D3D12SrMask {
                 attachments = 0
                 width = 0
                 height = 0
-                failure = "OIT coefficient attachments have different dimensions"
                 return
             }
-            if (sourceTextures.any { it === texture }) continue
-            sourceTextures[attachments++] = texture
+            if (sources.any { it === texture }) continue
+            sources.add(texture)
+            attachments++
         }
         if (attachments == ATTACHMENTS) {
-            failure = null
+            val encoder = checkNotNull(D3D12Device.sharedCommandEncoder()) { "OIT capture has no command encoder" }
+            retainOwner(encoder)
+            val copies = sources.mapIndexed { index, texture ->
+                val existing = sourceCopies[index]
+                if (existing != null && !existing.isClosed() && existing.format == texture.format &&
+                    existing.getWidth(0) == width && existing.getHeight(0) == height) {
+                    existing
+                } else {
+                    D3D12GpuTexture(
+                        GpuTexture.USAGE_COPY_SRC or GpuTexture.USAGE_COPY_DST or GpuTexture.USAGE_TEXTURE_BINDING,
+                        "Captured OIT coefficient $index", texture.format, width, height, 1, 1,
+                    ).also {
+                        sourceCopies[index] = it
+                        existing?.close()
+                    }
+                }
+            }
+            val uses = sources.flatMapIndexed { index, texture ->
+                VanillaFrameInputResources.textureCopy(texture.handle(), copies[index].handle(), viewportVersion)
+            }
+            encoder.recordCommands { context ->
+                VanillaFrameCoordinator.declaredPass(context, 0x3000A, uses, graphicsEffects = 0) {
+                    sources.forEachIndexed { index, texture ->
+                        encoder.copyTextureToTexture(texture, copies[index], 0, 0, 0, 0, 0, width, height)
+                    }
+                }
+            }
+            copies.forEachIndexed { index, texture -> sourceTextures[index] = texture }
             Illusion.LOGGER.debug(
                 "SR mask captured {}x{} OIT coefficient attachments (source version {})",
                 width, height, sourceVersion,
             )
-        } else {
-            failure = "OIT capture supplied $attachments of $ATTACHMENTS coefficient attachments"
         }
     }
 
     @JvmStatic
     @Synchronized
     fun hasSource(): Boolean {
-        val minecraft = Minecraft.getInstance()
-        val identity = VanillaFrameCoordinator.currentIdentity() ?: return false
-        return attachments == ATTACHMENTS && capturedWorld === minecraft.level &&
-            capturedWorldEpoch == identity.worldEpoch && capturedRealFrameId == identity.realFrameId &&
-            capturedViewportVersion == identity.resourceVersion &&
-            capturedFrameTime == minecraft.frameTimeNs &&
-            capturedHistoryGeneration == D3D12Temporal.historyGeneration &&
-            capturedView.contentEquals(D3D12Temporal.currentCameraView()) &&
-            sourceTextures.all { it != null && !it.isClosed() }
-    }
-
-    /** Records the mask into the already-open list; never submits or reads it back. */
-    @Synchronized
-    fun produce(encoder: D3D12CommandEncoderBackend, maskWidth: Int, maskHeight: Int): Long {
-        if (failure != null || !hasSource() || maskWidth <= 0 || maskHeight <= 0 ||
-            maskWidth != width || maskHeight != height
-        ) return 0L
-        val first = sourceTextures[0] ?: return 0L
-        val second = sourceTextures[1] ?: return 0L
-        val target = ensureOutput(maskWidth, maskHeight) ?: return 0L
-        if (capturedWorldEpoch <= 0L || capturedRealFrameId <= 0L || capturedViewportVersion <= 0L) return 0L
-        val produced = MCDR_ABI.D3D12ProduceReactiveMask(
-                encoder.nativeHandle(), first.handle(), second.handle(), target.handle(),
-                maskWidth, maskHeight,
-                capturedWorldEpoch, capturedRealFrameId, sourceVersion, capturedViewportVersion,
-            )
-        if (!produced) {
-            fail("native frameprep rejected the complete capture: ${MCDR_ABI.D3D12LastError()}")
-            return 0L
-        }
-        return target.handle()
-    }
-
-    internal fun produceForProvider(encoder: D3D12CommandEncoderBackend, maskWidth: Int,
-        maskHeight: Int, backend: Int): Long {
-        val caps = MCDR_ABI.querySrCaps(backend) ?: return 0L
-        val semantic = when {
-            backend == MCDR_ABI.SR_BACKEND_FSR && caps.takesReactiveMask -> ProviderMaskSemantic.FSR_REACTIVE
-            backend == MCDR_ABI.SR_BACKEND_XESS && caps.takesResponsiveMask -> ProviderMaskSemantic.XESS_RESPONSIVE
-            else -> return 0L
-        }
-        val handle = produce(encoder, maskWidth, maskHeight)
-        if (handle != 0L) Illusion.LOGGER.debug("OIT transparency mask supplied as {}", semantic)
-        return handle
+        val frame = VanillaFrameCoordinator.currentFrame() ?: return false
+        return attachments == ATTACHMENTS && capturedFrame === frame &&
+            width == frame.identity.width && height == frame.identity.height &&
+            sourceTextures.all { it != null && !it.isClosed() &&
+                it.getWidth(0) == width && it.getHeight(0) == height }
     }
 
     @Synchronized
-    fun note(): String? = failure
+    internal fun writeWorldOutputInputs(encoder: D3D12CommandEncoderBackend, input: MemorySegment,
+        frame: VanillaFrameInputs, color: D3D12GpuTexture, depth: D3D12GpuTexture, motion: Long) {
+        if (frame.settings.reconstructionBackend != MCDR_ABI.SR_BACKEND_FSR &&
+            frame.settings.reconstructionBackend != MCDR_ABI.SR_BACKEND_XESS) return
+        retainOwner(encoder)
+        val primary = checkNotNull(ensureOutput(frame.identity.width, frame.identity.height))
+        val first = sourceTextures[0]?.takeIf { hasSource() }
+        val second = sourceTextures[1]?.takeIf { hasSource() }
+        val composition = if (first != null && second != null &&
+            frame.settings.reconstructionBackend == MCDR_ABI.SR_BACKEND_FSR)
+            checkNotNull(ensureCompositionOutput(frame.identity.width, frame.identity.height)) else null
+        val layout = MCDRLayout.PROVIDER_MASK_INPUT
+        input.set(JAVA_INT, layout.byteOffset(groupElement("schemaVersion")), 2)
+        input.set(JAVA_INT, layout.byteOffset(groupElement("structSize")), layout.byteSize().toInt())
+        val identity = input.asSlice(layout.byteOffset(groupElement("identity")), MCDRLayout.FRAME_IDENTITY.byteSize())
+        for ((name, value) in listOf("worldEpoch" to frame.identity.worldEpoch,
+            "realFrameId" to frame.identity.realFrameId, "configVersion" to frame.identity.configVersion,
+            "resourceVersion" to frame.identity.resourceVersion)) {
+            identity.set(JAVA_LONG, MCDRLayout.FRAME_IDENTITY.byteOffset(groupElement(name)), value)
+        }
+        input.set(JAVA_LONG, layout.byteOffset(groupElement("historyGeneration")), frame.historyGeneration)
+        input.set(JAVA_LONG, layout.byteOffset(groupElement("previousRealFrameId")),
+            if (frame.previous == null) 0L else frame.identity.realFrameId - 1L)
+        for ((name, handle) in listOf("color" to color.handle(), "depth" to depth.handle(), "motion" to motion,
+            "source0" to (first?.handle() ?: 0L), "source1" to (second?.handle() ?: 0L),
+            "output" to primary.handle(), "compositionOutput" to (composition?.handle() ?: 0L))) {
+            input.set(ADDRESS, layout.byteOffset(groupElement(name)), MemorySegment.ofAddress(handle))
+        }
+        input.set(JAVA_INT, layout.byteOffset(groupElement("width")), frame.identity.width)
+        input.set(JAVA_INT, layout.byteOffset(groupElement("height")), frame.identity.height)
+        input.set(JAVA_INT, layout.byteOffset(groupElement("inputFlags")),
+            1 or (if (first != null && second != null) 2 else 0) or
+                (if (frame.previous != null) 4 else 0))
+        input.set(JAVA_FLOAT, layout.byteOffset(groupElement("historyJitterX")),
+            ((frame.previous?.jitterX ?: 0.0) - frame.current.jitterX).toFloat())
+        input.set(JAVA_FLOAT, layout.byteOffset(groupElement("historyJitterY")),
+            (frame.current.jitterY - (frame.previous?.jitterY ?: 0.0)).toFloat())
+        val currentProjection = Matrix4f().set(frame.current.rasterProjection())
+            .mul(Matrix4f().set(frame.current.viewRotation()))
+        val previous = frame.previous ?: frame.current
+        val previousView = Matrix4f().set(previous.viewRotation()).translate(
+            (frame.current.originX - previous.originX).toFloat(),
+            (frame.current.originY - previous.originY).toFloat(),
+            (frame.current.originZ - previous.originZ).toFloat())
+        val mapping = Matrix4f().set(previous.rasterProjection()).mul(previousView)
+            .mul(currentProjection.invert()).get(FloatArray(16))
+        check(mapping.all(Float::isFinite)) { "Provider-mask history mapping is invalid" }
+        val matrixOffset = layout.byteOffset(groupElement("currentToPrevious"))
+        mapping.forEachIndexed { index, value -> input.set(JAVA_FLOAT, matrixOffset + index * 4L, value) }
+    }
 
     @Synchronized
     fun invalidateCapture() {
         sourceTextures = arrayOfNulls(ATTACHMENTS)
         attachments = 0
-        capturedWorld = null
-        capturedFrameTime = Long.MIN_VALUE
-        capturedView = null
+        capturedFrame = null
     }
 
     @Synchronized
-    fun release() {
+    override fun close() {
         output?.close()
         output = null
+        compositionOutput?.close()
+        compositionOutput = null
+        sourceCopies.forEach { it?.close() }
+        sourceCopies = arrayOfNulls(ATTACHMENTS)
         invalidateCapture()
         sourceTextures = arrayOfNulls(ATTACHMENTS)
         attachments = 0
         width = 0
         height = 0
-        capturedWorldEpoch = 0L
-        capturedRealFrameId = 0L
-        capturedViewportVersion = 0L
         sourceVersion += 1L
+        owner = null
+    }
+
+    private fun retainOwner(encoder: D3D12CommandEncoderBackend) {
+        check(owner == null || owner === encoder) { "SR mask outputs changed command owner" }
+        if (owner == null) {
+            encoder.retainUntilCommandsClosed(this)
+            owner = encoder
+        }
     }
 
     private fun ensureOutput(maskWidth: Int, maskHeight: Int): D3D12GpuTexture? {
@@ -188,13 +235,34 @@ object D3D12SrMask {
                 )
             }
         } catch (t: Throwable) {
-            fail("could not create the reactive-mask output: $t")
+            logFailure("could not create the reactive-mask output: $t")
             null
         }
     }
 
-    private fun fail(reason: String) {
-        failure = reason
+    private fun ensureCompositionOutput(maskWidth: Int, maskHeight: Int): D3D12GpuTexture? {
+        val existing = compositionOutput
+        if (existing != null && !existing.isClosed() && existing.getWidth(0) == maskWidth && existing.getHeight(0) == maskHeight) {
+            return existing
+        }
+        existing?.close()
+        return try {
+            D3D12GpuTexture(
+                D3D12GpuTexture.USAGE_STORAGE or 1 or 2,
+                "DXRMC SR transparency and composition mask",
+                GpuFormat.R8_UNORM,
+                maskWidth,
+                maskHeight,
+                1,
+                1,
+            ).also { compositionOutput = it }
+        } catch (t: Throwable) {
+            logFailure("could not create the transparency-and-composition output: $t")
+            null
+        }
+    }
+
+    private fun logFailure(reason: String) {
         Illusion.LOGGER.warn("SR mask disabled for this capture: {}", reason)
     }
 }

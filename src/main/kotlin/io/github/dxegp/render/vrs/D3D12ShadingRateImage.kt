@@ -5,17 +5,19 @@ import com.mojang.renderpearl.api.textures.GpuTexture
 import io.github.dxegp.config.IllusionConfig
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
 import io.github.dxegp.render.temporal.D3D12Velocity
-import io.github.dxegp.render.temporal.D3D12Temporal
 import io.github.dxegp.d3d12.device.D3D12Device
+import io.github.dxegp.d3d12.device.D3D12AdapterInfo
 import io.github.dxegp.d3d12.command.D3D12CommandEncoderBackend
 import io.github.dxegp.render.frameprep.FrameInputCoordinates
 import io.github.dxegp.d3d12.resource.D3D12GpuTexture
 import net.minecraft.client.Minecraft
+import io.github.dxegp.render.frame.vanilla.VanillaFrameCoordinator
+import io.github.dxegp.render.frame.vanilla.VanillaFrameInputResources
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
 /**
- * Tier 2 的屏幕空间着色率图像（SRI）：每帧开画前跑一次 compute，读上一帧深度与运动矢量，按 16×16 tile 判定
+ * Tier 2 的屏幕空间着色率图像（SRI）：每帧开画前跑一次 Work Graph，读上一帧深度与运动矢量，按硬件 tile 判定
  * 是否降采样并写入 `R8_UINT` 着率图，地形批次绑到命令列表（`RSSetShadingRateImage`）。任何一步失败只记一次
  * 日志并永久自关。见 docs/mesh&vrs/README.md §3.3。
  */
@@ -23,7 +25,7 @@ object D3D12ShadingRateImage {
     private val LOGGER: Logger = LoggerFactory.getLogger("dxrmc-vrs-sri")
 
     /** 运行时 tile 尺寸（NVIDIA 为 16×16；能力查询里拿到的就是这个值）。 */
-    private const val TILE: Int = 16
+    private fun tileSizeValue(): Int = D3D12AdapterInfo.current?.shadingRateTileSize?.takeIf { it > 0 } ?: 0
 
     /** 深度快照 usage：SRV + COPY_DST + COPY_SRC，必须写成一行（工具链不接受以 `or` 开头的续行）。 */
     private val DEPTH_USAGE: Int = GpuTexture.USAGE_TEXTURE_BINDING or GpuTexture.USAGE_COPY_DST or GpuTexture.USAGE_COPY_SRC
@@ -35,10 +37,10 @@ object D3D12ShadingRateImage {
     private const val MOTION_PIXELS: Int = 8
 
     /**
-     * 着色率图像（两张 ping-pong）：compute 不能同时读写同一张纹理，每帧写 A 读 B；`t2` 只能绑视图句柄。
+     * 着色率图像（两张 ping-pong）：Work Graph 不能同时读写同一张纹理，每帧写 A 读 B。
      */
     private val images: LongArray = LongArray(2)
-    private val views: LongArray = LongArray(2)
+    private val candidates: LongArray = LongArray(2)
 
     /** 本帧写入下标；[lastWritten] 是上一帧写完那张（= 本帧的 `t2`，也是要绑的那张）。 */
     private var writeIndex: Int = 0
@@ -46,17 +48,17 @@ object D3D12ShadingRateImage {
 
     /** 上一帧的 SRI 是否仍有效（强制 1X1 的帧必须清掉，否则下一帧 `min(x, 0)` 再糊一帧）。 */
     private var historyValid: Boolean = false
-    private var pipeline: Long = 0L
     private var depthTex: Long = 0L
-    private var depthView: Long = 0L
     private var owner: D3D12CommandEncoderBackend? = null
     private var capturedWorld: Any? = null
-    private var capturedSequence = -1L
     private var capturedGeneration = -1L
-    private var capturedProjection: FloatArray? = null
-    private var capturedView: FloatArray? = null
-    private var capturedCamera: DoubleArray? = null
+    private var capturedProjection: VrsHistoryProjection? = null
     private var capturedMotion = 0L
+    private var capturedWorldEpoch = 0L
+    private var capturedRealFrameId = 0L
+    private var capturedResourceVersion = 0L
+    private var sourceVersion = 0L
+    private var capturedDepth: D3D12GpuTexture? = null
     private var depthFormat: GpuFormat? = null
     private var tilesX: Int = 0
     private var tilesY: Int = 0
@@ -68,19 +70,16 @@ object D3D12ShadingRateImage {
     private var readySequence = -1L
     private var readyGeneration = -1L
     private var readyFrameTime = Long.MIN_VALUE
+    private var readyWorldEpoch = 0L
+    private var readyRealFrameId = 0L
+    private var readyResourceVersion = 0L
+    private var readySourceVersion = 0L
 
     /** 一次性失败闩锁：置上之后永久退回逐图元档位。 */
     private var failed: Boolean = false
     private var lastNote: String? = null
     private var frames: Long = 0L
 
-    /** 上一帧的相机位置/朝向；`hasLastCamera == false` 时（首帧、世界切换后）不做跳变判定。 */
-    private var lastCamX: Double = 0.0
-    private var lastCamY: Double = 0.0
-    private var lastCamZ: Double = 0.0
-    private var lastYaw: Float = 0.0f
-    private var lastPitch: Float = 0.0f
-    private var hasLastCamera: Boolean = false
 
     /** 本帧强制全 1X1：相机跳变或世界切换后的那一帧。 */
     private var forceFine: Boolean = false
@@ -96,12 +95,19 @@ object D3D12ShadingRateImage {
 
     /** 本帧是否可用（`prepareFrame` 成功过、且没有失败闩锁）。 */
     @JvmStatic
-    fun isReady(): Boolean = ready && !failed && sriEnabled() &&
-        readyWorld === Minecraft.getInstance().level && readySequence == D3D12Temporal.frameSequence &&
-        readyGeneration == D3D12Temporal.historyGeneration && readyFrameTime == Minecraft.getInstance().frameTimeNs
+    fun isReady(): Boolean {
+        val frame = VanillaFrameCoordinator.currentFrame() ?: return false
+        val identity = frame.identity
+        return ready && !failed && sriEnabled() &&
+            readyWorld === frame.world && readySequence == identity.realFrameId &&
+            readyGeneration == frame.historyGeneration && readyFrameTime == frame.frameTimeNanos &&
+            readyWorldEpoch == identity.worldEpoch && readyRealFrameId == identity.realFrameId &&
+            readyResourceVersion == identity.resourceVersion && readySourceVersion == sourceVersion
+    }
 
     @JvmStatic
-    fun tileSize(): String = if (tilesX <= 0) "none" else tilesX.toString() + "x" + tilesY + "@" + pixelW + "x" + pixelH
+    fun tileSize(): String = if (tilesX <= 0) "none" else
+        tilesX.toString() + "x" + tilesY + "@" + pixelW + "x" + pixelH + " tile=" + tileSizeValue()
 
     @JvmStatic
     @Synchronized
@@ -111,12 +117,17 @@ object D3D12ShadingRateImage {
             return
         }
         val minecraft = Minecraft.getInstance()
-        val world = minecraft.level ?: return
-        if (capturedWorld === world && capturedSequence == D3D12Temporal.frameSequence &&
-            capturedGeneration == D3D12Temporal.historyGeneration) return
-        capturedWorld = null
+        val frame = VanillaFrameCoordinator.currentFrame() ?: return
+        val world = frame.world
+        val identity = frame.identity
         val depth = minecraft.gameRenderer.mainRenderTarget().depthTexture as? D3D12GpuTexture ?: return
         if (depth.isClosed()) return
+        if (depth.getWidth(0) != identity.width || depth.getHeight(0) != identity.height) return
+        if (capturedWorld === world && capturedWorldEpoch == identity.worldEpoch &&
+            capturedRealFrameId == identity.realFrameId &&
+            capturedGeneration == frame.historyGeneration &&
+            capturedResourceVersion == identity.resourceVersion && capturedDepth === depth) return
+        capturedWorld = null
         if (owner == null) {
             encoder.retainUntilCommandsClosed(AutoCloseable { reset(); owner = null })
             owner = encoder
@@ -128,35 +139,49 @@ object D3D12ShadingRateImage {
         }
         if (!ensureResources(depth.getWidth(0), depth.getHeight(0))) return
         encoder.recordCommands { ctx ->
-            MCDR_ABI.D3D12CopyTextureToTexture(ctx, depth.handle(), depthTex,
-                0, 0, 0, 0, 0, 0, pixelW, pixelH)
+            VanillaFrameCoordinator.declaredPass(ctx, VanillaFrameInputResources.VRS_DEPTH_CAPTURE_PASS,
+                VanillaFrameInputResources.textureCopy(depth.handle(), depthTex, identity.resourceVersion),
+                graphicsEffects = 0) {
+                MCDR_ABI.D3D12CopyTextureToTexture(ctx, depth.handle(), depthTex,
+                    0, 0, 0, 0, 0, 0, pixelW, pixelH)
+            }
         }
-        val camera = minecraft.gameRenderer.mainCamera().position()
         capturedWorld = world
-        capturedSequence = D3D12Temporal.frameSequence
-        capturedGeneration = D3D12Temporal.historyGeneration
-        capturedProjection = D3D12Temporal.currentProjection()
-        capturedView = D3D12Temporal.currentCameraView()
-        capturedCamera = doubleArrayOf(camera.x, camera.y, camera.z)
-        capturedMotion = D3D12Velocity.currentMotionView()?.handle() ?: 0L
+        capturedWorldEpoch = identity.worldEpoch
+        capturedRealFrameId = identity.realFrameId
+        capturedResourceVersion = identity.resourceVersion
+        sourceVersion += 1L
+        capturedDepth = depth
+        capturedGeneration = frame.historyGeneration
+        capturedProjection = VrsHistoryProjection.capture(frame.current)
+        capturedMotion = (D3D12Velocity.currentMotionView()?.texture() as? D3D12GpuTexture)?.handle() ?: 0L
     }
 
     internal fun requiresFine(): Boolean = sriEnabled() && !isReady()
 
-    /** 每帧开画前调用（挂点：`FrameGraphBuilderProfMixin` 的 `execute` HEAD）：此刻主深度是上一帧最后一笔。 */
+    /** 在 world BeginFrame 冻结身份后、地形绘制前准备，读取兼容的上一真实帧深度快照。 */
     @JvmStatic
     @Synchronized
     fun prepareFrame() {
         if (isReady()) return
         ready = false
+        val frame = VanillaFrameCoordinator.currentFrame() ?: return
+        val identity = frame.identity
         if (failed) {
             return
         }
         if (!D3D12VariableShadingRate.isEnabled()) {
+            historyValid = false
             note("AUTO is off or this device refused it; SRI stays idle")
             return
         }
+        if (tileSizeValue() <= 0) {
+            note("device did not report a VRS image tile size; SRI stays off this frame")
+            return
+        }
         if (!sriEnabled()) {
+            historyValid = false
+            capturedWorld = null
             note("`[vrs] sri` is off; falling back to the per-primitive distance bands")
             return
         }
@@ -169,74 +194,96 @@ object D3D12ShadingRateImage {
         }
         val w = depth.getWidth(0)
         val h = depth.getHeight(0)
+        if (w != identity.width || h != identity.height) return
         if (w <= 0 || h <= 0) {
             return
         }
-        val currentCamera = minecraft.gameRenderer.mainCamera().position()
-        D3D12Temporal.captureCameraFromState(minecraft)
-        val savedCamera = capturedCamera
-        val validCapture = depthFormat == depth.format && FrameInputCoordinates.previousFrameCompatible(
-            capturedSequence, D3D12Temporal.frameSequence, capturedGeneration, D3D12Temporal.historyGeneration,
-            capturedWorld, minecraft.level, capturedProjection, D3D12Temporal.currentProjection(),
-            capturedView, D3D12Temporal.currentCameraView(), savedCamera,
-            doubleArrayOf(currentCamera.x, currentCamera.y, currentCamera.z), pixelW, pixelH, w, h)
-        if (!validCapture) {
+        val cameraJumped = detectCameraJump()
+        val validCapture = frame.previous != null && capturedDepth === depth && sourceVersion > 0L && depthFormat == depth.format &&
+            pixelW == w && pixelH == h &&
+            FrameInputCoordinates.previousFrameCompatible(
+                capturedRealFrameId, identity.realFrameId, capturedWorldEpoch, identity.worldEpoch,
+                capturedResourceVersion, identity.resourceVersion,
+                capturedGeneration, frame.historyGeneration, capturedWorld, frame.world)
+        val currentProjection = VrsHistoryProjection.capture(frame.current)
+        val mapping = currentProjection?.let { capturedProjection?.mapTo(it) }
+        if (forceFine || cameraJumped || !validCapture || mapping == null) {
             historyValid = false
-            note("no compatible previous real-world depth capture; terrain stays 1X1")
+            val reason = when {
+                forceFine -> "history reset"
+                cameraJumped -> "camera cut"
+                !validCapture -> "no depth capture from the immediately preceding real-world frame"
+                else -> "camera projection cannot map previous depth into this frame"
+            }
+            forceFine = false
+            note("$reason; terrain stays 1X1")
             return
         }
-        // 相机跳变（/tp、重生、传送门）时上一帧的深度与速度已指向别处，本帧只能全 1X1，否则"传送后整帧糊一下"。
-        if (detectCameraJump()) {
-            forceFine = true
-        }
-        // 速度通道没开（抗锯齿与 DLSS 都关）不是错误：退化成只看深度 —— 深度视图当第二张 SRV，运动阈值
-        // 推到 Int.MAX_VALUE 使"在动就 1X1"永不触发。视图要等 `ensureResources` 建出来（首帧是 0）。
         val previousMotion = D3D12Velocity.previousMotionView()
         val previousTexture = previousMotion?.texture() as? D3D12GpuTexture
         val motion = if (previousTexture != null && !previousTexture.isClosed() &&
-            previousMotion.handle() == capturedMotion) capturedMotion else 0L
-        if (motion == 0L) {
-            note("no previous motion vectors (velocity pass off); SRI runs depth-only")
-        }
+            previousTexture.getWidth(0) == w && previousTexture.getHeight(0) == h &&
+            previousTexture.handle() == capturedMotion) capturedMotion else 0L
         val motionPixels = if (motion == 0L) Int.MAX_VALUE else motionPixels()
-        if (!ensurePipeline()) {
-            return
-        }
-        val motionHandle = if (motion == 0L) depthView else motion
         val encoder = D3D12Device.sharedCommandEncoder() ?: return
         check(owner === encoder) { "VRS preparation changed command owner" }
         try {
             // 上一帧 submit 之后这条列表就关掉了 —— 每帧都要重新开一条。
-            val encoderCtx = encoder.nativeHandle()
-            val clampBit = if (historyValid && temporalClampEnabled()) 2 else 0
-            val dispatched = MCDR_ABI.D3D12DispatchComputeShadingRate(encoderCtx, pipeline,
-                depthView, motionHandle, views[1 - writeIndex], images[writeIndex],
-                intArrayOf(tilesX, tilesY, TILE, edgePermille(), w, h, motionPixels,
-                    (if (forceFine) 1 else 0) or clampBit),
-                (tilesX + 7) / 8, (tilesY + 7) / 8, 1)
+            val clampBit = if (temporalClampEnabled()) 2 else 0
+            val historyBit = if (historyValid) 8 else 0
+            val compatibleBit = 1
+            val motionBit = if (motion != 0L) 4 else 0
+            val dispatched = encoder.recordCommands { ctx ->
+                val uses = buildList {
+                    add(VanillaFrameInputResources.texture(depthTex, identity.resourceVersion, 1,
+                        VanillaFrameInputResources.STATE_NON_PIXEL_SHADER_RESOURCE))
+                    if (motionBit != 0) add(VanillaFrameInputResources.texture(motion, identity.resourceVersion, 1,
+                        VanillaFrameInputResources.STATE_NON_PIXEL_SHADER_RESOURCE))
+                    if (historyBit != 0) add(VanillaFrameInputResources.texture(
+                        candidates[1 - writeIndex], identity.resourceVersion, 1,
+                        VanillaFrameInputResources.STATE_NON_PIXEL_SHADER_RESOURCE))
+                    add(VanillaFrameInputResources.texture(images[writeIndex], identity.resourceVersion, 2,
+                        VanillaFrameInputResources.STATE_UNORDERED_ACCESS,
+                        VanillaFrameInputResources.STATE_COMMON))
+                    add(VanillaFrameInputResources.texture(candidates[writeIndex], identity.resourceVersion, 2,
+                        VanillaFrameInputResources.STATE_UNORDERED_ACCESS,
+                        VanillaFrameInputResources.STATE_NON_PIXEL_SHADER_RESOURCE))
+                }
+                VanillaFrameCoordinator.declaredPass(ctx, VanillaFrameInputResources.VRS_INPUT_PASS, uses) {
+                    MCDR_ABI.D3D12ProduceVrs(ctx, depthTex,
+                        motion, if (historyValid) candidates[1 - writeIndex] else 0L,
+                        images[writeIndex], w, h, tileSizeValue(),
+                        edgePermille(), motionPixels, compatibleBit or clampBit or motionBit or historyBit,
+                        identity.worldEpoch, identity.realFrameId, sourceVersion,
+                        identity.resourceVersion, candidates[writeIndex],
+                        mapping.previousToCurrent, mapping.currentToPrevious)
+                }
+            }
             if (!dispatched) {
                 fail("dx12DispatchComputeShadingRate failed: " + MCDR_ABI.D3D12LastError())
                 return
             }
-            // 强制 1X1 的那帧写的是全 0，历史必须随之作废。
             lastWritten = writeIndex
             writeIndex = 1 - writeIndex
-            historyValid = !forceFine
+            historyValid = true
             ready = true
             readyWorld = minecraft.level
-            readySequence = D3D12Temporal.frameSequence
-            readyGeneration = D3D12Temporal.historyGeneration
-            readyFrameTime = minecraft.frameTimeNs
+            readySequence = identity.realFrameId
+            readyGeneration = frame.historyGeneration
+            readyFrameTime = frame.frameTimeNanos
+            readyWorldEpoch = identity.worldEpoch
+            readyRealFrameId = identity.realFrameId
+            readyResourceVersion = identity.resourceVersion
+            readySourceVersion = sourceVersion
             frames++
-            if (forceFine) {
-                note("camera jumped or the world changed; this frame's image is all 1X1 (§8.4)")
-                forceFine = false
-            }
+            note(if (motion == 0L) "previous depth reprojected; SRI runs depth-only (no matching previous motion)"
+                else "previous depth and motion reprojected; SRI generated")
             if (frames == 1L) {
                 LOGGER.info("SRI: first frame generated ({}x{} tiles for {}x{})", tilesX, tilesY, w, h)
             }
         } catch (t: Throwable) {
             fail("SRI prepare threw: " + t)
+            throw t
         }
     }
 
@@ -246,33 +293,26 @@ object D3D12ShadingRateImage {
     @JvmStatic
     fun requestForceFine(reason: String) {
         forceFine = true
-        hasLastCamera = false
-        // 历史马上不作数：下一帧写全 0，再下一帧若还拿它当 t2 会把整屏 `min(rate, 0)` 压成 1X1（白糊两帧）。
         historyValid = false
         ready = false
         capturedWorld = null
-        note("$reason; the next generated image is all 1X1")
+        note("$reason; terrain stays 1X1 until a compatible previous frame is captured")
     }
 
     /** 比较本帧与上一帧的相机判断跳变；没有上一帧时不判，那由 [requestForceFine] 负责。 */
     private fun detectCameraJump(): Boolean {
-        val camera = Minecraft.getInstance().gameRenderer.mainCamera()
-        val pos = camera.position()
-        val yaw = camera.yRot()
-        val pitch = camera.xRot()
-        val dx = pos.x - lastCamX
-        val dy = pos.y - lastCamY
-        val dz = pos.z - lastCamZ
+        val frame = VanillaFrameCoordinator.currentFrame() ?: return true
+        val camera = frame.current
+        val previous = frame.previous ?: return true
+        val yaw = camera.yaw
+        val pitch = camera.pitch
+        val dx = camera.originX - previous.originX
+        val dy = camera.originY - previous.originY
+        val dz = camera.originZ - previous.originZ
         val moved = dx * dx + dy * dy + dz * dz
-        val turned = yawDelta(yaw, lastYaw).coerceAtLeast(kotlin.math.abs(pitch - lastPitch))
-        val jumped = hasLastCamera &&
+        val turned = yawDelta(yaw, previous.yaw).coerceAtLeast(kotlin.math.abs(pitch - previous.pitch))
+        val jumped =
             (moved > CAMERA_JUMP_BLOCKS * CAMERA_JUMP_BLOCKS || turned > CAMERA_JUMP_DEGREES)
-        lastCamX = pos.x
-        lastCamY = pos.y
-        lastCamZ = pos.z
-        lastYaw = yaw
-        lastPitch = pitch
-        hasLastCamera = true
         return jumped
     }
 
@@ -320,15 +360,18 @@ object D3D12ShadingRateImage {
         releaseResources()
         ready = false
         frames = 0L
-        hasLastCamera = false
         forceFine = false
         historyValid = false
         lastWritten = -1
         writeIndex = 0
         capturedWorld = null
         capturedProjection = null
-        capturedCamera = null
         capturedMotion = 0L
+        capturedDepth = null
+        readyWorldEpoch = 0L
+        readyRealFrameId = 0L
+        readyResourceVersion = 0L
+        readySourceVersion = 0L
     }
 
     /** 只把帧计数清零，**不碰 GPU 资源**：钩子不一定在渲染线程上，不能像 [reset] 那样销毁纹理。 */
@@ -338,28 +381,31 @@ object D3D12ShadingRateImage {
     }
 
     private fun ensureResources(w: Int, h: Int): Boolean {
-        val tx = (w + TILE - 1) / TILE
-        val ty = (h + TILE - 1) / TILE
-        if (images[0] != 0L && tx == tilesX && ty == tilesY && w == pixelW && h == pixelH) {
+        val tile = tileSizeValue()
+        if (tile <= 0) return false
+        val tx = (w + tile - 1) / tile
+        val ty = (h + tile - 1) / tile
+        if (images.all { it != 0L } && candidates.all { it != 0L } &&
+            tx == tilesX && ty == tilesY && w == pixelW && h == pixelH) {
             return true
         }
-        // 只重建跟尺寸绑定的那两张图与快照：PSO 与编码器跟分辨率无关，重编译一次 DXIL 没必要。
+        // 只重建跟尺寸绑定的两张图与深度快照；Work Graph 状态由 native worker 持有。
         releaseImage()
         for (i in 0..1) {
             val img = MCDR_ABI.D3D12CreateShadingRateImage(tx, ty)
             if (img == 0L) {
+                releaseImage()
                 fail("dx12CreateShadingRateImage($tx,$ty) failed: " + MCDR_ABI.D3D12LastError())
                 return false
             }
-            // t2 只能绑视图句柄，所以每张图各建一张 SRV（usage 38 里的 TEXTURE_BINDING 就是给它用的）。
-            val view = MCDR_ABI.ID3D12CreateTextureView(img, 0, 1)
-            if (view == 0L) {
-                MCDR_ABI.ID3D12DestroyResource(img)
-                fail("shading rate image view creation failed: " + MCDR_ABI.D3D12LastError())
+            images[i] = img
+            val candidate = MCDR_ABI.D3D12CreateShadingRateImage(tx, ty)
+            if (candidate == 0L) {
+                releaseImage()
+                fail("VRS candidate history creation failed: " + MCDR_ABI.D3D12LastError())
                 return false
             }
-            images[i] = img
-            views[i] = view
+            candidates[i] = candidate
         }
         // 快照必须与主深度**同格式**（D32_FLOAT）：CopyTextureToTexture 不做格式转换，`R32_FLOAT` 会报 "format mismatch"。
         val tex = MCDR_ABI.ID3D12CreateTexture(DEPTH_USAGE, checkNotNull(depthFormat).ordinal, w, h, 1, 1)
@@ -368,15 +414,7 @@ object D3D12ShadingRateImage {
             fail("depth snapshot texture creation failed: " + MCDR_ABI.D3D12LastError())
             return false
         }
-        val view = MCDR_ABI.ID3D12CreateTextureView(tex, 0, 1)
-        if (view == 0L) {
-            MCDR_ABI.ID3D12DestroyResource(tex)
-            releaseImage()
-            fail("depth snapshot view creation failed: " + MCDR_ABI.D3D12LastError())
-            return false
-        }
         depthTex = tex
-        depthView = view
         tilesX = tx
         tilesY = ty
         pixelW = w
@@ -387,100 +425,22 @@ object D3D12ShadingRateImage {
         return true
     }
 
-    private fun ensurePipeline(): Boolean {
-        if (pipeline != 0L) {
-            return true
-        }
-        val hlsl = """
-            Texture2D<float> gDepth : register(t0);
-            Texture2D<float2> gMotion : register(t1);
-            // t2 = 上一帧的着色率图像（时间钳制）：两帧之间只允许变细，否则边缘 1X1/2X2 来回跳会成"呼吸"。
-            Texture2D<uint> gPrev : register(t2);
-            RWTexture2D<uint> gOut : register(u0);
-            cbuffer Params : register(b0) {
-                uint gTilesX; uint gTilesY; uint gTile; uint gEdgePermille;
-                uint gWidth; uint gHeight; uint gMotionPixels; uint gPad;
-            };
-
-            float loadDepth(int2 p) { return gDepth.Load(int3(p, 0)); }
-            float2 loadMotion(int2 p) { return gMotion.Load(int3(p, 0)); }
-
-            [numthreads(8, 8, 1)]
-            void main(uint3 id : SV_DispatchThreadID) {
-                if (id.x >= gTilesX || id.y >= gTilesY) return;
-
-                int2 p0 = int2(id.x * gTile, id.y * gTile);
-                int2 p1 = int2(min((int)(gWidth - 1u), p0.x + (int)gTile - 1),
-                               min((int)(gHeight - 1u), p0.y + (int)gTile - 1));
-
-                float d00 = loadDepth(p0);
-                float d10 = loadDepth(int2(p1.x, p0.y));
-                float d01 = loadDepth(int2(p0.x, p1.y));
-                float d11 = loadDepth(p1);
-
-                float dmin = min(min(d00, d10), min(d01, d11));
-                float dmax = max(max(d00, d10), max(d01, d11));
-
-                float2 m00 = loadMotion(p0);
-                float2 m10 = loadMotion(int2(p1.x, p0.y));
-                float2 m01 = loadMotion(int2(p0.x, p1.y));
-                float2 m11 = loadMotion(p1);
-                float mx = max(max(abs(m00.x), abs(m10.x)), max(abs(m01.x), abs(m11.x)));
-                float my = max(max(abs(m00.y), abs(m10.y)), max(abs(m01.y), abs(m11.y)));
-                float motion = max(mx, my);
-
-                float rel = (dmax - dmin) / max(dmin, 1.0e-4);
-                bool extreme = (dmin <= 1.0e-5) || (dmax >= 0.99999) || !(dmax == dmax);
-                bool edge = rel > ((float)gEdgePermille * 0.001);
-                bool moving = motion > (float)gMotionPixels;
-
-                uint rate = 5u;
-                // gPad bit0 = 强制全 1X1（相机跳变 / 世界切换那帧）：上一帧数据已不在同一个地方。
-                if ((gPad & 1u) != 0u) {
-                    gOut[id.xy] = 0u;
-                    return;
-                }
-                if (extreme || edge || moving) rate = 0u;
-                // gPad bit1 = 时间钳制：枚举值即面积序，min 就是"取更细那档"；历史无效时调用方关掉这一位。
-                if ((gPad & 2u) != 0u) {
-                    rate = min(rate, gPrev.Load(int3(id.xy, 0)));
-                }
-                gOut[id.xy] = rate;
-            }
-        """.trimIndent()
-        val dxil = MCDR_ABI.D3D12CompileShaderDxc(hlsl, "main", "cs_6_8")
-        if (dxil == null) {
-            fail("SRI DXC compile failed: " + MCDR_ABI.D3D12LastError())
-            return false
-        }
-        val pso = MCDR_ABI.D3D12CreateComputePipelineShadingRate(dxil)
-        if (pso == 0L) {
-            fail("dx12CreateComputePipelineShadingRate failed: " + MCDR_ABI.D3D12LastError())
-            return false
-        }
-        pipeline = pso
-        LOGGER.info("SRI: compute pipeline ready ({} bytes of DXIL)", dxil.size)
-        return true
-    }
-
     /** 只放跟分辨率绑定的资源（两张图像 + 深度快照），PSO 与编码器留着。 */
     private fun releaseImage() {
-        if (depthView != 0L) {
-            MCDR_ABI.ID3D12DestroyResource(depthView)
-            depthView = 0L
-        }
+        ready = false
+        capturedWorld = null
         if (depthTex != 0L) {
             MCDR_ABI.ID3D12DestroyResource(depthTex)
             depthTex = 0L
         }
         for (i in 0..1) {
-            if (views[i] != 0L) {
-                MCDR_ABI.ID3D12DestroyResource(views[i])
-                views[i] = 0L
-            }
             if (images[i] != 0L) {
                 MCDR_ABI.ID3D12DestroyResource(images[i])
                 images[i] = 0L
+            }
+            if (candidates[i] != 0L) {
+                MCDR_ABI.ID3D12DestroyResource(candidates[i])
+                candidates[i] = 0L
             }
         }
         lastWritten = -1
@@ -492,10 +452,6 @@ object D3D12ShadingRateImage {
 
     private fun releaseResources() {
         releaseImage()
-        if (pipeline != 0L) {
-            MCDR_ABI.ID3D12DestroyResource(pipeline)
-            pipeline = 0L
-        }
     }
 
     private fun note(message: String) {

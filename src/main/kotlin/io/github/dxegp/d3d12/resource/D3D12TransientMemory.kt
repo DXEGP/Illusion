@@ -6,10 +6,18 @@ import com.mojang.renderpearl.api.buffers.TransientMemory
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
 import io.github.dxegp.diagnostics.IllusionLogger
 import java.nio.ByteBuffer
+import java.util.IdentityHashMap
 
 class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Runnable) : TransientMemory {
     private var closed = false
     private val buffers = SubmissionRetirement<D3D12GpuBuffer>(::isComplete) { it.close() }
+    private val originalDrawReads = SubmissionRetirement<AutoCloseable>(::isComplete) { it.close() }
+    private val originalDrawOwners = IdentityHashMap<Any, AutoCloseable>()
+    private val uploadAllocations = SubmissionRetirement<D3D12UploadAllocation>(::isComplete) {
+        it.buffer.retireUploadAllocation(it)
+    }
+    private val uploadReads = SubmissionRetirement<D3D12UploadSubmissionLease>(::isComplete) { it.close() }
+    private var uploadRecording: D3D12UploadRecording? = null
     private val mapped = uploadArena(4096L)
     private val staging = uploadArena(512L * 1024L)
 
@@ -24,6 +32,9 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
         check(!closed) { "D3D12TransientMemory is closed" }
         ensureListOpen.run()
         buffers.collect()
+        originalDrawReads.collect()
+        uploadReads.collect()
+        uploadAllocations.collect()
     }
 
     override fun allocateCpu(size: Long, alignment: Long, minimumAllocation: Long, elementSize: Long): ByteBuffer {
@@ -37,6 +48,7 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
         beginAllocation()
         val allocation = staging.allocate(size, SubmissionUploadArena.commonAlignment(alignment, 512L),
             GpuBuffer.USAGE_MAP_WRITE or GpuBuffer.USAGE_COPY_SRC, minimumAllocation)
+        if (size > 0L) uploadAllocations.retain(allocation.resource.registerUploadAllocation(allocation.offset, size))
         return allocation.resource.map(allocation.offset, size, false, true)
     }
 
@@ -54,6 +66,7 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
         beginAllocation()
         val allocation = mapped.allocate(size, SubmissionUploadArena.commonAlignment(alignment, 256L),
             usage or GpuBuffer.USAGE_MAP_WRITE or GpuBuffer.USAGE_COPY_SRC, minimumAllocation)
+        if (size > 0L) uploadAllocations.retain(allocation.resource.registerUploadAllocation(allocation.offset, size))
         return allocation.resource.map(allocation.offset, size, false, true)
     }
 
@@ -67,17 +80,20 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
         }.getOrThrow().first
     }
 
-    internal fun writeIntoStagingBlock(total: Long, alignment: Long,
-        write: (ByteBuffer) -> Long): Result<Pair<GpuBufferSlice, Long>> =
+    @Suppress("NOTHING_TO_INLINE")
+    internal inline fun writeIntoStagingBlock(total: Long, alignment: Long,
+        crossinline write: (ByteBuffer) -> Long): Result<Pair<GpuBufferSlice, Long>> =
         writeIntoStagingBlock(total, alignment, 0L, write)
 
-    private fun writeIntoStagingBlock(total: Long, alignment: Long, minimumAllocation: Long,
-        write: (ByteBuffer) -> Long): Result<Pair<GpuBufferSlice, Long>> {
+    @Suppress("NOTHING_TO_INLINE")
+    private inline fun writeIntoStagingBlock(total: Long, alignment: Long, minimumAllocation: Long,
+        crossinline write: (ByteBuffer) -> Long): Result<Pair<GpuBufferSlice, Long>> {
         beginAllocation()
         var attempt = 0
         while (true) {
             val allocation = staging.allocate(total, SubmissionUploadArena.commonAlignment(alignment, 512L),
                 GpuBuffer.USAGE_MAP_WRITE or GpuBuffer.USAGE_COPY_SRC, minimumAllocation)
+            if (total > 0L) uploadAllocations.retain(allocation.resource.registerUploadAllocation(allocation.offset, total))
             val view = try {
                 allocation.resource.map(allocation.offset, total, false, true)
             } catch (failure: Throwable) {
@@ -103,8 +119,10 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
         require(total > 0L) { "Cannot upload zero bytes" }
         val source = uploadStaging(data, alignment, usage, minimumAllocation, elementSize)
         val destination = allocateGpu(total, alignment, usage, minimumAllocation, elementSize)
-        MCDR_ABI.D3D12CopyBuffer(ctx, (source.buffer() as D3D12GpuBuffer).handle(), source.offset(),
-            (destination.buffer() as D3D12GpuBuffer).handle(), destination.offset(), total)
+        check(MCDR_ABI.D3D12CopyBufferChecked(ctx, (source.buffer() as D3D12GpuBuffer).handle(), source.offset(),
+            (destination.buffer() as D3D12GpuBuffer).handle(), destination.offset(), total)) {
+            "GPU upload recording failed: ${MCDR_ABI.D3D12LastError()}"
+        }
         return destination
     }
 
@@ -128,17 +146,70 @@ class D3D12TransientMemory(private val ctx: Long, private val ensureListOpen: Ru
 
     fun rotate(submittedFence: Long) {
         check(!closed) { "D3D12TransientMemory is closed" }
+        uploadRecording?.seal()
+        uploadRecording = null
+        uploadReads.seal(submittedFence)
+        uploadAllocations.seal(submittedFence)
         mapped.seal(submittedFence)
         staging.seal(submittedFence)
         buffers.seal(submittedFence)
+        originalDrawReads.seal(submittedFence)
+        originalDrawOwners.clear()
+    }
+
+    internal fun retireAfterSubmission(buffer: D3D12GpuBuffer) {
+        check(!closed) { "D3D12TransientMemory is closed" }
+        buffers.retain(buffer)
+    }
+
+    internal fun retainPreparedUploadRead(slice: GpuBufferSlice): D3D12UploadRead {
+        check(!closed) { "D3D12TransientMemory is closed" }
+        val buffer = slice.buffer() as? D3D12GpuBuffer
+            ?: return D3D12UploadRead.Unavailable(D3D12UploadRead.Reason.OWNER_UNAVAILABLE)
+        val recording = uploadRecording ?: D3D12UploadRecording(ctx).also { uploadRecording = it }
+        val read = buffer.retainUploadRead(slice.offset(), slice.length(), recording)
+        if (read is D3D12UploadRead.Available) {
+            val lease = checkNotNull(read.submissionLease)
+            try {
+                uploadReads.retain(lease)
+            } catch (failure: Throwable) {
+                lease.close()
+                throw failure
+            }
+        }
+        return read
+    }
+
+    internal fun retainOriginalDrawRead(owner: Any, acquire: () -> AutoCloseable) {
+        check(!closed) { "D3D12TransientMemory is closed" }
+        if (originalDrawOwners.containsKey(owner)) return
+        val lease = acquire()
+        try {
+            originalDrawReads.retain(lease)
+            originalDrawOwners[owner] = lease
+        } catch (failure: Throwable) {
+            lease.close()
+            throw failure
+        }
+    }
+
+    internal fun retainUploadDestination(owner: Any, acquire: () -> AutoCloseable) {
+        beginAllocation()
+        retainOriginalDrawRead(owner, acquire)
     }
 
     fun close() {
         if (closed) return
-        closed = true
+        uploadRecording?.seal()
+        uploadRecording = null
+        uploadReads.drainAfterCompletion()
+        uploadAllocations.drainAfterCompletion()
         mapped.closeAfterCompletion()
         staging.closeAfterCompletion()
         buffers.drainAfterCompletion()
+        originalDrawReads.drainAfterCompletion()
+        originalDrawOwners.clear()
+        closed = true
     }
 
     private fun totalBytes(data: List<ByteBuffer>): Long = data.fold(0L) { total, buffer ->

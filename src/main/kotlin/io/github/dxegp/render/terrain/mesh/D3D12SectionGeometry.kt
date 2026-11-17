@@ -10,10 +10,22 @@ class D3D12SectionGeometry {
         val indexCount: Int,
         val vertexBytes: Int,
         val indexBytes: Int,
-        val meshlets: List<D3D12MeshletBuilder.Meshlet>,
+        meshlets: List<D3D12MeshletBuilder.Meshlet>,
     ) {
+        val meshlets: List<D3D12MeshletBuilder.Meshlet> = meshlets.toList()
+        val quadCount: Int
+            get() = Math.floorDiv(indexCount, 6)
         val maximumMeshletQuads = meshlets.maxOfOrNull { it.quadCount } ?: 0
         val bounded = meshlets.all { it.directionMask and D3D12MeshletBuilder.BOUNDS_OUTSIDE_SECTION == 0 }
+
+        init {
+            require(generation > 0L && layer.isNotEmpty() && indexCount > 0 && indexCount % 6 == 0)
+            require(vertexBytes > 0 && indexBytes >= 0 && meshlets.isNotEmpty())
+            require(meshlets.zipWithNext().all { (first, second) -> first.firstQuad < second.firstQuad })
+            require(meshlets.all { it.firstQuad >= 0 && it.quadCount > 0 &&
+                it.firstQuad + it.quadCount <= quadCount })
+            require(meshlets.sumOf { it.quadCount } == quadCount)
+        }
     }
 
     private val generation = nextGeneration.incrementAndGet()
@@ -26,7 +38,7 @@ class D3D12SectionGeometry {
         val built = D3D12MeshletBuilder.build(vertex,
             quadsPerMeshlet = io.github.dxegp.config.D3D12Settings.meshQuads) ?: return
         val upload = LayerUpload(generation, layer, indexCount, vertex.remaining(), indexBytes,
-            built.meshlets.toList())
+            built.meshlets)
         layers = layers + (layer to upload)
     }
 

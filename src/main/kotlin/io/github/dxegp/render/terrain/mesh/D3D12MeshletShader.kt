@@ -2,6 +2,7 @@ package io.github.dxegp.render.terrain.mesh
 
 import com.mojang.renderpearl.api.vertex.VertexFormat
 import io.github.dxegp.d3d12.shader.D3D12CompiledShader
+import io.github.dxegp.d3d12.shader.D3D12OitCaptureShader
 import io.github.dxegp.d3d12.shader.NagaVertexAdapter
 
 /**
@@ -24,7 +25,7 @@ object D3D12MeshletShader {
 
     fun build(shader: D3D12CompiledShader, format: VertexFormat?, stride: Int = VERTEX_STRIDE,
               cull: Boolean = false, backfaceCull: Boolean = true, quadsPerMeshlet: Int = 16,
-              visibleWork: Boolean = false): String? {
+              visibleWork: Boolean = false, capture: D3D12OitCaptureShader? = null): String? {
         require(!visibleWork || !cull)
         require(quadsPerMeshlet in listOf(16, 32, 64))
         val threads = minOf(quadsPerMeshlet * 4, 128)
@@ -32,7 +33,30 @@ object D3D12MeshletShader {
         val maxPrimitives = quadsPerMeshlet * 2
         val vertex = NagaVertexAdapter.adapt(shader) ?: return null
         if (vertex.inputs.isEmpty()) return null
-        val renamed = vertex.source
+        var renamed = vertex.source
+        var meshOutputType = "D3D12VertexOutput"
+        var vertexStore = "        verts[outputVertex] = vs_main(vin);"
+        val positionInput = vertex.inputs.singleOrNull { it.name == "Position" && it.hlslType == "float3" }
+        if (capture != null) {
+            if (positionInput == null || capture.profile != io.github.dxegp.d3d12.shader.D3D12OitCaptureProfile.TERRAIN) return null
+            val output = Regex("typedef (\\w+) D3D12VertexOutput;").find(renamed)?.groupValues?.get(1) ?: return null
+            val declaration = Regex("\\bstruct ${Regex.escape(output)}\\s*\\{([^}]*)}\\s*;",
+                RegexOption.DOT_MATCHES_ALL).find(renamed) ?: return null
+            val fieldPattern = Regex("\\b(\\w+)\\s*:\\s*\\w+$")
+            val fields = declaration.groupValues[1].split(';').filter { it.isNotBlank() }.map {
+                fieldPattern.find(it.trim())?.groupValues?.get(1) ?: return null
+            }
+            if (fields.isEmpty()) return null
+            meshOutputType = "McdrOitMeshVertexOutput"
+            renamed += "\n" + capture.prelude + "\nstruct $meshOutputType {" + declaration.groupValues[1] +
+                "\n    float4 McdrOitPreviousClip : MCDR_OIT_PREVIOUS_CLIP;\n};\n"
+            vertexStore = buildString {
+                appendLine("        D3D12VertexOutput original = vs_main(vin);")
+                for (field in fields) appendLine("        verts[outputVertex].$field = original.$field;")
+                append("        verts[outputVertex].McdrOitPreviousClip = " +
+                    "McdrOitTerrainPreviousClipV2(m.sectionId, vin.input${positionInput.location});")
+            }
+        }
         val camera = resolveCameraUniforms(vertex.uniforms)
         val cu = if (cull) resolveCullUniforms(vertex.uniforms) ?: return null else null
 
@@ -148,11 +172,15 @@ void as_main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
         val meshletLimit = if (visibleWork) "gSections.Load(0u)" else "gMeshletCount"
 
         // 逐图元着色率只在解析出 CameraBlockPos/CameraOffset 时生成（距离用相机相对坐标）；不写 SV_ShadingRate 时组合器的 MIN 会把粗档位压回 1X1（安全失败）。
-        val vrsPrimStruct = if (camera == null) "" else
-            "struct D3D12MeshPrimitive { uint shadingRate : SV_ShadingRate; };\n"
-        val vrsPrimParam = if (camera == null) "" else
+        val primitiveFields = buildString {
+            if (camera != null) append("uint shadingRate : SV_ShadingRate;")
+            if (capture != null) append("nointerpolation uint2 oitSurface : MCDR_OIT_TERRAIN;")
+        }
+        val vrsPrimStruct = if (primitiveFields.isEmpty()) "" else
+            "struct D3D12MeshPrimitive { $primitiveFields };\n"
+        val vrsPrimParam = if (primitiveFields.isEmpty()) "" else
             ",\n             out primitives D3D12MeshPrimitive prims[$maxPrimitives]"
-        val vrsRate = if (camera == null) "" else """
+        val vrsRate = if (camera == null) "" else if (capture != null) "uint primRate = 0u;" else """
     // 按"段的盒子"而不是"meshlet 的盒子"定档：同段跨阈值会同屏出现 1X2/2X2，TAA 夹紧后细碎闪烁。
     float3 vrsBase = (float3(s.chunkX, s.chunkY, s.chunkZ) - float3(${camera.cameraBlockPos}))
                    + ${camera.cameraOffset};
@@ -167,9 +195,17 @@ void as_main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
         primRate = vrsDistance < gVrsBand.x ? 0u : (vrsDistance < gVrsBand.y ? 1u : farRate);
     }
         """
-        val vrsStore = if (camera == null) "" else
-            "        prims[vid * 2u].shadingRate = primRate;\n" +
-                "        prims[vid * 2u + 1u].shadingRate = primRate;\n"
+        val vrsStore = buildString {
+            if (camera != null) {
+                appendLine("        prims[vid * 2u].shadingRate = primRate;")
+                appendLine("        prims[vid * 2u + 1u].shadingRate = primRate;")
+            }
+            if (capture != null) {
+                appendLine("        uint sectionPrimitive = m.localVertexOffset / 2u + vid * 2u;")
+                appendLine("        prims[vid * 2u].oitSurface = uint2(m.sectionId, sectionPrimitive);")
+                appendLine("        prims[vid * 2u + 1u].oitSurface = uint2(m.sectionId, sectionPrimitive + 1u);")
+            }
+        }
 
         return renamed + """
 
@@ -230,50 +266,56 @@ MeshletDesc loadMeshlet(uint id) {
 }
 
 $globalsExtra
-float4 meshReadF32(uint a) { return asfloat(meshVertices.Load4(a)); }
-float4 meshReadUNorm8(uint a) {
+uint4 meshReadWords(uint a, uint count) {
+    if (count == 1u) return uint4(meshVertices.Load(a), 0u, 0u, 0u);
+    if (count == 2u) return uint4(meshVertices.Load2(a), 0u, 0u);
+    if (count == 3u) return uint4(meshVertices.Load3(a), 0u);
+    return meshVertices.Load4(a);
+}
+float4 meshReadF32(uint a, uint count) { return asfloat(meshReadWords(a, count)); }
+float4 meshReadUNorm8(uint a, uint count) {
     uint w = meshVertices.Load(a);
     return float4(w & 255u, (w >> 8) & 255u, (w >> 16) & 255u, (w >> 24) & 255u) / 255.0;
 }
-float4 meshReadUNorm16(uint a) {
-    uint2 w = meshVertices.Load2(a);
+float4 meshReadUNorm16(uint a, uint count) {
+    uint2 w = meshReadWords(a, (count + 1u) / 2u).xy;
     return float4(w.x & 65535u, w.x >> 16, w.y & 65535u, w.y >> 16) / 65535.0;
 }
-float4 meshReadUNorm32(uint a) { return float4(meshVertices.Load4(a)); }
-float4 meshReadSNorm8(uint a) {
+float4 meshReadUNorm32(uint a, uint count) { return float4(meshReadWords(a, count)); }
+float4 meshReadSNorm8(uint a, uint count) {
     uint w = meshVertices.Load(a);
     int4 s = int4(int(w << 24) >> 24, int(w << 16) >> 24, int(w << 8) >> 24, int(w) >> 24);
     return max(float4(s) / 127.0, -1.0);
 }
-float4 meshReadSNorm16(uint a) {
-    uint2 w = meshVertices.Load2(a);
+float4 meshReadSNorm16(uint a, uint count) {
+    uint2 w = meshReadWords(a, (count + 1u) / 2u).xy;
     int4 s = int4(int(w.x << 16) >> 16, int(w.x) >> 16, int(w.y << 16) >> 16, int(w.y) >> 16);
     return max(float4(s) / 32767.0, -1.0);
 }
-int4 meshReadSInt8(uint a) {
+int4 meshReadSInt8(uint a, uint count) {
     uint w = meshVertices.Load(a);
     return int4(int(w << 24) >> 24, int(w << 16) >> 24, int(w << 8) >> 24, int(w) >> 24);
 }
-int4 meshReadSInt16(uint a) {
-    uint2 w = meshVertices.Load2(a);
+int4 meshReadSInt16(uint a, uint count) {
+    uint2 w = meshReadWords(a, (count + 1u) / 2u).xy;
     return int4(int(w.x << 16) >> 16, int(w.x) >> 16, int(w.y << 16) >> 16, int(w.y) >> 16);
 }
-int4 meshReadSInt32(uint a) { return int4(meshVertices.Load4(a)); }
-uint4 meshReadUInt8(uint a) {
+int4 meshReadSInt32(uint a, uint count) { return int4(meshReadWords(a, count)); }
+uint4 meshReadUInt8(uint a, uint count) {
     uint w = meshVertices.Load(a);
     return uint4(w & 255u, (w >> 8) & 255u, (w >> 16) & 255u, (w >> 24) & 255u);
 }
-uint4 meshReadUInt16(uint a) {
-    uint2 w = meshVertices.Load2(a);
+uint4 meshReadUInt16(uint a, uint count) {
+    uint2 w = meshReadWords(a, (count + 1u) / 2u).xy;
     return uint4(w.x & 65535u, w.x >> 16, w.y & 65535u, w.y >> 16);
 }
-uint4 meshReadUInt32(uint a) { return meshVertices.Load4(a); }
+uint4 meshReadUInt32(uint a, uint count) { return meshReadWords(a, count); }
 $asBlock$vrsPrimStruct
 // 线程组 = 一个 meshlet：前 quadCount*4 线程各解一个顶点，前 quadCount 线程算术写出一个 quad 的两个三角形；不读索引，带 AS 时 meshlet 号来自 payload。
 [numthreads($threads, 1, 1)]
 [outputtopology("triangle")]
 void ms_main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID$msPayloadParam,
-             out vertices D3D12VertexOutput verts[$maxVertices]$vrsPrimParam,
+             out vertices $meshOutputType verts[$maxVertices]$vrsPrimParam,
              out indices uint3 tris[$maxPrimitives])
 {
     uint meshletId = $msMeshletId;
@@ -295,7 +337,7 @@ $vrsRate
     for (uint outputVertex = vid; outputVertex < vertexCount; outputVertex += ${threads}u) {
         uint vertexIndex = s.vertexBase + m.localVertexOffset + outputVertex;
         D3D12VertexInput vin = (D3D12VertexInput)0;
-$decode        verts[outputVertex] = vs_main(vin);
+$decode$vertexStore
     }
 
     // 算术索引：MC 的每个 quad 固定 4 个顶点、绕序 (0,1,2) / (0,2,3)。

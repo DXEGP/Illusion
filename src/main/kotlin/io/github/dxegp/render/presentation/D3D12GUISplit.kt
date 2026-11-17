@@ -1,410 +1,263 @@
 package io.github.dxegp.render.presentation
 
-import com.mojang.renderpearl.api.GpuFormat
 import com.mojang.blaze3d.pipeline.RenderTarget
 import com.mojang.blaze3d.systems.RenderSystem
-import com.mojang.renderpearl.api.textures.GpuTextureView
-import io.github.dxegp.Illusion
+import com.mojang.renderpearl.api.GpuFormat
+import com.mojang.renderpearl.api.commands.RenderPassDescriptor
+import com.mojang.renderpearl.api.pipeline.BlendFunction
+import com.mojang.renderpearl.api.pipeline.ColorTargetState
+import com.mojang.renderpearl.api.pipeline.PrimitiveTopology
+import com.mojang.renderpearl.api.pipeline.RenderPipeline
+import com.mojang.renderpearl.api.textures.FilterMode
 import io.github.dxegp.d3d12.device.D3D12Device
-import io.github.dxegp.render.resolution.D3D12RenderScale
-import io.github.dxegp.render.vrs.D3D12VariableShadingRate
-import io.github.dxegp.d3d12.resource.D3D12GpuTexture
+import io.github.dxegp.d3d12.command.D3D12CommandEncoderBackend
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
-import io.github.dxegp.d3d12.resource.D3D12GpuTextureView
-import io.github.dxegp.render.presentation.framegen.FrameGeneration
-import io.github.dxegp.render.reconstruction.SuperResolution
+import io.github.dxegp.d3d12.resource.D3D12GpuTexture
+import io.github.dxegp.render.frame.vanilla.VanillaFrameCoordinator
 import net.minecraft.client.Minecraft
-import org.joml.Vector4f
+import net.minecraft.client.Screenshot
+import net.minecraft.client.renderer.BindGroupLayouts
+import net.minecraft.network.chat.Component
+import net.minecraft.resources.Identifier
+import org.joml.Vector4fc
+import java.io.File
+import java.util.ArrayDeque
+import java.util.function.Consumer
 
-/**
- * The GUI's own window-sized render target: decouples the GUI from the scaled world layer.
- *
- * The GUI's scissor is in *window pixels*, so the GUI must never draw into a render area smaller
- * than the window — vanilla's `RenderPass.enableScissor` throws otherwise. That is why the GUI keeps
- * its window-sized target even when the world-layer blit fails (only a missing target falls back).
- *
- * In hudless mode this target doubles as the frame generation UI layer (premultiplied alpha); see docs/antialiasing/README.md §6.
- */
 class D3D12GUIRenderTarget(useStencil: Boolean) :
     RenderTarget("DXRMC GUI", GpuFormat.RGBA8_UNORM,
         if (useStencil) GpuFormat.D32_FLOAT_S8_UINT else GpuFormat.D32_FLOAT)
 
-object D3D12GUISplit {
+object D3D12GUISplit : AutoCloseable {
+    private data class DisplayScreenshot(val directory: File, val callback: Consumer<Component>)
 
-    /** Window-sized GUI target; created lazily and resized when the window changes. */
-    @Volatile
+    private val compositePipeline = RenderPipeline.builder()
+        .withLocation(Identifier.fromNamespaceAndPath("dxr_mc", "pipeline/gui_composite"))
+        .withVertexShader("core/screenquad")
+        .withFragmentShader("core/blit_screen")
+        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
+        .withCull(false)
+        .withBindGroupLayout(BindGroupLayouts.IN_SAMPLER)
+        .withColorTargetState(ColorTargetState(BlendFunction.TRANSLUCENT_PREMULTIPLIED_ALPHA))
+        .build()
     private var target: D3D12GUIRenderTarget? = null
-
-    /** Whether the world layer was blitted in this frame (only then may the final blit switch source). */
-    @Volatile
-    private var preparedThisFrame = false
-
-    /** Where the GUI draws this frame; set even when the world-layer blit fails. */
-    @Volatile
+    private var owner: D3D12CommandEncoderBackend? = null
+    private var composite: D3D12GUIRenderTarget? = null
     private var frameTarget: D3D12GUIRenderTarget? = null
-
-    /** Last reported degradation; logged only on change so it does not spam every frame. */
-    @Volatile
-    private var lastFailure: String? = null
-
-    /** Creation is attempted once, then rolled back permanently (no per-frame retry, no log spam). */
-    @Volatile
-    private var givenUp = false
-
-    /** DLSS wrote the upscaled world layer straight into the GUI target: [prepareForGui] must skip its blit. */
-    @Volatile
-    private var worldLayerDoneThisFrame = false
-
-    /** This frame's SR world layer (window-sized, no UI); [armUiComposition] clears it at the frame boundary. */
-    @Volatile
-    private var worldLayerThisFrame: D3D12GpuTexture? = null
-
-    /** Whether hudless presentation applies to this frame; updated only after present, in [armUiComposition]. */
-    @Volatile
+    private var preparedThisFrame = false
     private var hudlessArmed = false
-
-    /** Last hudless state pushed to native; pushed only on change (native logs a line per push). */
-    @Volatile
     private var hudlessPushed = false
-
-    // Last UI texture handle given to native (same texture is pushed once) + "old DLL, no export" warning once.
-    private var pushedUiHandle: Long = 0L
-    private var warnedNoUiTexture: Boolean = false
-
-    /** See [worldLayerDoneThisFrame]. */
-    @JvmStatic
-    fun markWorldLayerDone() {
-        worldLayerDoneThisFrame = true
-    }
-
-    /** Diagnostic read: only meaningful right after [markWorldLayerDone] on the render thread. */
-    @JvmStatic
-    fun isWorldLayerDoneThisFrame(): Boolean = worldLayerDoneThisFrame
+    private var pushedUiHandle = 0L
+    private var guiCompleted = false
+    private var blurredBackdrop = false
+    private var displayComposed = false
+    private val screenshotRequests = ArrayDeque<DisplayScreenshot>()
 
     @JvmStatic
-    fun isActive(): Boolean = D3D12RenderScale.isEnabled() || hudlessArmed || preparedThisFrame
+    fun isActive(): Boolean = frameTarget != null
 
-    /**
-     * Records this frame's upscaled world layer (= presentation source). Must run after SR wrote it
-     * and before [prepareForGui].
-     */
-    @JvmStatic
-    fun markWorldLayer(texture: D3D12GpuTexture) {
-        worldLayerThisFrame = texture
-        worldLayerDoneThisFrame = true
-    }
-
-    /** Whether this frame uses hudless presentation; SR and [prepareForGui] read the same latch. */
     @JvmStatic
     fun isHudlessArmed(): Boolean = hudlessArmed
 
-    /**
-     * Frame boundary (after present): decides hudless presentation once and pushes it to native.
-     *
-     * It must be fixed before the frame starts, because SR is hooked before [prepareForGui] and both
-     * have to see the same value. Native's `D3D12FgUiCompositionReady` answers "is the SDK really
-     * composing UI now" — not "is hudless on", or the first enable could never happen.
-     */
     @JvmStatic
-    fun armUiComposition() {
-        // This frame's world layer has been presented; SR may not run next frame, so drop the reference.
-        worldLayerThisFrame = null
-        worldLayerDoneThisFrame = false
-        preparedThisFrame = false
-        frameTarget = null
-        // DLSS writes its upscaled result straight into the GUI target (pInOutput): there is no separate
-        // world layer to hand over, and it is also DLSS-FG's hudless source, so the two must not mix.
-        val want = target != null &&
-            FrameGeneration.hudlessWanted() &&
-            SuperResolution.backendId() != MCDR_ABI.SR_BACKEND_DLSS
-        val ready = if (want) MCDR_ABI.D3D12FgUiCompositionReady() else 0
-        val able = want && ready == 1
-        if (want && !able) {
-            noteCompositionNotReady()
-        }
-        if (able != hudlessPushed && MCDR_ABI.D3D12FgSetUiComposition(able) == 1) {
-            hudlessPushed = able
-        }
-        val next = able && hudlessPushed
-        if (next == hudlessArmed) {
-            return
-        }
-        hudlessArmed = next
-        Illusion.LOGGER.info(
-            "hudless presentation {} - presenting {}, the GUI is {}",
-            if (next) "on" else "off",
-            if (next) "the world layer only" else "the world + GUI composite",
-            if (next) "composed by the frame generation backend" else "drawn by us into the presented image")
+    fun targetForFrame(): RenderTarget = frameTarget ?: ensureTarget()
+
+    internal fun uiTextureForFrame(): D3D12GpuTexture? = (frameTarget?.getColorTexture() as? D3D12GpuTexture)?.takeIf {
+        guiCompleted && !it.isClosed()
     }
 
-    /**
-     * Logged when hudless is wanted but native is not composing UI yet (throttled to one line per 10 s).
-     */
-    private fun noteCompositionNotReady() {
-        val now = System.nanoTime()
-        if (now - lastNotReadyLogNanos < NOT_READY_LOG_INTERVAL_NANOS) return
-        lastNotReadyLogNanos = now
-        Illusion.LOGGER.info(
-            "hudless presentation wanted, but the frame generation backend is not composing yet " +
-                "(fg state={}, backend={}) - keeping the world + GUI composite",
-            MCDR_ABI.D3D12FgState(),
-            FrameGeneration.activeBackend())
-    }
+    internal fun guiContainsSceneBackdrop(): Boolean = guiCompleted && blurredBackdrop
 
-    private var lastNotReadyLogNanos = 0L
-
-    /** Throttle for [noteCompositionNotReady] (10 s). */
-    private const val NOT_READY_LOG_INTERVAL_NANOS = 10_000_000_000L
-
-    /**
-     * Where the GUI (title-screen panorama included) draws this frame; null = use vanilla's main
-     * target. `RenderTarget.resize` asserts the render thread, so every caller must be on it.
-     */
-    @JvmStatic
-    fun targetForFrame(): RenderTarget? {
-        val minecraft = try {
-            Minecraft.getInstance()
-        } catch (t: Throwable) {
-            return null
-        }
-        // Empty frameTarget = the split is off, or prepareForGui never ran this frame. In hudless mode
-        // the GUI target is the UI layer, so falling back to the main target is never allowed.
-        val current = frameTarget
-            ?: if (!hudlessArmed && mainTargetMatchesWindow(minecraft)) return null else ensureTarget()
-        val gui = current as? D3D12GUIRenderTarget ?: return null
-        // The window may have changed since prepareForGui: the scissor is in window pixels, so the target must match exactly or vanilla throws.
-        return try {
-            val window = minecraft.window
-            if (gui.width != window.width || gui.height != window.height) {
-                return ensureTarget()
-            }
-            gui
-        } catch (t: Throwable) {
-            degrade("late resize failed: $t")
-            null
-        }
-    }
-
-    /**
-     * Whether the main target's *actual* attachment size equals the window. Compare textures, not the
-     * configured scale: the config flips instantly while the target is only rebuilt on resize.
-     * Returns true when the texture cannot be read (then vanilla's own path is fine).
-     */
-    private fun mainTargetMatchesWindow(minecraft: Minecraft): Boolean {
-        val world = (minecraft.gameRenderer.mainRenderTarget().colorTextureView as? D3D12GpuTextureView)
-            ?.texture() as? D3D12GpuTexture ?: return true
-        val window = minecraft.window
-        return world.getWidth(0) == window.width && world.getHeight(0) == window.height
-    }
-
-    /**
-     * DLSS/DLAA need a window-sized `pInOutput`, so they must not take [targetForFrame]'s "main target
-     * already matches the window, no split needed" early-out: idempotent create/fix of the target.
-     */
-    @JvmStatic
-    fun ensureTargetForDlss(): RenderTarget? = try {
-        ensureTarget()
-    } catch (t: Throwable) {
-        degrade("ensureTargetForDlss failed: $t")
-        null
-    }
-
-    private fun ensureTarget(): RenderTarget? {
-        if (givenUp) {
-            return null
-        }
+    private fun ensureTarget(): D3D12GUIRenderTarget {
+        RenderSystem.assertOnRenderThread()
         val minecraft = Minecraft.getInstance()
         val width = minecraft.window.width
         val height = minecraft.window.height
-        if (width <= 0 || height <= 0) {
-            return null
+        check(width > 0 && height > 0) { "GUI display extent is empty" }
+        val existing = target
+        if (existing != null && existing.width == width && existing.height == height) return existing
+        if (pushedUiHandle != 0L) {
+            check(MCDR_ABI.D3D12FgSetUiTexture(0L) == 1) { "Frame generation still borrows the previous GUI target" }
+            pushedUiHandle = 0L
         }
-        return try {
-            val existing = target
-            if (existing == null) {
-                // The depth format must match the main target's, or the GUI pipeline keeps rebuilding its PSO.
-                val created = D3D12GUIRenderTarget(minecraft.gameRenderer.mainRenderTarget().hasDepth())
-                created.resize(width, height)
-                target = created
-                logGeometry(minecraft, created, "active")
-                pushUiTextureToFrameGen(created)
-                created
-            } else {
-                if (existing.width != width || existing.height != height) {
-                    if (pushedUiHandle != 0L) {
-                        check(MCDR_ABI.D3D12FgSetUiTexture(0L) == 1) {
-                            "Frame generation still borrows the previous UI target"
-                        }
-                        pushedUiHandle = 0L
-                    }
-                    existing.resize(width, height)
-                    logGeometry(minecraft, existing, "resized")
-                    // A resize must be re-registered with native: FFX caches the resource description at registration.
-                    pushedUiHandle = 0L
-                    pushUiTextureToFrameGen(existing)
-                }
-                existing
-            }
-        } catch (t: Throwable) {
-            givenUp = true
-            Illusion.LOGGER.error(
-                "could not create the GUI's own render target; forcing render scale back to 100% so the GUI cannot outgrow the render area",
-                t)
-            // Without a window-sized GUI target the GUI falls back to the main target, whose scissor then goes out of bounds below 100 %.
-            D3D12RenderScale.setPercent(100)
-            runCatching {
-                val mc = Minecraft.getInstance()
-                mc.gameRenderer.resize(mc.window.width, mc.window.height)
-            }.onFailure { degrade("render scale rollback failed: $it") }
-            null
-        }
+        val created = D3D12GUIRenderTarget(minecraft.gameRenderer.mainRenderTarget().hasDepth())
+        created.resize(width, height)
+        val createdComposite = D3D12GUIRenderTarget(false)
+        createdComposite.resize(width, height)
+        target = created
+        val oldComposite = composite
+        composite = createdComposite
+        existing?.destroyBuffers()
+        oldComposite?.destroyBuffers()
+        return created
     }
 
-    /**
-     * Hands the GUI target's colour texture to frame generation as the UI texture — once per
-     * create/resize, not per frame. `Int.MIN_VALUE` = export missing in an old DLL (warned once).
-     */
-    private fun pushUiTextureToFrameGen(target: RenderTarget) {
-        val texture = (target.colorTextureView as? D3D12GpuTextureView)?.texture() as? D3D12GpuTexture ?: return
-        val handle = texture.handle()
-        if (handle == pushedUiHandle) {
-            return
-        }
-        val status = try {
-            MCDR_ABI.D3D12FgSetUiTexture(handle)
-        } catch (t: Throwable) {
-            Illusion.LOGGER.warn("could not hand the GUI target to frame generation: {}", t.toString())
-            return
-        }
-        when (status) {
-            1 -> {
-                pushedUiHandle = handle
-                Illusion.LOGGER.info("handed the GUI target ({}) to frame generation as the UI texture", handle)
-            }
-            Int.MIN_VALUE -> if (!warnedNoUiTexture) {
-                warnedNoUiTexture = true
-                Illusion.LOGGER.info("this native library has no frame-generation UI texture entry point; UI tagging stays off")
-            }
-            else -> Illusion.LOGGER.warn("frame generation rejected the GUI target as UI texture (status={})", status)
-        }
+    internal fun beginFrame(clearColor: Vector4fc) {
+        check(frameTarget == null) { "GUI frame was not retired" }
+        RenderSystem.getDevice().createCommandEncoder()
+            .clearColorTexture(checkNotNull(ensureTarget().getColorTexture()), clearColor)
+        guiCompleted = false
+        blurredBackdrop = false
+        displayComposed = false
+        hudlessArmed = false
     }
 
-    /** Diagnostic: both real texture sizes, logged only on create/resize. */
-    private fun logGeometry(minecraft: Minecraft, gui: RenderTarget, state: String) {
-        val world = (minecraft.gameRenderer.mainRenderTarget().colorTextureView as? D3D12GpuTextureView)
-            ?.texture() as? D3D12GpuTexture
-        Illusion.LOGGER.info(
-            "GUI split {} - world {}x{} ({}%), GUI target {}x{}",
-            state,
-            world?.getWidth(0) ?: -1, world?.getHeight(0) ?: -1, D3D12RenderScale.percent(),
-            gui.width, gui.height)
-    }
-
-    /**
-     * Called once the world layer is drawn and before the GUI; runs after [D3D12SmaaWorld] so SMAA
-     * works at world resolution first.
-     */
     @JvmStatic
     fun prepareForGui() {
-        // Recomputed every frame: only a blit that really happened this frame may switch the presented source.
-        preparedThisFrame = false
-        frameTarget = null
-        val worldLayerAlreadyInTarget = worldLayerDoneThisFrame
-        worldLayerDoneThisFrame = false
-        if (givenUp) {
-            return
-        }
-        val minecraft = Minecraft.getInstance()
-        // hudless: this target is the UI layer, so the split stays on even at 100 % scale.
-        val hudless = hudlessArmed
-        if (!hudless && !worldLayerAlreadyInTarget && mainTargetMatchesWindow(minecraft)) {
-            // The main target is already window-sized: no split needed, the GUI stays on it.
-            return
-        }
-        val gui = ensureTarget() as? D3D12GUIRenderTarget ?: return degrade("no GUI target")
-        // Decided before the blit: a failed blit must never push the GUI back into the world target.
+        check(!preparedThisFrame) { "GUI target was prepared twice" }
+        val gui = ensureTarget()
         frameTarget = gui
-        // Vanilla clears the main target's depth before the GUI; this is a different target, so clear it here too.
-        gui.depthTexture?.let {
-            RenderSystem.getDevice().createCommandEncoder().clearDepthTexture(it, 0.0)
+        val encoderOwner = checkNotNull(D3D12Device.sharedCommandEncoder()) { "GUI has no command owner" }
+        check(owner == null || owner === encoderOwner) { "GUI display changed command owner" }
+        if (owner == null) {
+            encoderOwner.retainUntilCommandsClosed(this)
+            owner = encoderOwner
         }
-        if (hudless) {
-            // Start fully transparent: vanilla's translucent blend then yields premultiplied RGB plus a
-            // correct coverage alpha, which is exactly FFX's `USE_PREMUL_ALPHA` convention.
-            val ui = (gui.colorTextureView as? D3D12GpuTextureView)?.texture() as? D3D12GpuTexture
-                ?: return degrade("GUI target is not a D3D12 texture")
-            val encoder = D3D12Device.sharedCommandEncoder() ?: return degrade("no shared command encoder")
-            D3D12VariableShadingRate.hardReset(encoder.nativeCtx())
-            encoder.clearColorTexture(ui, Vector4f(0.0f, 0.0f, 0.0f, 0.0f))
-            // preparedThisFrame stays false: this frame presents the world layer, not this UI layer.
-            degrade(null)
-            return
-        }
-        // The world layer is already in this target (DLSS pInOutput); blitting again would overwrite it.
-        if (worldLayerAlreadyInTarget) {
-            preparedThisFrame = true
-            degrade(null)
-            return
-        }
-        val world = (minecraft.gameRenderer.mainRenderTarget().colorTextureView as? D3D12GpuTextureView)
-            ?.texture() as? D3D12GpuTexture ?: return degrade("world layer is not a D3D12 texture")
-        val destination = (gui.colorTextureView as? D3D12GpuTextureView)?.texture() as? D3D12GpuTexture
-            ?: return degrade("GUI target is not a D3D12 texture")
-        val encoder = D3D12Device.sharedCommandEncoder() ?: return degrade("no shared command encoder")
-        // Defensive reset: the GUI shares this command list with the world, and a skipped `scope()` finally would leave text coarsely shaded.
-        D3D12VariableShadingRate.hardReset(encoder.nativeCtx())
-        // World layer into the GUI target (upscale below 100 %, downscale above), always linear. Only a
-        // native-accepted blit switches the final source; a refusal costs one frame of GUI, never a scissor overflow.
-        if (!encoder.recordTextureBlit(world, destination)) {
-            return degrade("native texture blit refused")
-        }
+        val depth = checkNotNull(gui.getDepthTexture() as? D3D12GpuTexture)
+        val encoder = checkNotNull(D3D12Device.sharedCommandEncoder()) { "GUI has no command encoder" }
+        encoder.clearDepthTexture(depth, 0.0)
         preparedThisFrame = true
-        degrade(null)
     }
 
-    /** Records / clears the degradation state; logs only on change. */
-    private fun degrade(reason: String?) {
-        if (lastFailure == reason) {
-            return
-        }
-        lastFailure = reason
-        if (reason == null) {
-            Illusion.LOGGER.info(
-                "GUI split healthy again - {}",
-                if (hudlessArmed) {
-                    "the GUI target carries the UI layer only (the world is presented separately)"
-                } else {
-                    "the world layer is blitted into the GUI target"
-                })
-        } else {
-            Illusion.LOGGER.warn("GUI split degraded ({}); the GUI keeps drawing into its own window-sized target, this frame just presents the world target", reason)
-        }
-    }
-
-    /** The target that is actually presented this frame; null = the caller uses the main target. */
     @JvmStatic
-    fun replayTarget(): RenderTarget? {
-        if (!preparedThisFrame || givenUp || hudlessArmed) {
-            return null
+    fun prepareBlurBackdrop() {
+        if (!preparedThisFrame) return
+        val scene = D3D12SceneDisplay.sceneTexture() ?: return
+        check(!blurredBackdrop) { "GUI blur backdrop was prepared twice" }
+        val output = checkNotNull(composite)
+        composeSceneAndGui(scene, output)
+        val source = checkNotNull(output.getColorTexture() as? D3D12GpuTexture)
+        val destination = checkNotNull(frameTarget?.getColorTexture() as? D3D12GpuTexture)
+        val encoder = checkNotNull(D3D12Device.sharedCommandEncoder())
+        val version = checkNotNull(VanillaFrameCoordinator.currentResourceVersion())
+        VanillaFrameCoordinator.recordDeclaredPresentationPass(0x20005, listOf(
+            MCDR_ABI.VanillaResourceUse(source.handle(), version, access = 1, requiredState = 0xC0, finalState = 0x4),
+            MCDR_ABI.VanillaResourceUse(destination.handle(), version, access = 2, requiredState = 0x4),
+        )) {
+            check(encoder.recordTextureBlit(source, destination)) { "GUI blur backdrop transfer failed" }
         }
-        return target
+        blurredBackdrop = true
     }
 
-    /**
-     * Presentation source: the world layer in hudless mode (or [fallback] if it was already released),
-     * our GUI target once the world was blitted into it, otherwise vanilla's [fallback].
-     */
+    internal fun completeGui() {
+        check(preparedThisFrame && !guiCompleted) { "GUI completed without preparation or more than once" }
+        val ui = checkNotNull(frameTarget?.getColorTexture() as? D3D12GpuTexture)
+        check(!ui.isClosed()) { "Completed GUI texture is closed" }
+        if (ui.handle() != pushedUiHandle) {
+            check(MCDR_ABI.D3D12FgSetUiTexture(ui.handle()) == 1) { "Frame generation rejected GUI texture" }
+            pushedUiHandle = ui.handle()
+        }
+        val scene = D3D12SceneDisplay.sceneTexture()
+        val settings = VanillaFrameCoordinator.currentFrame()?.settings
+        val wantsHudless = scene != null && !blurredBackdrop && settings != null &&
+            settings.frameGenerationMode != 0 && settings.frameGenerationBackend == MCDR_ABI.FG_BACKEND_FSRFG
+        check(MCDR_ABI.D3D12FgSetUiComposition(wantsHudless) == 1) { "Frame generation rejected GUI composition change" }
+        hudlessPushed = wantsHudless
+        hudlessArmed = wantsHudless
+        guiCompleted = true
+    }
+
+    internal fun composeDisplay() {
+        check(guiCompleted && !displayComposed) { "Display composition preceded GUI completion or ran twice" }
+        val scene = D3D12SceneDisplay.sceneTexture()
+        if (scene != null && !blurredBackdrop) composeSceneAndGui(scene, checkNotNull(composite))
+        displayComposed = true
+    }
+
+    private fun composeSceneAndGui(scene: D3D12GpuTexture, output: D3D12GUIRenderTarget) {
+        val destination = checkNotNull(output.getColorTexture() as? D3D12GpuTexture)
+        val encoder = checkNotNull(D3D12Device.sharedCommandEncoder())
+        val version = checkNotNull(VanillaFrameCoordinator.currentResourceVersion())
+        VanillaFrameCoordinator.recordDeclaredPresentationPass(0x20006, listOf(
+            MCDR_ABI.VanillaResourceUse(scene.handle(), version, access = 1, requiredState = 0xC0, finalState = 0x4),
+            MCDR_ABI.VanillaResourceUse(destination.handle(), version, access = 2, requiredState = 0x4),
+        )) {
+            check(encoder.recordTextureBlit(scene, destination)) { "Scene transfer to final composite failed" }
+        }
+        val descriptor = RenderPassDescriptor.builder { "GUI over scene display" }
+            .withColorAttachment(checkNotNull(output.getColorTextureView()))
+            .build()
+        RenderSystem.getDevice().createCommandEncoder().createRenderPass(descriptor).use { pass ->
+            pass.setPipeline(RenderSystem.getCompiledPipeline(compositePipeline))
+            pass.setUniform("InSampler", checkNotNull(frameTarget?.getColorTextureView()),
+                RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST))
+            pass.draw(3, 1, 0, 0)
+        }
+    }
+
+    internal fun queueScreenshot(directory: File, callback: Consumer<Component>) {
+        RenderSystem.assertOnRenderThread()
+        screenshotRequests.addLast(DisplayScreenshot(directory, callback))
+    }
+
+    internal fun saveScreenshots() {
+        if (screenshotRequests.isEmpty()) return
+        val output = checkNotNull(completedDisplayTarget()) { "Screenshot preceded display composition" }
+        val color = checkNotNull(output.getColorTexture()) { "Screenshot has no display color" }
+        check(output.width == color.getWidth(0) && output.height == color.getHeight(0)) {
+            "Screenshot extent differs from the completed display attachment"
+        }
+        while (screenshotRequests.isNotEmpty()) {
+            val request = screenshotRequests.removeFirst()
+            Screenshot.grab(request.directory, output, request.callback)
+        }
+    }
+
+    internal fun completedDisplayTarget(): RenderTarget? {
+        if (!displayComposed) return null
+        return if (D3D12SceneDisplay.sceneTexture() == null || blurredBackdrop) frameTarget else composite
+    }
+
+    @JvmStatic
+    fun resetForNoWorld() {
+        discardFrame()
+        if (hudlessPushed) check(MCDR_ABI.D3D12FgSetUiComposition(false) == 1) {
+            "Frame generation still owns the GUI composition"
+        }
+        hudlessArmed = false
+        hudlessPushed = false
+    }
+
+    @JvmStatic
+    fun discardFrame() {
+        frameTarget = null
+        preparedThisFrame = false
+        guiCompleted = false
+        blurredBackdrop = false
+        displayComposed = false
+        hudlessArmed = false
+    }
+
     @JvmStatic
     fun presentSourceTexture(fallback: D3D12GpuTexture): D3D12GpuTexture {
-        if (!givenUp && hudlessArmed) {
-            // A world switch may have released the old world layer: fall back rather than pass a dangling handle.
-            val layer = worldLayerThisFrame
-            return if (layer != null && !layer.isClosed()) layer else fallback
+        val scene = D3D12SceneDisplay.sceneTexture()
+        if (scene != null) {
+            check(displayComposed) { "Scene presentation preceded completed display composition" }
+            if (blurredBackdrop) return checkNotNull(uiTextureForFrame())
+            if (hudlessArmed) {
+                if (MCDR_ABI.D3D12FgUiCompositionReady() == 1) return scene
+                check(MCDR_ABI.D3D12FgSetUiComposition(false) == 1) { "Frame generation rejected GUI fallback" }
+                hudlessPushed = false
+                hudlessArmed = false
+            }
+            return checkNotNull(composite?.getColorTexture() as? D3D12GpuTexture)
         }
-        if (!preparedThisFrame || givenUp) {
-            return fallback
+        return uiTextureForFrame() ?: fallback
+    }
+
+    override fun close() {
+        if (pushedUiHandle != 0L) check(MCDR_ABI.D3D12FgSetUiTexture(0L) == 1) {
+            "Frame generation still borrows the GUI target at shutdown"
         }
-        return (target?.colorTextureView as? D3D12GpuTextureView)?.texture() as? D3D12GpuTexture
-            ?: fallback
+        target?.destroyBuffers()
+        composite?.destroyBuffers()
+        target = null
+        composite = null
+        owner = null
+        pushedUiHandle = 0L
+        hudlessArmed = false
+        hudlessPushed = false
+        screenshotRequests.clear()
+        discardFrame()
     }
 }

@@ -1,0 +1,11 @@
+{
+  "homepage": "https://github.com/DXEGP/Illusion",
+  "26.3": {
+    "2630-0.6.2-alpha": "Completely rebuilt of vanilla render pipeline.",
+    "2630-0.3.0-alpha": "Mesh, VRS, HDR and super resolution/multi-frame generation, etc."
+  },
+  "promos": {
+    "26.3": "2630-0.6.2-alpha",
+    "26.3": "2630-0.6.2-alpha"
+  }
+}

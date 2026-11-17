@@ -21,10 +21,7 @@ mixin 处理的是接口拿到**之前**、以及接口给不了的东西：
 - 静态上下文里没人递给你的对象（`GameRenderer#preloadUiShader` 里的 `ResourceManager`）。
 - 私有类型（`ShaderManager$PendingResults` 是私有 record，写不进方法描述符，只能包它的构造）。
 
-体量：`Illusion\src\main\java\io\github\dxegp\mixin\` 下 **44 个文件、1947 行**。按注解行统计为
-53 处 `@Inject`、5 处 `@WrapOperation`、5 处 `@ModifyExpressionValue`、2 处 `@ModifyReturnValue`、
-1 处 `@ModifyArg`、2 处 `@ModifyVariable`、4 处 `@Invoker`、2 处 `@Accessor`。最大的是
-`mixin/options/OptionsMixin.java`（128 行）。
+生产 mixin 分布在 `src/main/java/io/github/dxegp/mixin/` 和 `src/main/kotlin/io/github/dxegp/mixin/`，实际注册清单以 `src/main/resources/dxr_mc.mixins.json` 为准。选项加载与保存由 Kotlin `options/OptionsRenderOptionsMixin.kt` 统一接线。
 
 ### 1.2 判据：什么必须留在 mixin
 
@@ -171,15 +168,14 @@ file="META-INF/accesstransformer.cfg"
 `SectionUploadCaptureMixin` 必须挂 `addSectionBuffersToUberBuffer`，不要改挂 `SectionCompiler.compile`：后者能成功应用，
 但回调一次也不触发。
 
-### 3.7 视频设置与选项（10）
+### 3.7 视频设置与选项（9）
 
 | Mixin | 目标（类#方法） | 注入点 | 目的 |
 | --- | --- | --- | --- |
 | `options\PreferredGraphicsApiMixin` | `PreferredGraphicsApi`（`<clinit>` / `values` / `getBackendsToTry`） | `@Inject` TAIL + `@ModifyReturnValue` ×2 | 往原版枚举里追加 `D3D12` 常量、把 `CODEC` 重建为 `StringRepresentable.fromEnum(values)`、让后端尝试列表只含我们的条目 |
 | `options\PreferredGraphicsApiAccessor` | `PreferredGraphicsApi#<init>` | `@Invoker("<init>")`，方法体抛 `AssertionError` | 造枚举常量；AT 救不了枚举构造器，只能这样 |
 | `options\OptionsMixin` | `Options#<init>` | `@ModifyArg`（`OptionInstance` 七参构造 index=1）+ `@Inject` at INVOKE `Object.<init>` shift=AFTER + `@Inject` RETURN | 给图形后端选项换 tooltip；安装「永不」限帧档；最后再补一次 NEVER 的专用 tooltip |
-| `options\OptionsAntiAliasingMixin` | `Options#load` / `#save` | `@Inject` TAIL | 抗锯齿设置的读写 |
-| `options\OptionsRenderOptionsMixin` | `Options#load` / `#save`；`#isRestartRequiredToApplyVideoSettings` | `@Inject` TAIL ×2；`@Inject` RETURN cancellable | 七个非 `Options` 字段的设置项的持久化；HDR 待重启时把重启提示变成 `true` |
+| `options\OptionsRenderOptionsMixin.kt` | `Options#load` / `#save`；`#isRestartRequiredToApplyVideoSettings` | `@Inject` TAIL ×2；`@Inject` RETURN cancellable | 单个 Kotlin mixin：loadSavedSettings 一次加载 AA 和其余渲染选项；save 读取各业务的可保存配置；HDR 待重启时返回 true |
 | `options\OptionsGraphicsPresetMixin` | `Options#applyGraphicsPreset` | `@Inject` INVOKE `GraphicsPreset#apply` shift=AFTER | 画质预设联动抗锯齿（fast=off、fancy=SMAA、fabulous=TAA、custom 不动） |
 | `options\OptionsScreenVideoMixin` | `OptionsScreen#openScreenButton` | `@Inject` HEAD, cancellable | 标题等于 `VIDEO` 且 HDR 可用时，换成自绘的视频设置界面 |
 | `options\VideoSettingsScreenOptionsAccessor` | `VideoSettingsScreen#displayOptions` / `#qualityOptions` / `#preferenceOptions` | `@Invoker` ×3 | 取出原版三个私有静态选项数组 |
@@ -192,7 +188,7 @@ file="META-INF/accesstransformer.cfg"
   一次 ClassCastException 就够让游戏起不来。
 - `getBackendsToTry` 必须返回**单条目** `new GpuBackend[]{ new D3D12Backend() }`：返回多条目会让
   `BackendCreationException` 被吞掉、静默回退 OpenGL；失败改由 `D3D12Fatal` 重置 `preferredGraphicsBackend` 并崩溃。
-- 七个设置项的 `load` / `save` 与 `OptionsAntiAliasingMixin` 分成两个 mixin，各自只改自己的键，互不破坏。
+- OptionsRenderOptionsMixin 在 loadSavedSettings 内一次加载 AA、比例、VRS、DLSS、Reflex、HDR、FG、SR，全部读入后再归一化 requested 并初始化 persistent；AA 没有独立 mixin。保存 AA/比例/DLSS/SR/FG 时统一读取 settingsToSave，临时 resize applied 不覆盖磁盘偏好，详见 [渲染配置](../rendering/render-configuration.md)。
 
 ### 3.8 调试界面（4）
 
@@ -305,7 +301,7 @@ service 包只在外层 JAR 定义一次，游戏从 `EarlyLoadingScreenControll
 三条不变量：
 
 1. 租约只允许成功领用一次，关闭后不能领用。
-2. 游戏侧在后端正常建窗入口领用，后端自检看到同一个非零 `lastWindowHandle`。
+2. 游戏侧在后端正常建窗入口领用，后端建窗契约读取同一个非零 `lastWindowHandle`。
 3. `WindowState` 采集真实位置、逻辑尺寸与最小化、最大化、全屏标志；图像按逻辑尺寸合成，呈现使用实时像素尺寸。
 
 ### 5.5 发布容器与首次启动
@@ -340,10 +336,17 @@ FML 12.0.12 发现外层服务容器后，仍将它交给 JiJ dependency locator
 
 ### 5.7 退出与资源所有权
 
-软件 renderer 在 D3D12 领用前已经清黑并销毁，退出时不会重新呈现残留的早期加载图像。
+软件 renderer 在 D3D12 领用前已经清黑并销毁；provider 退出时不再绘制加载图像。
 provider 的关闭操作幂等，只释放加载资源和未领用窗口；已领用窗口由游戏原有生命周期销毁一次。
 
-加载图像的实际视觉连续性、DPI/全屏变化和 RTSS 注入仍需要在 Windows 客户端实测。
+游戏先关闭 surface、再关闭 renderer，最后销毁复用的 SDL 顶层窗口。
+`destroySurface` 与 `destroySurfaceNoWaitIdle` 必须在释放 swapchain 前，先隐藏承载父窗口，
+再隐藏最后一个呈现子窗口并按当前客户区尺寸刷黑；DirectComposition 没有子窗口时直接处理承载窗口。
+此操作覆盖 `SeamlessWindowHost` 和普通呈现子窗口两条路径，随后才释放 host 或销毁子窗口，避免
+resize 后旧 backbuffer 在释放等待期间继续可见，也避免窗口重绘时露出父窗口残留的早期加载画面。
+
+resize 后退出的用户确认与问题关闭状态集中见[实施记录：当前构建与运行](../rendering/work-graph-implementation.md#当前构建与运行)。
+加载图像的实际视觉连续性、DPI/全屏变化和 RTSS 注入仍需单独实测。
 
 ## 6. 新增一个 mixin 的规范
 
@@ -368,8 +371,7 @@ provider 的关闭操作幂等，只释放加载资源和未领用窗口；已�
 
 ### 6.3 优先级
 
-44 个 mixin **没有一个**声明 `priority`（默认 1000）。同一目标类上的多个 mixin（`Options` 上有 4 个、
-`GameRenderer` 上有 5 个、`LevelRenderer` 上有 3 个）靠「注入点位置 + 被注入方法名」区分，不靠优先级排序。
+当前生产 mixin 沿用默认 `priority=1000`。同一目标类上的多个 mixin 靠注入位置和方法区分；Options 的设置加载/保存合并在一个 Kotlin 入口，加载顺序由 loadSavedSettings 的批量边界确定。
 
 不要为了抢顺序去加 `priority`：真正的顺序保证来自 `INVOKE` 目标与 `shift`，那是可验证、可 review 的；
 `priority` 只影响同一位置的多个回调谁先跑，改了以后没有任何编译期或启动期检查替你兜底。
@@ -401,7 +403,7 @@ provider 的关闭操作幂等，只释放加载资源和未领用窗口；已�
 6. **描述符要写全。** 内部类带 `$`（`FrameGraphBuilder$Inspector`），有重载就写完整参数表。
 7. **不要把 `defaultRequire` 降成 0。** 它现在是 `1`，注入点消失会在启动时炸；降成 0 之后同类问题会变成静默失效。
 
-### 6.6 提交前自检
+### 6.6 提交前检查
 
 - [ ] 目标方法有重载？写完整描述符。
 - [ ] 目标是 lambda / 私有内部类？用 `targets =` + `remap = false`。
@@ -414,7 +416,7 @@ provider 的关闭操作幂等，只释放加载资源和未领用窗口；已�
 
 ## 7. 文件导航
 
-mixin 侧（前缀 `Illusion/src/main/java/io/github/dxegp/`，逐条清单见 `dxr_mc.mixins.json`）：
+mixin 侧：Java 路径相对 `src/main/java/io/github/dxegp/`，Kotlin 路径相对 `src/main/kotlin/io/github/dxegp/`；逐条注册清单见 `dxr_mc.mixins.json`。
 
 | 文件 | 内容 |
 | --- | --- |
@@ -425,7 +427,7 @@ mixin 侧（前缀 `Illusion/src/main/java/io/github/dxegp/`，逐条清单见 `
 | `mixin/backend/FrontendGpuDeviceCompilePipelineMixin.java`、`mixin/backend/ShaderManagerRequiredFailureMixin.java`、`mixin/backend/GameRendererPreloadUiShaderMixin.java` | 管线与着色器 |
 | `mixin/terrain/SectionUploadCaptureMixin.kt`、`CompiledSectionGeometryMixin.kt`、`LevelRendererMeshCaptureMixin.kt`、`DynamicGpuDataCaptureMixin.kt` | 地形网格所有权、退休与绘制快照采集 |
 | `mixin/diagnostics/` 下的 ProfMixin、`mixin/debug/PreparedFrameProfMixin.java` | 阶段计时 |
-| `mixin/options/OptionsMixin.java`、`mixin/options/OptionsRenderOptionsMixin.java`、`mixin/options/OptionsAntiAliasingMixin.java`、`mixin/options/OptionsGraphicsPresetMixin.java` | `Options` 上的四处注入 |
+| `mixin/options/OptionsMixin.java`、`mixin/options/OptionsRenderOptionsMixin.kt`、`mixin/options/OptionsGraphicsPresetMixin.java` | Options 构造/提示、统一加载保存和画质预设接线 |
 | `mixin/options/PreferredGraphicsApiMixin.java`、`mixin/options/PreferredGraphicsApiAccessor.java` | 往原版枚举里追加 D3D12 |
 | `mixin/options/OptionsScreenVideoMixin.java`、`mixin/options/VideoSettingsScreenOptionsAccessor.java` | 自绘视频设置界面 |
 | `mixin/client/InactivityFpsLimitMixin.java`、`mixin/client/FpsLimitTrackerMixin.java`、`mixin/backend/DebugCrosshairRendererMixin.java` | 「永不」限帧档；已停用的准星空壳 |

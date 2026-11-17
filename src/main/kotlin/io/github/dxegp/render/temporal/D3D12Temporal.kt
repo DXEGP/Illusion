@@ -6,7 +6,6 @@ import com.mojang.renderpearl.api.buffers.GpuBuffer
 import com.mojang.renderpearl.api.buffers.GpuBufferSlice
 import io.github.dxegp.config.D3D12Settings
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
-import io.github.dxegp.render.resolution.D3D12RenderScale
 import io.github.dxegp.d3d12.resource.D3D12GpuBuffer
 import io.github.dxegp.render.reconstruction.dlss.DeepLearningSuperSampling
 import io.github.dxegp.render.reconstruction.SuperResolution
@@ -19,7 +18,7 @@ import java.nio.ByteOrder
 /**
  * Temporal (TAAU) base state: sub-pixel jitter, previous-frame/history management, per-object records.
  *
- * Jitter goes into the **level** projection only, columns [8]/[9] (`clip.w = -view.z`), never into the 3D
+ * Jitter translates clip-space x/y in the **level** projection only, never into the 3D
  * HUD; history must always keep the **unjittered** matrix or the velocity field is polluted. Halton(2,3)
  * in pixels, `[-0.5, +0.5)`, injected only when something consumes it ([hasJitterConsumer]).
  * See docs/antialiasing/README.md §3.
@@ -50,6 +49,7 @@ object D3D12Temporal {
     @JvmStatic
     fun isActive(): Boolean = enabled || D3D12TAA.isSelected() || DeepLearningSuperSampling.isEnabled() ||
         (SuperResolution.needsVelocityPass() && SuperResolution.isEnabled()) ||
+        io.github.dxegp.render.presentation.framegen.FrameGeneration.isEnabled() ||
         io.github.dxegp.render.vrs.D3D12VariableShadingRate.isEnabled()
 
     /**
@@ -58,7 +58,7 @@ object D3D12Temporal {
      */
     private fun hasJitterConsumer(): Boolean =
         D3D12TAA.isSelected() ||
-            (DeepLearningSuperSampling.isEnabled() && !DeepLearningSuperSampling.isStalled()) ||
+            DeepLearningSuperSampling.isEnabled() ||
             (SuperResolution.needsVelocityPass() && SuperResolution.isEnabled())
 
     /** Whether the jitter is really written into the projection (the capture path ignores it). */
@@ -73,6 +73,61 @@ object D3D12Temporal {
         }
 
     private var frameIndex: Long = 0L
+    internal var renderFrameTimeNanos: Long = Long.MIN_VALUE
+        private set
+    private var recordedProjection: RecordedLevelProjection? = null
+    private var pendingProjection: PendingLevelProjection? = null
+    private var uploadJitterX: Double = 0.0
+    private var uploadJitterY: Double = 0.0
+
+    private class PendingLevelProjection(
+        val buffer: GpuBuffer,
+        val offset: Long,
+        val payload: ByteBuffer,
+        val receipt: RecordedLevelProjection,
+    )
+
+    @Synchronized
+    internal fun recordedLevelProjection(): RecordedLevelProjection? = recordedProjection
+
+    @Synchronized
+    internal fun beginRenderFrame(timeNanos: Long) {
+        renderFrameTimeNanos = timeNanos
+        recordedProjection = null
+        pendingProjection = null
+    }
+
+    internal fun isLevelProjectionUpload(destination: GpuBufferSlice, data: ByteBuffer): Boolean =
+        (destination.buffer() as? D3D12GpuBuffer)?.label() == LEVEL_PROJECTION_LABEL && data.remaining() == 64
+
+    @Synchronized
+    internal fun commitLevelProjectionUpload(destination: GpuBufferSlice, payload: ByteBuffer): RecordedLevelProjection? {
+        if (!isLevelProjectionUpload(destination, payload)) return null
+        val pending = pendingProjection
+        pendingProjection = null
+        check(pending != null && pending.buffer === destination.buffer() &&
+            pending.offset == destination.offset() && pending.payload === payload) {
+            "Level projection upload has no matching prepared camera"
+        }
+        val minecraft = Minecraft.getInstance()
+        check(pending.receipt.world === minecraft.level && pending.receipt.frameTimeNanos == renderFrameTimeNanos &&
+            pending.receipt.historyGeneration == historyGeneration) {
+            "Level projection upload changed world, time or history while recording"
+        }
+        recordedProjection = pending.receipt
+        injectedJitterX = pending.receipt.jitterX
+        injectedJitterY = pending.receipt.jitterY
+        injectedFrameId = retiredDisplayFrameId
+        return pending.receipt
+    }
+
+    @Synchronized
+    internal fun discardLevelProjectionUpload(destination: GpuBufferSlice) {
+        if ((destination.buffer() as? D3D12GpuBuffer)?.label() != LEVEL_PROJECTION_LABEL) return
+        pendingProjection = null
+        recordedProjection = null
+        injectedFrameId = Long.MIN_VALUE
+    }
 
     internal val frameSequence: Long
         get() = frameIndex
@@ -115,10 +170,6 @@ object D3D12Temporal {
         loggedPhaseCount = reported
     }
 
-    /**
-     * Frame stamp ([Minecraft.getFrameTimeNs]) of the last level-projection upload; one frame may upload it
-     * several times, and advancing per upload would give two jitters within one frame.
-     */
     private var uploadFrameNs: Long = Long.MIN_VALUE
     private var frameWorld: Any? = null
 
@@ -196,6 +247,8 @@ object D3D12Temporal {
 
     @Synchronized
     fun reset() {
+        recordedProjection = null
+        pendingProjection = null
         frameIndex = 0L
         uploadFrameNs = Long.MIN_VALUE
         frameWorld = null
@@ -226,7 +279,6 @@ object D3D12Temporal {
         cameraPositionDouble = null
         previousCameraPositionDouble = null
         D3D12Velocity.reset()
-        D3D12TAA.reset()
         D3D12ObjectMotion.reset()
     }
 
@@ -237,10 +289,10 @@ object D3D12Temporal {
     fun beginFrame() {
         val minecraft = Minecraft.getInstance()
         val world = minecraft.level ?: return
-        if (frameWorld === world && uploadFrameNs == minecraft.frameTimeNs) return
+        if (frameWorld === world && uploadFrameNs == renderFrameTimeNanos) return
         if (frameWorld !== world) reset()
         frameWorld = world
-        uploadFrameNs = minecraft.frameTimeNs
+        uploadFrameNs = renderFrameTimeNanos
         previousCameraPosition = cameraPosition
         previousCameraPositionDouble = cameraPositionDouble
         // Camera position comes straight from `Camera` at the frame start. Deriving it from the Global
@@ -276,7 +328,6 @@ object D3D12Temporal {
         // Velocity textures roll on the same beat.
         D3D12Velocity.beginFrame()
         // So does the TAA history ping-pong.
-        D3D12TAA.beginFrame()
         // Per-object snapshots: entity positions are final after tick(), the velocity pass records at frame end.
         D3D12ObjectMotion.beginFrame()
         D3D12ObjectMotion.harvestVisible()
@@ -288,11 +339,14 @@ object D3D12Temporal {
      */
     @Synchronized
     fun onLevelProjectionUpload(pristine: FloatArray, width: Int, height: Int): FloatArray {
+        uploadJitterX = 0.0
+        uploadJitterY = 0.0
         if (pristine.size != 16) {
             return pristine
         }
         // Advance at most once per frame (see [uploadFrameNs]).
         if (Minecraft.getInstance().level == null || width <= 0 || height <= 0) return pristine.copyOf()
+        if (!isActive()) return pristine.copyOf()
         if (lastSizeWidth != 0 && (lastSizeWidth != width || lastSizeHeight != height)) reset()
         beginFrame()
         lastSizeWidth = width
@@ -302,16 +356,22 @@ object D3D12Temporal {
         if (!hasJitterConsumer() || !jitterEnabled) {
             return pristine.copyOf()
         }
+        uploadJitterX = jitterX
+        uploadJitterY = jitterY
         return jitterProjection(pristine, clipJitterX(width), clipJitterY(height))
     }
 
     /**
-     * Adds a clip-space offset to the projection ([8] = m[0][2], [9] = m[1][2]); `clip.w = -view.z`, so `m[0][2] -= c`.
+     * Applies a clip-space translation to the projection while preserving its depth and homogeneous rows.
      */
     fun jitterProjection(pristine: FloatArray, clipX: Double, clipY: Double): FloatArray {
         val out = pristine.copyOf()
-        out[8] = (out[8] - clipX).toFloat()
-        out[9] = (out[9] - clipY).toFloat()
+        for (column in 0 until 4) {
+            val offset = column * 4
+            val homogeneous = pristine[offset + 3]
+            out[offset] = (pristine[offset] + clipX * homogeneous).toFloat()
+            out[offset + 1] = (pristine[offset + 1] + clipY * homogeneous).toFloat()
+        }
         return out
     }
 
@@ -331,7 +391,7 @@ object D3D12Temporal {
     /** Diagnostic: |injected - current| jitter (largest axis); -1 when the frame ids differ. */
     @Synchronized
     fun injectedJitterMismatch(): Double {
-        if (injectedFrameId != presentedFrameId) {
+        if (injectedFrameId != retiredDisplayFrameId) {
             return -1.0
         }
         val dx = kotlin.math.abs(injectedJitterX - jitterX)
@@ -344,8 +404,8 @@ object D3D12Temporal {
      * merges uploads at low frame rates and two frames at high ones.
      */
     @Synchronized
-    fun onFramePresented() {
-        presentedFrameId++
+    fun onDisplayFrameRetired() {
+        retiredDisplayFrameId++
     }
 
     /**
@@ -355,9 +415,6 @@ object D3D12Temporal {
      */
     @Synchronized
     fun interceptWrite(destination: GpuBufferSlice, data: ByteBuffer): ByteBuffer? {
-        if (!isActive()) {
-            return null
-        }
         val buffer = destination.buffer()
         if (buffer !is D3D12GpuBuffer) {
             return null
@@ -386,24 +443,31 @@ object D3D12Temporal {
 
     /** Jitter injection for the level projection (called from [interceptWrite] only). */
     private fun interceptLevelProjectionWrite(destination: GpuBufferSlice, data: ByteBuffer): ByteBuffer? {
+        discardLevelProjectionUpload(destination)
         if (data.remaining() != 64) {
             return null
         }
-        val size = renderSize() ?: return null
-        val pristine = readFloats(data, 0, 16) ?: return null
-        // Frame identity = present count, not a time window: at low frame rates a second upload in the same
-        // frame would roll the jitter again and the raster and the resolve end up disagreeing.
-        val jittered = onLevelProjectionUpload(pristine, size[0], size[1])
-        lastRollFrameId = presentedFrameId
-
-        // Remember the jitter really fed to the raster, so the DLSS side can compare reported vs rendered.
-        injectedJitterX = jitterX
-        injectedJitterY = jitterY
-        injectedFrameId = presentedFrameId
+        val pristine = checkNotNull(readFloats(data, 0, 16)) { "Level projection upload has no matrix" }
+        require(pristine.all(Float::isFinite)) { "Level projection upload contains a non-finite matrix" }
+        val minecraft = Minecraft.getInstance()
+        val color = checkNotNull(minecraft.gameRenderer.mainRenderTarget().colorTextureView?.texture()) {
+            "Level projection upload has no color attachment"
+        }
+        check(!color.isClosed()) { "Level projection upload color attachment is closed" }
+        val width = color.getWidth(0)
+        val height = color.getHeight(0)
+        check(width > 0 && height > 0) { "Level projection upload color attachment is empty" }
+        val world = checkNotNull(minecraft.level) { "Level projection upload has no world" }
+        val frameTimeNanos = renderFrameTimeNanos
+        val jittered = onLevelProjectionUpload(pristine, width, height)
+        val receipt = RecordedLevelProjection(world, frameTimeNanos, historyGeneration,
+            if (isActive() && frameIndex > 0L) frameIndex - 1L else 0L,
+            width, height, uploadJitterX, uploadJitterY, pristine, jittered)
+        lastRollFrameId = retiredDisplayFrameId
 
         // Rewrite the caller's buffer in place (offsets relative to `position`): a fresh buffer breaks the
         // caller's length/lifetime assumptions.
-        return try {
+        val payload = try {
             val view = data.duplicate().order(ByteOrder.LITTLE_ENDIAN)
             view.position(data.position())
             view.asFloatBuffer().put(jittered, 0, 16)
@@ -414,6 +478,8 @@ object D3D12Temporal {
             out.asFloatBuffer().put(jittered, 0, 16)
             out
         }
+        pendingProjection = PendingLevelProjection(destination.buffer(), destination.offset(), payload, receipt)
+        return payload
     }
 
     /**
@@ -456,8 +522,7 @@ object D3D12Temporal {
         }
     }
 
-    /** Number of presented frames, used as the frame identity (see [onFramePresented]). */
-    private var presentedFrameId: Long = 0L
+    private var retiredDisplayFrameId: Long = 0L
 
     /** jitter + frame id of the last injection, see [injectedJitter]. */
     private var injectedJitterX: Double = 0.0
@@ -469,20 +534,6 @@ object D3D12Temporal {
 
     private var lastSizeWidth: Int = 0
     private var lastSizeHeight: Int = 0
-
-    /**
-     * Render-target pixels = window size x `[render] renderScale`; the jitter is in target pixels, so must scale.
-     */
-    private fun renderSize(): IntArray? {
-        return try {
-            val window = Minecraft.getInstance().window
-            val width = D3D12RenderScale.scaled(window.width)
-            val height = D3D12RenderScale.scaled(window.height)
-            if (width <= 0 || height <= 0) null else intArrayOf(width, height)
-        } catch (t: Throwable) {
-            null
-        }
-    }
 
     /** Reads `count` little-endian floats at [offset] bytes from the caller's current position. */
     private fun readFloats(data: ByteBuffer, offset: Int, count: Int): FloatArray? {

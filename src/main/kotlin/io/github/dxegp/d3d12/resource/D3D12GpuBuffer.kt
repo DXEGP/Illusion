@@ -1,11 +1,12 @@
 package io.github.dxegp.d3d12.resource
 
 import com.mojang.renderpearl.api.buffers.GpuBufferSlice
+import com.mojang.renderpearl.api.buffers.GpuBuffer
 import com.mojang.renderpearl.backend.common.BaseGpuBuffer
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.concurrent.atomic.AtomicLong
+import java.util.TreeMap
 /**
  * D3D12 缓冲。heap 类型由 native 按 usage 选（MAP_WRITE→UPLOAD，MAP_READ→READBACK，其余 DEFAULT），
  * [map] 返回持久映射内存上的 direct ByteBuffer。
@@ -13,13 +14,19 @@ import java.util.concurrent.atomic.AtomicLong
 class D3D12GpuBuffer(private val usageFlags: Int, private val bufferSize: Long, private val label: String = "") :
     BaseGpuBuffer(usageFlags, bufferSize) {
     private val handle: Long
+    @Volatile
     private var closed = false
+    private var uploadRoot: D3D12UploadAllocation? = null
+    private val uploadAllocations = TreeMap<Long, D3D12UploadAllocation>()
+    private var uploadReadPins = 0
+    private var destroyed = false
 
     init {
         this.handle = MCDR_ABI.ID3D12CreateBuffer(usageFlags, bufferSize)
         if (this.handle == 0L) {
             throw IllegalStateException("dx12CreateBuffer returned a null handle")
         }
+        if (usageFlags and GpuBuffer.USAGE_MAP_WRITE != 0) uploadRoot = D3D12UploadAllocation(this, 0L, bufferSize)
     }
 
 
@@ -38,20 +45,98 @@ class D3D12GpuBuffer(private val usageFlags: Int, private val bufferSize: Long, 
         return this.label
     }
 
+    @Synchronized
     override fun map(offset: Long, length: Long, read: Boolean, write: Boolean): GpuBufferSlice.MappedView {
+        check(!closed) { "Cannot map a closed buffer" }
+        require(offset >= 0L && length >= 0L && offset <= bufferSize && length <= bufferSize - offset)
         require(length <= Int.MAX_VALUE) { "Mapping buffer slice larger than 2GB is not supported" }
         val data: ByteBuffer = MCDR_ABI.D3D12MapBuffer(this.handle, offset, length, read, write)
             ?: throw IllegalStateException(mapFailureMessage(offset, length, read, write))
         // 必须强制 LITTLE_ENDIAN：direct ByteBuffer 默认 BIG_ENDIAN，UBO 会按大端写入、矩阵全垃圾。
         data.order(ByteOrder.LITTLE_ENDIAN)
+        val writes = if (write && usageFlags and GpuBuffer.USAGE_MAP_WRITE != 0) {
+            val root = checkNotNull(uploadRoot)
+            buildList {
+                add(root)
+                var entry = uploadAllocations.floorEntry(offset) ?: uploadAllocations.ceilingEntry(offset)
+                while (entry != null && entry.key < offset + length) {
+                    val allocation = entry.value
+                    if (allocation.byteOffset + allocation.byteLength > offset) add(allocation)
+                    entry = uploadAllocations.higherEntry(entry.key)
+                }
+            }.also { allocations -> for (allocation in allocations) allocation.beginWrite() }
+        } else emptyList()
+        var mappingClosed = false
         return GpuBufferSlice.MappedView(this.slice(offset, length), data
         ) {
-            MCDR_ABI.D3D12UnmapBuffer(this.handle)
+            synchronized(this) {
+                if (!mappingClosed) {
+                    mappingClosed = true
+                    MCDR_ABI.D3D12UnmapBuffer(this.handle)
+                    for (allocation in writes) allocation.completeWrite(offset, length)
+                    if (writes.isNotEmpty()) {
+                        var entry = uploadAllocations.floorEntry(offset) ?: uploadAllocations.ceilingEntry(offset)
+                        while (entry != null && entry.key < offset + length) {
+                            val allocation = entry.value
+                            if (allocation.byteOffset + allocation.byteLength > offset && allocation !in writes) {
+                                allocation.beginWrite()
+                                allocation.completeWrite(offset, length)
+                            }
+                            entry = uploadAllocations.higherEntry(entry.key)
+                        }
+                    }
+                }
+            }
         }
     }
 
+    @Synchronized
+    internal fun registerUploadAllocation(offset: Long, length: Long): D3D12UploadAllocation {
+        check(!closed && usageFlags and GpuBuffer.USAGE_MAP_WRITE != 0)
+        require(offset >= 0L && length > 0L && offset <= bufferSize && length <= bufferSize - offset)
+        val previous = uploadAllocations.floorEntry(offset)?.value
+        val next = uploadAllocations.ceilingEntry(offset)?.value
+        check(previous == null || previous.byteOffset + previous.byteLength <= offset)
+        check(next == null || offset + length <= next.byteOffset)
+        return D3D12UploadAllocation(this, offset, length).also { uploadAllocations[offset] = it }
+    }
+
+    @Synchronized
+    internal fun retireUploadAllocation(allocation: D3D12UploadAllocation) {
+        check(uploadAllocations.remove(allocation.byteOffset, allocation))
+        allocation.close()
+    }
+
+    @Synchronized
+    internal fun retainUploadRead(offset: Long, length: Long, recording: D3D12UploadRecording): D3D12UploadRead {
+        if (closed) return D3D12UploadRead.Unavailable(D3D12UploadRead.Reason.BUFFER_CLOSED)
+        if (usageFlags and GpuBuffer.USAGE_MAP_WRITE == 0) {
+            return D3D12UploadRead.Unavailable(D3D12UploadRead.Reason.NOT_UPLOAD)
+        }
+        if (uploadRoot?.hasOpenWrites == true) return D3D12UploadRead.Unavailable(D3D12UploadRead.Reason.WRITE_OPEN)
+        val selected = uploadAllocations.floorEntry(offset)?.value
+        val allocation = if (selected != null && offset <= selected.byteOffset + selected.byteLength &&
+            length > 0L && length <= selected.byteOffset + selected.byteLength - offset) selected
+        else if (uploadAllocations.isNotEmpty()) {
+            return D3D12UploadRead.Unavailable(D3D12UploadRead.Reason.RANGE_MISMATCH)
+        } else uploadRoot ?: return D3D12UploadRead.Unavailable(D3D12UploadRead.Reason.OWNER_UNAVAILABLE)
+        val read = allocation.readRange(offset, length)
+        if (read !is D3D12UploadRead.Available) return read
+        uploadReadPins = Math.incrementExact(uploadReadPins)
+        val lease = D3D12UploadSubmissionLease(recording, AutoCloseable {
+            synchronized(this) {
+                check(uploadReadPins > 0)
+                uploadReadPins--
+                if (closed && uploadReadPins == 0 && !destroyed) {
+                    destroyed = true
+                    MCDR_ABI.ID3D12DestroyResource(handle)
+                }
+            }
+        })
+        return read.retainSubmission(lease)
+    }
+
     companion object {
-        private val G_CLOSE_LOG = java.util.concurrent.atomic.AtomicInteger()
         /**
          * `Map` 失败最常见的原因是设备已被移除（`0x887A0005`）：那一刻起每个 GPU 调用都会失败，
          * 崩溃点只是恰好落在第一个 `Map` 上。单独识别它，避免被误读成"某个 buffer 有问题"。
@@ -117,16 +202,18 @@ class D3D12GpuBuffer(private val usageFlags: Int, private val bufferSize: Long, 
             "evaluate that first used a real depth snapshot)."
     }
 
+    @Synchronized
     override fun close() {
         if (this.closed) {
             return
         }
         this.closed = true
-        // 临时取证：谁在关缓冲、关了几次。
-        if (label.contains("Screenshot") || (usageFlags and 8 != 0 && G_CLOSE_LOG.getAndIncrement() < 4)) {
-            System.err.println("GpuBuffer.close label='$label' size=$bufferSize")
+        uploadRoot?.close()
+        for (allocation in uploadAllocations.values) allocation.close()
+        if (uploadReadPins == 0) {
+            destroyed = true
+            MCDR_ABI.ID3D12DestroyResource(this.handle)
         }
-        MCDR_ABI.ID3D12DestroyResource(this.handle)
     }
 
     override fun isClosed(): Boolean {

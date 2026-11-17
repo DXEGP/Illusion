@@ -14,7 +14,7 @@
 
 | 路径 | 触发点（代码位置） | 谁写报告 | 谁弹窗 | 进程如何退出 |
 | --- | --- | --- | --- | --- |
-| Java 异常（后端初始化/自检失败） | `d3d12/backend/D3D12Backend.kt` 的 `createWindow` / `createDevice` → `diagnostics/D3D12Fatal.kt:crash` | `D3D12Fatal`：自定义 `CrashReport` + `ReportedException`，最终落到 `crash-reports/` | `D3D12Fatal.showPopup`（原生 `MessageBoxW`） | `ReportedException` 逃出原版候选后端循环，被 `Main.main` 的 `catch (Throwable)` 接住 → 原版崩溃流程 |
+| Java 异常（后端初始化/能力契约失败） | `d3d12/backend/D3D12Backend.kt` 的 `createWindow` / `createDevice` → `diagnostics/D3D12Fatal.kt:crash` | `D3D12Fatal`：自定义 `CrashReport` + `ReportedException`，最终落到 `crash-reports/` | `D3D12Fatal.showPopup`（原生 `MessageBoxW`） | `ReportedException` 逃出原版候选后端循环，被 `Main.main` 的 `catch (Throwable)` 接住 → 原版崩溃流程 |
 | Java 异常（运行期任意异常） | 渲染/资源调用内部，例如 `d3d12/resource/D3D12GpuBuffer.kt` 的 `mapFailureMessage` | 原版 `CrashReport.forThrowable`（DXRMC 不介入） | 无（原版崩溃界面是游戏内 GUI） | 原版崩溃流程；退出码代码中未明确 |
 | native 访问冲突 / 未处理 SEH | `MCDR/src/diagnostics/d3d12_diagnostics.cpp` 的 `dx12CrashFilter` | **不写文件**，只往 stderr 打 `FATAL` 行 | 无 | 过滤器返回 `EXCEPTION_EXECUTE_HANDLER`，由 Windows 按未处理异常终止进程；代码未设置退出码，实际退出码即异常码（如访问冲突 `0xC0000005`） |
 | 设备被移除 / 复位 | `MCDR\src/render/presentation/d3d12_surface.cpp` 的 `presentSurface`、`MCDR\src/backend/device/d3d12_device.cpp` 的 `deviceRemoved` / `logDeviceStatus`，以及 JVM 侧 `D3D12GpuBuffer` | 不专门写报告；只有后续任意一个会失败的调用把它变成上表第二行 | 无 | 不主动退出，见 1.4 |
@@ -39,10 +39,9 @@ D3D12 的失败一旦落进这一层，就会静默变成一次 OpenGL 启动：
    异常一路冒到 `Main.main` 的 `catch (Throwable)`；`CrashReport.forThrowable` 会复用我们这份报告，
    最后 `Minecraft.crash(...)` 写出 `crash-reports/` 并弹出崩溃报告界面。
 
-`crash` 的调用点只有三处，都在 `D3D12Backend.kt`：`createWindow` 里 `SDL_CreateWindow` 返回 0、
-`[debug] failDevice` 打开的故意失败钩子、以及 `createDevice` 末尾的 `catch (t: Throwable)`。
-进入 `catch` 前会先 `device.close()`（自检阶段的 catch 里），并打两条 ERROR：
-`D3D12 self-test failed`（带栈）与 `D3D12 failure is fatal by design: no GL/Vulkan fallback, …`。
+`crash` 的调用点只有两处，都在 `D3D12Backend.kt`：`createWindow` 里 `SDL_CreateWindow` 返回 0，
+以及 `createDevice` 末尾的 `catch (t: Throwable)`。初始化失败会打出
+`D3D12 initialization failed`（带栈）与 `D3D12 failure is fatal by design: no GL/Vulkan fallback, …`。
 
 `resetPreferredGraphicsApi` 有两条实现，取决于 `Minecraft` 实例是否已经存在：
 
@@ -136,7 +135,7 @@ watchdog 杀掉（watchdog 只看 `Render thread` 在不在），只能由用户
 | 字段 | 值从哪来 | 为什么 D3D12 问题非要它 |
 | --- | --- | --- |
 | description（标题） | 常量 `TITLE`：`DXRMC: the Direct3D 12 backend failed to initialise; the preferred graphics API is back to default` | 报告列表/首屏就能看出「不是随便哪个 mod 崩了」，并顺带告知设置已被复位 |
-| `Failure` | `crash` 的 `what` 形参：`SDL_CreateWindow failed for DX12 (video driver: …)`、`DX12 self-test failed: <异常>`、`simulated Direct3D 12 device failure ([debug] failDevice = true)` | 具体失败点。自检失败时 `what` 里带的是异常 `toString()`，因此包含原生返回码 |
+| `Failure` | `crash` 的 `what` 形参：`SDL_CreateWindow failed for DX12 (video driver: …)` 或 `DX12 initialization failed: <异常>` | 具体失败点，异常 `toString()` 会保留原生返回码 |
 | `Fallback` | 固定文案：`disabled by DXRMC: Direct3D 12 is the only backend offered, so the game does not silently continue on OpenGL/Vulkan` | 直接堵住「为什么不自动换 GL」这个最常见疑问，也说明这是**策略**不是缺陷 |
 | `preferredGraphicsBackend` | 复位函数的返回值，形如 `reset "d3d12" -> "default", marked startedCleanly …, and saved options.txt (…)` | 下一次启动到底会试哪个后端、为什么不会再被改成 opengl |
 | `Next launch` | 固定文案：设置已被 DXRMC 自己复位、本次崩溃按「已处理关停」记录，所以原版的不洁关停保护不会强推 OpenGL；要再试 D3D12 请去「选项 → 视频设置」重新选 | 避免用户以为「DXRMC 自己关掉了 D3D12」 |
@@ -203,8 +202,7 @@ watchdog 杀掉（watchdog 只看 `Render thread` 在不在），只能由用户
   报告与 `ReportedException` 照旧。
 - 已弃用的逃生口（不作为唯一入口）：系统属性 `-Ddxrmc.noPopup=true`；Gradle 侧的 `-Pdxrmc.noPopup`
   转发成它。`D3D12Settings` 里这两条是「或」的关系。
-- 与自动化自检配套：`[debug] failDevice` / `selfTest*` 故意让后端失败时，如果不关弹窗，无人值守的
-  CI / 回归就会停在一个等点击的模态框上。
+- 行为验证不再通过配置项让后端故意失败；独立 probe 进程应使用 `noCrashPopup` 或进程级超时处理模态错误。
 
 ## 4. 日志体系
 
@@ -309,7 +307,7 @@ int formatLogPrefix(char* out, size_t outSize, const char* level, const char* lo
 - **工单号只留在代码注释里**，消息正文里不出现。
 - native 前缀只由 `formatLogPrefix()` 生成；JVM 出口只有 `IllusionLogger`；`MCDR_ABI` 里 FFM 调用失败也走
   `IllusionLogger.warnMessage`。
-- 裸 `fprintf(stderr, …)` 只留给**崩溃旁路**与 JVM 自检，且行首写 `FATAL ` 而不是 `[dx12] `。
+- 裸 `fprintf(stderr, …)` 只留给**崩溃旁路**与 JVM 初始化错误，且行首写 `FATAL ` 而不是 `[dx12] `。
 
 ### 4.6 现存的不一致（复核时优先看）
 
@@ -353,24 +351,14 @@ int formatLogPrefix(char* out, size_t outSize, const char* level, const char* lo
 | `asyncRenderThread` | `true` | 独立渲染线程（acquire/present/fence 等待离主线程） | 关掉是**诊断手段**：怀疑渲染线程与录制线程抢同一个堆时用来隔离；`gameRestart()` |
 | `temporalChain` | `false` | 强制打开时域链（jitter、投影注入、velocity attachment） | 玩法上不需要（选 TAA/DLAA/DLSS 会自动开）；没有 AA 时观察链路用 |
 | `temporalJitter` | `true` | 是否把亚像素 jitter 注入投影矩阵 | 关掉可分离「jitter 错了」与「矩阵错了」 |
-| `selfTestSurface` | `false` | 在真实窗口上建/呈现/销毁一条一次性交换链 | **默认关**：RTSS/Afterburner 会把 OSD 绑到第一条被 Present 的链上，自检链会把它抢走一整个会话；`gameRestart()` |
-| `selfTestMesh` | `false` | mesh shader 自检（DXC 现场编译 → mesh PSO → DispatchMesh → 回读） | 现场编译 HLSL，不放进启动关键路径；`gameRestart()` |
-| `selfTestCompute` | `false` | compute 自检（`cs_6_8` → compute PSO → Dispatch → 回读），同时驱动着色率图像（R8_UINT SRI）自检 | 同上；`gameRestart()` |
-| `meshDiagnostics` | `NONE` | 一次性 mesh 回读隔离：`CLEAR` 只写平色再回读，`PASS` 先跑完整 mesh pass | 区分「回读通路坏了」与「pass 没落到纹理上」；只在取证时开 |
-| `failDevice` | `false` | 故意让建设备第一步就失败 | 端到端验证失败策略（不回退 + 复位设置 + 带说明的崩溃报告）；配合 `noCrashPopup` 用；**不要用来玩游戏** |
 | `noCrashPopup` | `false` | 抑制致命错误对话框，只写崩溃报告 | 自动化运行必备（对话框是模态的，会一直等一个不会到来的点击） |
 
-另外三组**每次启动都会跑**、没有开关的 Java 侧自检：`selfTestJavaResources`、`selfTestCommandLayer`、
-`selfTestPipelines`（在 `D3D12Backend.createDevice` 里无条件调用）。任何一组抛异常都会关设备并走
-`D3D12Fatal.crash("DX12 self-test failed: …")`——所以「什么都没改却启动崩溃」时先看这三组。
+资源、工作图和 ABI 的行为验证位于 `src/probes/`，不在 `D3D12Backend.createDevice` 启动路径执行。
 
 ### 5.3 自动化入口（不是功能开关）
 
 构建脚本里的 `-Pdxrmc.*` 只用于自动化跑测试，按项目约定**不是功能入口**：
 
-- `-Pdxrmc.selfTest=fg-on@20,fg-off@400` → 系统属性 `dxrmc.selfTest`，由
-  `render/presentation/framegen/FrameGenerationSelfTest.install()` 在 tick 上按时间点开关帧生成；没设属性时只做一次
-  `System.getProperty` 就返回，不注册任何监听器。
 - `-Pdxrmc.noPopup` → 系统属性 `dxrmc.noPopup`，等价于 `[debug] noCrashPopup = true` 的已弃用逃生口。
 
 ### 5.4 设备状态取证（无开关）
@@ -396,14 +384,13 @@ JVM 侧（相对 `Illusion\src\main\kotlin\io\github\dxegp\`）：
 | `diagnostics/D3D12VrsDebugEntry.kt` | 独立的 F3 debug entry（`dxr_mc:vrs`），VRS 诊断行可由玩家在 F3+F6 里开关 |
 | `diagnostics/IllusionLogger.kt` | JVM 侧唯一日志出口 + 级别枚举 + 把级别/关停标记/镜像文件路径推给 native |
 | `config/D3D12Settings.kt` | 把配置解析成不可变 `Snapshot`，并用 ABI/环境变量推给 native（建设备前就要的值） |
-| `d3d12/backend/D3D12Backend.kt` | 后端入口：窗口/设备创建、三组无条件自检、失败时调 `D3D12Fatal.crash` |
+| `d3d12/backend/D3D12Backend.kt` | 后端入口：窗口/设备创建、能力契约检查、失败时调 `D3D12Fatal.crash` |
 | `d3d12/ffi/MCDR_ABI.kt` | FFM 绑定；`LOAD_FAILURE`/`isAvailable()` 与日志/诊断相关导出（SetLogLevel、SetLogFile、SetPIX…） |
 | `d3d12/resource/D3D12GpuBuffer.kt` | 识别设备移除（三个 HRESULT）、一次性报告、把 `mcdrLastError` 原文带进异常 |
 | `d3d12/surface/D3D12GpuSurface.kt` | `present()`：blit/呈现推进、帧统计计数、`DXGI_STATUS_OCCLUDED` 等的 JVM 侧表现 |
 | `diagnostics/D3D12PixCaptureController.kt` | F9 键位与 PIX timing 抓帧的启停/帧数预算（配置在按下瞬间读） |
-| `diagnostics/FrameGenerationSelfTest.kt` | 只给自动化用的 tick 钩子（`dxrmc.selfTest` 属性驱动） |
 | `config/IllusionConfig.kt` | `[logging]` / `[debug]` 等全部配置项的定义与中英文注释（配置界面文案来源） |
-| `IllusionClient.kt` | 客户端入口：应用默认日志级别、启动 watchdog、注册 PIX 键位与自检钩子 |
+| `IllusionClient.kt` | 客户端入口：应用默认日志级别、启动 watchdog、注册 PIX 键位 |
 
 native 侧（相对仓库根）：
 

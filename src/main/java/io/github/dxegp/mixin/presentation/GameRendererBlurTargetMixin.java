@@ -7,6 +7,8 @@ import net.minecraft.client.renderer.GameRenderer;
 import org.objectweb.asm.Opcodes;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
  * GUI 背景模糊要作用在 GUI 自己的目标上。
@@ -16,6 +18,11 @@ import org.spongepowered.asm.mixin.injection.At;
  */
 @Mixin(GameRenderer.class)
 public class GameRendererBlurTargetMixin {
+    @Inject(method = "processBlurEffect", at = @At("HEAD"), remap = false)
+    private void illusionPrepareBlurBackdrop(CallbackInfo callback) {
+        D3D12GUISplit.prepareBlurBackdrop();
+    }
+
     @ModifyExpressionValue(method = "processBlurEffect", at = @At(value = "FIELD",
                      target = "Lnet/minecraft/client/renderer/GameRenderer;" +
                              "mainRenderTarget:Lcom/mojang/blaze3d/pipeline/RenderTarget;",

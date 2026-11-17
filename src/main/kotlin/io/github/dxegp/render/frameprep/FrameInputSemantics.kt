@@ -3,11 +3,31 @@ package io.github.dxegp.render.frameprep
 internal enum class MotionCoverage {
     CAMERA_REPROJECTION,
     CAMERA_WITH_ENTITY_TRANSLATION_APPROXIMATION,
+    CAMERA_WITH_RASTER_ENTITY_MODELS,
+}
+
+/**
+ * Facts available for an object motion guide. An entity row can improve camera
+ * reprojection without being a complete per-pixel guide.
+ */
+internal enum class MotionGuideCoverage {
+    CAMERA_ONLY,
+    ENTITY_TRANSLATION_AABB_APPROXIMATION,
+    PART_TRANSFORM_UNAVAILABLE,
+    RASTER_COVERAGE_UNAVAILABLE,
+    CPU_ENTITY_MODEL_RASTER_PARTIAL,
+    INVALID,
 }
 
 internal enum class ProviderMaskSemantic {
     FSR_REACTIVE,
+    FSR_TRANSPARENCY_AND_COMPOSITION,
     XESS_RESPONSIVE,
+}
+
+internal enum class ProviderMaskHistory {
+    UNAVAILABLE,
+    COMPATIBLE,
 }
 
 internal object FrameInputCoordinates {
@@ -15,7 +35,7 @@ internal object FrameInputCoordinates {
     const val PRE_EXPOSURE = 1.0f
     const val DEPTH_CLEAR = 0.0f
     const val MOTION_INCLUDES_JITTER = false
-    const val HAS_COMPOSITION_MASK = false
+    const val HAS_COMPOSITION_MASK = true
 
     fun sdkJitter(jitterX: Float, jitterY: Float): FloatArray = floatArrayOf(jitterX, -jitterY)
 
@@ -30,17 +50,14 @@ internal object FrameInputCoordinates {
         return floatArrayOf(minOf(first, second), maxOf(first, second))
     }
 
-    fun previousFrameCompatible(capturedSequence: Long, currentSequence: Long,
+    fun previousFrameCompatible(capturedFrameId: Long, currentFrameId: Long,
+        capturedWorldEpoch: Long, currentWorldEpoch: Long,
+        capturedResourceVersion: Long, currentResourceVersion: Long,
         capturedGeneration: Long, currentGeneration: Long, capturedWorld: Any?, currentWorld: Any?,
-        capturedProjection: FloatArray?, currentProjection: FloatArray?,
-        capturedView: FloatArray?, currentView: FloatArray?, capturedCamera: DoubleArray?,
-        currentCamera: DoubleArray, capturedWidth: Int, capturedHeight: Int, width: Int, height: Int): Boolean =
-        capturedWorld != null && capturedWorld === currentWorld &&
-            (capturedSequence == currentSequence || capturedSequence + 1L == currentSequence) &&
-            capturedGeneration == currentGeneration &&
-            capturedProjection != null && capturedProjection.contentEquals(currentProjection) &&
-            capturedView != null && capturedView.contentEquals(currentView) &&
-            capturedCamera != null && capturedCamera.all(Double::isFinite) &&
-            capturedCamera.contentEquals(currentCamera) &&
-            width > 0 && height > 0 && capturedWidth == width && capturedHeight == height
+    ): Boolean = capturedWorld != null && capturedWorld === currentWorld &&
+        capturedFrameId > 0L && currentFrameId > capturedFrameId && currentFrameId - capturedFrameId == 1L &&
+        capturedWorldEpoch > 0L && capturedWorldEpoch == currentWorldEpoch &&
+        capturedResourceVersion > 0L && capturedResourceVersion == currentResourceVersion &&
+        capturedGeneration == currentGeneration
+
 }

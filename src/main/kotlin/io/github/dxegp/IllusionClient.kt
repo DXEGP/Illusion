@@ -5,7 +5,7 @@ import io.github.dxegp.Illusion.Companion.MOD_NAME
 import io.github.dxegp.diagnostics.D3D12PixCaptureController
 import io.github.dxegp.diagnostics.D3D12ExitWatchdog
 import io.github.dxegp.diagnostics.IllusionLogger
-import io.github.dxegp.diagnostics.FrameGenerationSelfTest
+import io.github.dxegp.render.config.RenderConfiguration
 import net.neoforged.api.distmarker.Dist
 import net.neoforged.fml.ModContainer
 import net.neoforged.fml.common.Mod
@@ -24,6 +24,7 @@ class IllusionClient(container: ModContainer) {
     init {
         // Apply log level in the init stage in order to correctly start the logger.
         IllusionLogger.applyDefaults()
+        RenderConfiguration.initialize()
         container.registerExtensionPoint(
             IConfigScreenFactory::class.java,
             IConfigScreenFactory { modContainer, parent -> ConfigurationScreen(modContainer, parent) }
@@ -37,8 +38,6 @@ class IllusionClient(container: ModContainer) {
         // here (the binding is one), but there is nothing to gain from crashing if it is.
         container.eventBus?.let {
             D3D12PixCaptureController.register(it)
-            // 仅当传了 -Pdxrmc.selfTest=… 才挂 tick 钩子（不设属性就什么都不做）。
-            FrameGenerationSelfTest.install()
         }
     }
 }

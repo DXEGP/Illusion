@@ -28,15 +28,14 @@ D3D12Settings（Snapshot：解析、缓存、推给 native）
         │  val xxx get() = snapshot().xxx
         ▼
 D3D12VideoSettingsScreen / D3D12VideoSettingsContent / D3D12Widgets
-        │  stage → commit → OptionInstance.set → options.save()
+        │  stage → RenderConfiguration.request → Prepare / Commit / Publish
         ▼
-options.txt + native（专用 ABI 函数）
+applied → Option/UI；完整 Published → persistent → settingsToSave → options.txt
 ```
 
 视频设置项为什么不放进 toml：它们必须是原版 `OptionInstance` 才能复用原版的取值集合与格式化
 键（如 `options.percent_value`）；但它们不是 `Options` 的字段，原版 `processDumpedOptions` 遍历
-看不到，所以由 `OptionsRenderOptionsMixin` 在 `Options.load`/`save` 的 `TAIL` 上按 `键:值` 行
-手工读写同一个文件。「应用」按钮只做「写回 OptionInstance + `options.save()`」，与 toml 无关。
+看不到，所以由 Kotlin `OptionsRenderOptionsMixin` 在 `Options.load`/`save` 的 TAIL 按 `键:值` 行读写同一文件。loadSavedSettings 包住 AA 与其余项的一次批量加载，全部读入后归一化 requested 并初始化 persistent；AA/比例/DLSS/SR/FG 保存时统一读 settingsToSave。应用通过真实配置候选发布，临时 resize NONE applied 保持可渲染，磁盘仍保存 persistent。详细契约见 [渲染配置](../../rendering/render-configuration.md)。
 
 ---
 
@@ -46,8 +45,8 @@ options.txt + native（专用 ABI 函数）
 
 `Illusion.kt` 的 `init` 里 `modContainer.registerConfig(ModConfig.Type.CLIENT, IllusionConfig.SPEC)`
 ——客户端类型决定文件名 `config/dxr_mc-client.toml`。字段在文件顶部只做类型声明，真正的定义集中
-在同一个 `init` 块里按节 `push`/`pop`。文件顶部另有全部枚举（`CommandBundleMode`、
-`DlssImplementation`、`DlssFrameGeneration`、`SrBackend`、`HdrMode`、`RtMode`、`MeshDiagnostics`），
+在同一个 `init` 块里按节 `push`/`pop`。文件顶部另有全部枚举（`DlssImplementation`、
+`DlssFrameGeneration`、`SrBackend`、`HdrMode`、`RtMode`），
 因为 `defineEnum` 需要类型；枚举常量上的 KDoc 是「这个取值意味着什么」的第一现场。
 
 ### 2.2 八节
@@ -55,13 +54,13 @@ options.txt + native（专用 ABI 函数）
 | 节 | 键前缀 | 管什么 | 生效粒度 |
 | --- | --- | --- | --- |
 | `[logging]` | `dxr_mc.configuration.logging` | 日志级别、native 详细日志、关停追踪、落盘 | 重载即可 |
-| `[renderer]` | `…renderer` | GL 上下文逃生口、异步录制、命令 bundle、HDR、交换链、锐化 | 混合：多数要重启 |
+| `[renderer]` | `…renderer` | GL 上下文逃生口、HDR、交换链、锐化 | 混合：按实际读取点判断 |
 | `[dlss]` | `…dlss` | DLSS 实现、输出交接、Reflex 限帧、帧生成 | 实现选择要重启 |
 | `[sr]` | `…sr` | 超分后端（NONE/DLSS/FSR/XeSS）、锐度、响应遮罩 | 下一帧 |
 | `[raytracing]` | `…raytracing` | 光追可见性分层 | 下一帧 |
 | `[mesh]` | `…mesh` | mesh 地形与 amplification 剔除 | 代码中未明确 |
 | `[vrs]` | `…vrs` | 逐图元距离带、着色率图像参数 | 每个地形批次 |
-| `[debug]` | `…debug` | PIX、调试层、自检、HLSL 落盘、崩溃弹窗 | 多数要重启 |
+| `[debug]` | `…debug` | PIX、调试层、HLSL 落盘、崩溃弹窗 | 多数要重启 |
 
 节注释是粗粒度说明，**逐项以字段自己的 `comment` 与 `gameRestart()` 为准**：`[renderer]` 的节
 注释写「改一个值需要重启游戏」，但 `hdr`、`allowTearing`、`presentChildWindow` 三项都没有
@@ -116,18 +115,19 @@ ABI 推过去。
 
 ### 3.2 Snapshot 的形状
 
+无实际调用方的 `asyncCommandLists`、`asyncWorkers`、`commandBundles` 及其旧来源覆盖已移除。保留的 `[debug] asyncRenderThread` 控制设备实际创建的提交/呈现线程；它不启用并行 bundle 录制，也不由已删除的 worker 配置控制。
+
 ```kotlin
 private class Snapshot(
     val glContext: Boolean,
-    val asyncCommandLists: Boolean,
-    val asyncWorkers: Int,
+    val asyncRenderThread: Boolean,
     // ……每个开关一个 val
 )
 
 @Volatile private var snapshot: Snapshot? = null
 @Volatile private var pushed: String? = null
 
-val asyncWorkers: Int get() = snapshot().asyncWorkers
+val asyncRenderThread: Boolean get() = snapshot().asyncRenderThread
 ```
 
 构造参数就是全部开关，**新增开关先加构造参数**，编译器会提示漏项。对外一律只读属性
@@ -137,7 +137,7 @@ val asyncWorkers: Int get() = snapshot().asyncWorkers
 ### 3.3 为什么快照
 
 `build()` 的注释给了理由：渲染器在逐帧路径上读这些开关，而 `ModConfigSpec.get()` 带校验与转换
-并不便宜；渲染线程与录制 worker 又并发读，不可变对象 + `@Volatile` 发布是最省事的安全做法。
+并不便宜；不可变对象 + `@Volatile` 发布为实际配置读取方提供一致快照。当前 JVM 不创建 bundle 录制 worker。
 
 ### 3.4 早读不缓存
 
@@ -184,17 +184,14 @@ glContext = config(false) { IllusionConfig.GL_CONTEXT.get() } ||
     File("gl_context.flag").exists(),
 ```
 
-两条规则缺一不可：**只在配置仍是默认值时才看旧来源**（例如 `asyncWorkers` 只在配置等于 8 时
-才允许 `DX12_ASYNC_WORKERS` 覆盖），否则玩家在 toml 里的选择会被环境变量无声压掉；**每个 key
+两条规则缺一不可：**只在配置仍是默认值时才看旧来源**，否则玩家在 toml 里的选择会被环境变量无声压掉；**每个 key
 只 warn 一次**（`legacy(...)` + 并发 `warned` 集合），日志里说明该来源已弃用。
 
-历史清单：`DXR_MC_GL_CONTEXT`、`gl_context.flag`、`dxrmc.noApi`、`DX12_ASYNC`、
-`backend.async`、`DX12_ASYNC_WORKERS`、`backend.async.workers`、`DX12_BUNDLE_MODE`、
-`backend.bundleMode`、`dxrmc.sharpen`、`MCDR_DLSS_IMPL`、`MCDR_STREAMLINE`、
+当前兼容来源包括：`DXR_MC_GL_CONTEXT`、`gl_context.flag`、`dxrmc.noApi`、
+`dxrmc.sharpen`、`MCDR_DLSS_IMPL`、`MCDR_STREAMLINE`、
 `MCDR_REFLEX_FRAME_LIMIT_US`、`dxrmc.dlssOutput`、`DX12_DEBUG_LAYER`、`DX12_PROF`、
 `D3D12_LOG_VERBOSE`、`DXR_MC_SKIP_GL_SWAP`、`DX12_NO_ASYNC`、`dxrmc.temporal`、
-`dxrmc.temporal.jitter`、`dxrmc.selfTest*`、`dxrmc.failDevice`、`dxrmc.noPopup`、
-`DX12_MESH_DIAG`、`DX12_NATIVE_LOG_FILE`。
+`dxrmc.temporal.jitter`、`dxrmc.noPopup`、`DX12_NATIVE_LOG_FILE`。
 
 ---
 
@@ -204,7 +201,7 @@ glContext = config(false) { IllusionConfig.GL_CONTEXT.get() } ||
 | --- | --- | --- | --- |
 | 逐次直读 | 每次用到都读 `IllusionConfig`，不经快照 | VRS 距离带（每地形批次）、PIX 捕获帧数（按键时）、日志级别 | 下一次用到 |
 | 快照级 | `D3D12Settings.snapshot()` | 锐化强度、帧生成倍率、光追模式、超分后端 | 配置重载事件 → 下次读属性 |
-| 创建级 | 设备/交换链创建时消费一次 | 调试层、GL 上下文、异步录制、DLSS 实现、HDR、交换链选项 | 必须重启（或重建交换链） |
+| 创建级 | 设备/交换链创建时消费一次 | 调试层、GL 上下文、实际 asyncRenderThread、DLSS 实现、HDR、交换链选项 | 必须重启（或重建交换链） |
 
 界面侧的 `OptionInstance` 是第四种：commit 之后立刻 `set()`，回调直接改状态/推 native，所以
 「点应用就生效」；落盘由 `options.save()` 负责，与 toml 无关。
@@ -225,13 +222,11 @@ glContext = config(false) { IllusionConfig.GL_CONTEXT.get() } ||
 | 键 | 为什么 |
 | --- | --- |
 | `[renderer] glContext` | 窗口创建方式（`GLFW_NO_API` 还是真 GL 上下文）在建窗口时定死 |
-| `[renderer] asyncCommandLists` / `asyncWorkers` / `commandBundles` | 录制线程池在渲染器启动时建立 |
 | `[dlss] implementation` | DLSS 后端在第一次 evaluate 前选定 |
 | `[debug] debugLayer` | 调试层是设备创建参数 |
 | `[debug] asyncRenderThread` | 专用渲染线程在启动时创建 |
 | `[debug] pixCapture` / `pixDirectory` | PIX 捕获层必须在第一个 D3D12 设备之前加载 |
-| `[debug] selfTest*` / `failDevice` | 启动路径上执行一次的自检 |
-| `[debug] meshDiagnostics` | 一次性隔离测试，设备建好后不再读 |
+行为验证不通过配置项触发；独立 probe 位于 `src/probes/`，不改变玩家配置或启动路径。
 
 不需要重启：
 
@@ -353,12 +348,16 @@ D3D12VideoSettingsPage(
 
 ### 6.5 暂存、应用、撤销
 
+```mermaid
+flowchart LR
+    Stage[控件暂存] --> Request[requested]
+    Request --> Prepare[FG Prepare → SR Prepare → Commit]
+    Prepare --> Applied[applied 与 Option/UI]
+    Applied -->|完整 Published| Persist[persistent → settingsToSave → save]
+    Request -->|主菜单等待世界| Wait[AwaitingWorld: 结束UI回调并保留请求]
 ```
-点击 → stage(value)     → 控件画 pendingValue，并显示「有改动」
-应用 → commitPending()  → OptionInstance.set() → options.save()
-撤销 → clearPending()   → 回到 OptionInstance 的当前值
-关闭 → clearPending()   → 回父界面（关闭不等于应用）
-```
+
+主菜单选择 SR 时显示“超分设置已暂存，进入世界后应用；成功后保存”，可正常关闭、重开设置。取消仍在忙的提交恢复 persistent；若它与当前临时 applied 不同，继续准备恢复。首次 Options 读取的磁盘偏好在等待世界和临时 resize 期间保持。
 
 `hasChanges()` 决定底部按钮：有改动时是「应用 / 撤销」，无改动时「应用」变成「完成」（点它等于
 关闭），撤销隐藏。切页或窗口变化会重建行列表，重建时用 `pendingOrNull()` 收集、`stageExternal()`
@@ -436,9 +435,7 @@ D3D12VideoSettingsPage(
    `SliderableValueSet`（需要 `toSliderValue` / `fromSliderValue` / `next` / `previous`）。
 2. 决定显示名格式：循环按钮由原版 `CycleButton` 自动加「标题: 值」前缀，所以 `valueToString`
    只返回值；滑条没有这个前缀，得自己用 `options.percent_value` 之类格式化。
-3. 持久化：若不是 `Options` 字段，在 `OptionsRenderOptionsMixin` 的 `load`/`save` `TAIL` 加一行，
-   并实现 `load(file)`/`save(file)`（按 `键:值` 行读写，save 先删同键旧行再追加）。`load` 里要
-   处理「`Options.load` 期间 `set` 不触发回调」，通常手动补一次推 native。
+3. 持久化：若不是 Options 字段，在 Kotlin OptionsRenderOptionsMixin 的 loadSavedSettings 批次和 save 尾部各加入对应业务读写。受 RenderConfiguration 管理的设置由 request 接收，批量加载结束后统一归一化；save 读取 settingsToSave，不直接读临时 applied 或控件值。
 4. 加进页面：在 `D3D12VideoSettingsContent` 对应页的 `entries` 里加 `Setting(option)`，需要解释
    就加 `Note(text, warning)`。
 5. 可用性判据用 `D3D12AdapterInfo.current != null`（设备真的建起来），不要用配置里的首选后端。
@@ -489,10 +486,7 @@ D3D12VideoSettingsPage(
 
 ### 8.6 窗口重建与渲染目标
 
-渲染缩放改变会重建主渲染目标，这是选项回调自己的动作，界面只负责 `set()`，不要自己调重建。
-DLAA 要求渲染分辨率等于目标分辨率，所以选中 DLAA 时缩放强制 100 并锁定；实现方式是让取值集合
-无论怎么拖都返回 100，而不是隐藏滑条——原版控件是建界面时按取值集合造好的，隐藏要走列表重建，
-工程里没有干净入口。
+渲染比例变化由 RenderConfiguration 准备新世界附件与 provider，组合 Commit 后发布。resize 尚未 ready 时先发布匹配新窗口的临时 NONE 配置，persistent 保留完整偏好；同尺寸 SDK 拒绝后暂停，等待新设置或新尺寸。DLAA 的 100% 由配置归一化确定，小窗口的实际输入比例由 Applied 独立记录。
 
 ### 8.7 只读行的视觉
 
@@ -526,12 +520,13 @@ false 都会在下一帧被拉回），不是只在首帧设一次——只设�
 | `client/settings/D3D12VideoSettingsContent.kt` | 四个页面的内容、条目类型、灰化联动与取值过滤 |
 | `client/settings/D3D12Widget.kt` | 控件基类、`WidgetRenderer`（提取器的 alpha/scissor 封装）、调色板 |
 | `client/settings/D3D12Widgets.kt` | 标题/分组/说明/页签/二级页签/设置行/按钮七种控件 |
-| `render/resolution/D3D12RenderScale.kt` | 渲染缩放选项、25% 步进取值集合、DLAA 锁定 |
-| `render/antialiasing/D3D12AntiAliasing.kt` | 抗锯齿选项（原版取值集合上的 `OptionInstance`） |
+| `render/resolution/D3D12RenderScale.kt` | 渲染缩放选项、取值集合与配置请求 |
+| `render/antialiasing/D3D12AntiAliasing.kt` | 抗锯齿选项与配置请求 |
+| `render/config/RenderConfiguration.kt` | requested/applied/persistent、批量加载、候选发布与可保存设置 |
 | `render/presentation/latency/NvidiaReflex.kt` | Reflex 三档选项、`options.txt` 读写、与帧生成的互锁 |
 | `…FrameGeneration`、`…SuperResolution` | 帧生成/超分的后端选择与状态行，向界面提供实时状态 |
 | `Illusion/src/main/java/io/github/dxegp/mixin/options/OptionsScreenVideoMixin.java` | 把原版「视频设置…」按钮换成自绘界面 |
-| `mixin/options/OptionsRenderOptionsMixin.java` | 在 `Options.load`/`save` 上读写视频设置项的 `options.txt` 行，并补一票重启提示 |
+| `mixin/options/OptionsRenderOptionsMixin.kt` | Kotlin 统一加载 AA 及其余设置，建立 persistent；保存各业务配置并补 HDR 重启提示 |
 | `mixin/options/VideoSettingsScreenOptionsAccessor.java` | 取出原版三个私有选项数组 |
 | `mixin/options/OptionInstanceAccessor.java`、`TooltipAccessor.java` | 读 `OptionInstance` 的 tooltip（Kotlin 侧看不到织入接口） |
 | `mixin/diagnostics/MinecraftRenderFrameProfMixin.java` | 每帧调用「改进的透明」的强制开启 |

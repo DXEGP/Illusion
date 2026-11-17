@@ -19,9 +19,6 @@ object D3D12Settings {
 
     private class Snapshot(
         val glContext: Boolean,
-        val asyncCommandLists: Boolean,
-        val asyncWorkers: Int,
-        val commandBundles: CommandBundleMode,
         val sharpenAmount: Float,
         val taaSharpenAmount: Float,
         val dlssImplementation: DlssImplementation,
@@ -40,11 +37,6 @@ object D3D12Settings {
         val asyncRenderThread: Boolean,
         val temporalChain: Boolean,
         val temporalJitter: Boolean,
-        val selfTestSurface: Boolean,
-        val selfTestMesh: Boolean,
-        val selfTestCompute: Boolean,
-        val failDevice: Boolean,
-        val meshDiagnostics: MeshDiagnostics,
         val noCrashPopup: Boolean,
         val nativeLogFile: String,
         val pixTimingCapture: Boolean,
@@ -75,12 +67,6 @@ object D3D12Settings {
 
     /** 保留一个真 GL 上下文（否则向 GLFW 要 `GLFW_NO_API`）；设备创建前读。 */
     val glContext: Boolean get() = snapshot().glContext
-
-    val asyncCommandLists: Boolean get() = snapshot().asyncCommandLists
-
-    val asyncWorkers: Int get() = snapshot().asyncWorkers
-
-    val commandBundles: CommandBundleMode get() = snapshot().commandBundles
 
     val sharpenAmount: Float get() = snapshot().sharpenAmount
 
@@ -119,17 +105,6 @@ object D3D12Settings {
     val temporalChain: Boolean get() = snapshot().temporalChain
 
     val temporalJitter: Boolean get() = snapshot().temporalJitter
-
-    /** 自检链会抢走 RTSS/Afterburner 绑定的第一条呈现交换链，所以默认关。 */
-    val selfTestSurface: Boolean get() = snapshot().selfTestSurface
-
-    val selfTestMesh: Boolean get() = snapshot().selfTestMesh
-
-    val selfTestCompute: Boolean get() = snapshot().selfTestCompute
-
-    val failDevice: Boolean get() = snapshot().failDevice
-
-    val meshDiagnostics: MeshDiagnostics get() = snapshot().meshDiagnostics
 
     val noCrashPopup: Boolean get() = snapshot().noCrashPopup
 
@@ -207,13 +182,6 @@ object D3D12Settings {
             fallback
         }
 
-        val asyncWorkerLegacy =
-            (System.getenv("DX12_ASYNC_WORKERS") ?: System.getProperty("backend.async.workers"))
-                ?.trim()?.toIntOrNull()
-
-        val bundleModeLegacy = (System.getenv("DX12_BUNDLE_MODE") ?: System.getProperty("backend.bundleMode"))
-            ?.trim()?.lowercase()
-
         val legacySharpen = System.getProperty("dxrmc.sharpen")?.toFloatOrNull()
             ?.takeUnless { it.isNaN() }
             ?.coerceIn(0.0f, 1.0f)
@@ -231,26 +199,6 @@ object D3D12Settings {
                     System.getProperty("dxrmc.noApi") == "false" ||
                         System.getenv("DXR_MC_GL_CONTEXT") == "1" ||
                         File("gl_context.flag").exists()
-                },
-            asyncCommandLists = config(true) { IllusionConfig.ASYNC_COMMAND_LISTS.get() } &&
-                !legacy("asyncCommandLists") {
-                    System.getenv("DX12_ASYNC")?.trim() == "0" ||
-                        System.getProperty("backend.async") == "0"
-                },
-            asyncWorkers = config(8) { IllusionConfig.ASYNC_WORKERS.get() }
-                .let { configured ->
-                    if (configured == 8 && asyncWorkerLegacy != null) asyncWorkerLegacy else configured
-                }
-                .coerceIn(1, 8),
-            commandBundles = config(CommandBundleMode.AUTO) { IllusionConfig.COMMAND_BUNDLES.get() }
-                .takeUnless {
-                    it == CommandBundleMode.AUTO &&
-                        legacy("commandBundles") { bundleModeLegacy != null }
-                }
-                ?: when (bundleModeLegacy) {
-                    "serial", "1" -> CommandBundleMode.SERIAL
-                    "parallel", "0" -> CommandBundleMode.PARALLEL
-                    else -> CommandBundleMode.AUTO
                 },
             sharpenAmount = legacySharpen
                 ?: config(0.67f) { IllusionConfig.SHARPEN_AMOUNT.get().toFloat() },
@@ -287,21 +235,6 @@ object D3D12Settings {
                 legacy("temporalChain") { System.getProperty("dxrmc.temporal") == "true" },
             temporalJitter = config(true) { IllusionConfig.TEMPORAL_JITTER.get() } &&
                 !legacy("temporalJitter") { System.getProperty("dxrmc.temporal.jitter") == "false" },
-            selfTestSurface = config(false) { IllusionConfig.SELF_TEST_SURFACE.get() } ||
-                legacy("selfTestSurface") { System.getProperty("dxrmc.selfTestSurface") == "true" },
-            selfTestMesh = config(false) { IllusionConfig.SELF_TEST_MESH.get() } ||
-                legacy("selfTestMesh") { System.getProperty("dxrmc.selfTestMesh") == "true" },
-            selfTestCompute = config(false) { IllusionConfig.SELF_TEST_COMPUTE.get() } ||
-                legacy("selfTestCompute") { System.getProperty("dxrmc.selfTestCompute") == "true" },
-            failDevice = config(false) { IllusionConfig.FAIL_DEVICE.get() } ||
-                legacy("failDevice") { System.getProperty("dxrmc.failDevice") == "true" },
-            meshDiagnostics = config(MeshDiagnostics.NONE) { IllusionConfig.MESH_DIAGNOSTICS.get() }
-                .takeUnless { it == MeshDiagnostics.NONE }
-                ?: when (System.getenv("DX12_MESH_DIAG")?.trim()?.lowercase()) {
-                    "clear" -> MeshDiagnostics.CLEAR
-                    "pass" -> MeshDiagnostics.PASS
-                    else -> MeshDiagnostics.NONE
-                },
             noCrashPopup = config(false) { IllusionConfig.NO_CRASH_POPUP.get() } ||
                 legacy("noCrashPopup") { System.getProperty("dxrmc.noPopup") == "true" },
             nativeLogFile = config("") { IllusionConfig.NATIVE_LOG_FILE.get() }

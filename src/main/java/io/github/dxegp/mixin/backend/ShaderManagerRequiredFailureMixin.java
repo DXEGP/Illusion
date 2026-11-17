@@ -2,6 +2,8 @@ package io.github.dxegp.mixin.backend;
 
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+import com.mojang.blaze3d.systems.RenderSystem;
+import io.github.dxegp.d3d12.device.D3D12Device;
 import net.minecraft.CrashReport;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.ShaderManager;
@@ -11,10 +13,9 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 
 /**
- * 必需着色器管线编译失败时，把"静默黑屏"升级成真正的崩溃。
+ * 首次加载必需管线失败时报告崩溃，重载失败保留上一代已发布管线。
  *
- * <p>原版那条 `RuntimeException` 发生在资源重载线程上，被 `SimpleReloadInstance` 记进日志就结束、
- * 渲染线程继续跑；但 `apply` 已经把管线缓存丢掉，玩家看到的是一整块黑屏。
+ * <p>资源重载只在全部必需管线成功后发布新缓存；加载错误继续交给原版重载流程处理。
  *
  * <p>必须包 `NEW` 而不是改方法签名：`apply` 的参数类型 `ShaderManager$PendingResults` 是私有内部
  * record，Java 侧写不出来（用 `Object` 会被 Mixin 判为 invalid signature）。
@@ -34,9 +35,13 @@ public class ShaderManagerRequiredFailureMixin {
         Operation<RuntimeException> original) {
         RuntimeException thrown = original.call(message);
         if (message != null && message.startsWith(REQUIRED_PREFIX)) {
-            LOGGER.error("A required render pipeline failed to load and no pipeline cache is left for the render thread, which can only end in a black screen, so this is escalated to a crash."
-                + " The usual cause is that the build output is missing its shader resources:"
-                + " delete Illusion\\build\\resources\\main and re-run processResources.\n{}", message);
+            if (RenderSystem.tryGetDevice() instanceof FrontendGpuDeviceBackendAccessor frontend
+                && frontend.illusionBackend() instanceof D3D12Device backend
+                && backend.getPipelines().hasPublishedPipelineCache()) {
+                LOGGER.error("Required render pipeline reload failed; keeping the published pipeline cache.\n{}", message);
+                return thrown;
+            }
+            LOGGER.error("Initial required render pipeline loading failed; no published pipeline cache is available.\n{}", message);
             Minecraft minecraft = Minecraft.getInstance();
             if (minecraft != null) {
                 minecraft.delayCrash(CrashReport.forThrowable(thrown, "Loading required render pipelines"));

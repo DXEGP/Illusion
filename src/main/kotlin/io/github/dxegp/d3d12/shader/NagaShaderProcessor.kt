@@ -7,6 +7,7 @@ import com.google.gson.annotations.SerializedName
 import com.mojang.renderpearl.api.pipeline.ShaderType
 import com.mojang.renderpearl.util.ShaderCompileException
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
+import java.security.MessageDigest
 
 data class D3D12ShaderIo(
     val name: String,
@@ -61,38 +62,46 @@ data class D3D12ShaderManifest(
 data class D3D12ShaderConversion(val hlsl: String, val manifest: D3D12ShaderManifest)
 
 internal object NagaShaderProcessor {
+    const val MANIFEST_SCHEMA = "illusion.shader-manifest/1"
     private val gson = Gson()
+    private val fingerprint by lazy {
+        val digest = MessageDigest.getInstance("SHA-256")
+        javaClass.getResourceAsStream("/illusion_shader.dll")?.use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        } ?: error("Required compiler library is not packaged: illusion_shader.dll")
+        "illusion-naga-bridge/1;abi=1;sha256=" +
+            digest.digest().joinToString("") { "%02x".format(it.toInt() and 255) }
+    }
 
-    fun convert(
-        filename: String,
-        source: String,
-        stage: ShaderType,
-        bindings: Map<String, Int> = emptyMap(),
-        vertexAttributes: List<String> = emptyList(),
-        vertexOutputs: List<D3D12ShaderIo> = emptyList(),
-        flipY: Boolean = false,
-        flipTexcoord: Boolean = false,
-    ): D3D12ShaderConversion {
+    fun toolFingerprint(): String = fingerprint
+
+    fun convert(input: ShaderConversionRequest): D3D12ShaderConversion {
+        val filename = input.filename
         val request = JsonObject().apply {
             addProperty("path", filename)
-            addProperty("source", source)
-            addProperty("stage", if (stage == ShaderType.FRAGMENT) "fragment" else "vertex")
+            addProperty("source", input.source)
+            addProperty("stage", if (input.stage == ShaderType.FRAGMENT) "fragment" else "vertex")
             addProperty("shader_model", "6_9")
             addProperty("register_layout", "host")
             addProperty("push_constant_register", D3D12RootConstantLayoutContract.REGISTER)
             addProperty("push_constant_space", D3D12RootConstantLayoutContract.SPACE)
-            add("bindings", gson.toJsonTree(bindings))
-            add("vertex_attributes", gson.toJsonTree(vertexAttributes))
-            add("fragment_inputs", gson.toJsonTree(vertexOutputs.associate { it.name to it.location }))
-            add("vertex_outputs", gson.toJsonTree(vertexOutputs.map { output ->
+            add("bindings", gson.toJsonTree(input.bindings))
+            add("vertex_attributes", gson.toJsonTree(input.vertexAttributes))
+            add("fragment_inputs", gson.toJsonTree(input.vertexOutputs.associate { it.name to it.location }))
+            add("vertex_outputs", gson.toJsonTree(input.vertexOutputs.map { output ->
                 JsonObject().apply {
                     addProperty("location", output.location)
                     addProperty("hlsl_type", output.hlslType)
                     output.interpolation?.let { addProperty("interpolation", it) }
                 }
             }))
-            addProperty("flip_y", flipY)
-            if (flipTexcoord) addProperty("flip_texcoord", "texCoord")
+            addProperty("flip_y", input.flipY)
+            if (input.flipTexcoord) addProperty("flip_texcoord", "texCoord")
         }
         try {
             val response = JsonParser.parseString(MCDR_ABI.D3D12ConvertShader(request.toString())).asJsonObject
@@ -100,7 +109,7 @@ internal object NagaShaderProcessor {
                 throw ShaderCompileException("naga: $filename: ${response["message"]?.asString}")
             }
             val manifest = gson.fromJson(response["manifest"], D3D12ShaderManifest::class.java)
-            check(manifest.schema == "illusion.shader-manifest/1") { "Unsupported naga manifest" }
+            check(manifest.schema == MANIFEST_SCHEMA) { "Unsupported naga manifest" }
             return D3D12ShaderConversion(response["hlsl"].asString, manifest)
         } catch (error: ShaderCompileException) {
             throw error

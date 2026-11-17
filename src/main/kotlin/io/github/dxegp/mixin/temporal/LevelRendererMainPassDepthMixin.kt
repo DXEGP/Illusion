@@ -1,6 +1,8 @@
 package io.github.dxegp.mixin.temporal
 
 import com.mojang.renderpearl.api.buffers.GpuBufferSlice
+import com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation
 import io.github.dxegp.render.frame.vanilla.VanillaFrameCoordinator
 import net.minecraft.client.renderer.LevelRenderer
 import net.minecraft.client.renderer.LevelTargetBundle
@@ -18,6 +20,29 @@ abstract class LevelRendererMainPassDepthMixin {
     @Shadow
     @Final
     private lateinit var targets: LevelTargetBundle
+
+    @WrapMethod(method = ["lambda\$addMainPass\$0"], remap = false)
+    private fun illusionWorldPassAbortOnThrow(
+        slice: GpuBufferSlice,
+        firstFlag: Boolean,
+        sections: ChunkSectionsToRender,
+        frame: FeatureRenderDispatcher.PreparedFrame,
+        secondFlag: Boolean,
+        thirdFlag: Boolean,
+        operation: Operation<Any?>,
+    ) {
+        try {
+            operation.call(slice, firstFlag, sections, frame, secondFlag, thirdFlag)
+        } catch (failure: Throwable) {
+            VanillaFrameCoordinator.worldPassAborted(failure)
+            throw failure
+        }
+    }
+
+    @Inject(method = ["lambda\$addMainPass\$0"], at = [At("HEAD")], remap = false)
+    private fun illusionWorldPassStarted(callback: CallbackInfo) {
+        VanillaFrameCoordinator.worldPassStarted()
+    }
 
     @Inject(method = ["lambda\$addMainPass\$0"], at = [At("RETURN")], remap = false)
     private fun illusionWorldPassCompleted(

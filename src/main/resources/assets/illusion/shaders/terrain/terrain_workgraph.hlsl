@@ -130,17 +130,26 @@ void MeshletCull(ThreadNodeInputRecord<TerrainMeshletRecord> input,
     records.OutputComplete();
 }
 
+groupshared uint terrainVisibleBase;
+
 [Shader("node")]
-[NodeLaunch("thread")]
-void EmitVisible(ThreadNodeInputRecord<TerrainMeshletRecord> input) {
-    uint destination;
-    terrainVisible.InterlockedAdd(0u, 1u, destination);
-    if (destination >= terrainCapacity) {
-        uint ignored;
-        terrainVisible.InterlockedOr(4u, 1u, ignored);
-        return;
+[NodeLaunch("coalescing")]
+[NumThreads(64, 1, 1)]
+void EmitVisible([MaxRecords(64)] GroupNodeInputRecords<TerrainMeshletRecord> input,
+    uint thread : SV_GroupIndex) {
+    uint count = input.Count();
+    if (thread == 0u) {
+        terrainVisible.InterlockedAdd(0u, count, terrainVisibleBase);
+        if (terrainVisibleBase >= terrainCapacity || count > terrainCapacity - terrainVisibleBase) {
+            uint ignored;
+            terrainVisible.InterlockedOr(4u, 1u, ignored);
+        }
     }
-    TerrainMeshletRecord meshlet = input.Get();
+    GroupMemoryBarrierWithGroupSync();
+    if (thread >= count) return;
+    uint destination = terrainVisibleBase + thread;
+    if (destination >= terrainCapacity) return;
+    TerrainMeshletRecord meshlet = input[thread];
     terrainVisible.Store2(32u + terrainSectionCount * 32u + destination * 8u,
         uint2(meshlet.descriptor, meshlet.section));
 }
