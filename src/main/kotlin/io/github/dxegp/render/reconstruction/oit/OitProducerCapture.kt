@@ -154,7 +154,8 @@ internal object OitProducerCapture {
         val assignedTerrainStageReceiptIds = HashSet<Long>()
         var lastTerrainStageSequence = 0L
         val terrainBufferIds = IdentityHashMap<GpuBuffer, Long>()
-        val terrainGroups = HashMap<OitTerrainSelectionKey, Long>()
+        val terrainOccurrenceCounts = HashMap<OitTerrainStageOccurrenceKey, Int>()
+        val terrainGroups = HashMap<OitTerrainOccurrenceKey, Long>()
         var nextTerrainBufferId = 0L
         var nextTerrainGroupId = 0L
 
@@ -296,6 +297,7 @@ internal object OitProducerCapture {
 
     fun recordPass(pass: Any, descriptor: RenderPassDescriptor) {
         val current = recording ?: return
+        if (OitReconstructionInputs.terrainRecordFrames()?.isRecording() == false) return
         val stage = current.providerStage ?: current.scopes.lastOrNull()?.facts?.stage
         check(current.activePass == null) { "OIT passes overlap" }
         val colors = descriptor.colorAttachments().map { attachment ->
@@ -422,9 +424,13 @@ internal object OitProducerCapture {
         val vertexRange = OitTerrainBufferRange(vertexOwner, prepared.vertexOffset, prepared.batch.requiredVertexBytes)
         val group = when (material) {
             is OitTerrainStageMaterial.Known -> {
-                val key = OitTerrainSelectionKey(invocation.scope.producerId, commandRange, vertexRange,
+                val selectionKey = OitTerrainSelectionKey(invocation.scope.producerId, commandRange, vertexRange,
                     draw.drawCount, prepared.commandSelections, material)
-                val groupId = current.terrainGroups.getOrPut(key) {
+                val occurrenceKey = OitTerrainStageOccurrenceKey(selectionKey, invocation.scope.stage)
+                val occurrence = current.terrainOccurrenceCounts.getOrDefault(occurrenceKey, 0)
+                current.terrainOccurrenceCounts[occurrenceKey] = Math.incrementExact(occurrence)
+                val groupKey = OitTerrainOccurrenceKey(selectionKey, occurrence)
+                val groupId = current.terrainGroups.getOrPut(groupKey) {
                     current.nextTerrainGroupId = Math.incrementExact(current.nextTerrainGroupId)
                     current.nextTerrainGroupId
                 }
@@ -639,11 +645,11 @@ internal object OitProducerCapture {
             current.failed || current.scopes.isNotEmpty() || current.activePass != null)
     }
 
-    fun executionResult(): OitExecutionRecording? = recording?.let { current ->
+    fun executionResult(recordingSerial: Long): OitExecutionRecording? = recording?.let { current ->
         val scopes = current.executionScopes + current.scopes.map {
             OitExecutionScope(it.facts, it.actualDrawCalls, OitExecutionScopeCompletion.ACTIVE, null)
         }
-        OitExecutionRecording(current.facts, current.producers, scopes.sortedBy { it.scope.serial },
+        OitExecutionRecording(current.facts, recordingSerial, current.producers, scopes.sortedBy { it.scope.serial },
             current.executionPasses.values.toList(), current.executionEvents, current.failures,
             setOf(OitNativeExecutionGap.DRAW_RECEIPT_UNAVAILABLE,
                 OitNativeExecutionGap.FROZEN_CONTENT_LEASE_UNAVAILABLE,

@@ -131,19 +131,20 @@ internal object D3D12OitNormalizationSource {
         }
         val expectedTextures = setOf("Sampler0", "DepthBoundsSampler") + (0 until attachments).map { "Coeff$it" }
         val uniforms = BindGroupLayout.flattenUniforms(pipeline.bindGroupLayouts)
-        if (uniforms.size != expectedTextures.size + 2 ||
-            uniforms.map { it.name() }.toSet() != expectedTextures + setOf("Globals", "Projection") || uniforms.any { uniform ->
+        val uniformBuffers = setOf("Globals", "Projection")
+        val declaredNames = uniforms.map { it.name() }.toSet()
+        val compiledNames = compiled.entries.map { it.name }.toSet()
+        if (declaredNames.size != uniforms.size || compiledNames.size != compiled.entries.size ||
+            !declaredNames.containsAll(compiledNames) || "Projection" !in compiledNames || uniforms.any { uniform ->
                 when (uniform.name()) {
-                    "Globals", "Projection" -> uniform.type() != UniformType.UNIFORM_BUFFER
+                    in uniformBuffers -> uniform.type() != UniformType.UNIFORM_BUFFER
                     in expectedTextures -> uniform.type() != UniformType.COMBINED_IMAGE_SAMPLER
                     else -> true
                 }
-            } || compiled.entries.size != expectedTextures.size + 2 ||
-            compiled.entries.filter { it.type == D3D12BindGroupEntry.Type.UNIFORM_BUFFER }.map { it.name }.toSet() != setOf("Globals", "Projection") ||
-            compiled.entries.filter { it.type == D3D12BindGroupEntry.Type.SAMPLED_IMAGE }.map { it.name }.toSet() != expectedTextures ||
+            } || compiled.entries.filter { it.type == D3D12BindGroupEntry.Type.SAMPLED_IMAGE }.map { it.name }.toSet() != expectedTextures ||
             compiled.entries.any { it.type == D3D12BindGroupEntry.Type.TEXEL_BUFFER ||
                 it.rawBuffer || it.texelBufferFormat != null ||
-                (it.type == D3D12BindGroupEntry.Type.UNIFORM_BUFFER && it.name !in setOf("Globals", "Projection")) }) {
+                (it.type == D3D12BindGroupEntry.Type.UNIFORM_BUFFER && it.name !in uniformBuffers) }) {
             return unsupported(D3D12OitNormalizationUnsupported.BINDINGS)
         }
         val identity = "$CONTRACT_SCHEMA/$actualFragmentHash/$actualVertexHash/$coefficients/$rank/$attachments"

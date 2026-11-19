@@ -13,4 +13,5 @@ data class D3D12CompiledShader(
     val oitTile: D3D12OitTileCompilation = D3D12OitTileCompilation.NotApplicable,
     val oitTileCaptureIdentity: D3D12OitCaptureIdentity? = null,
     val oitNormalization: D3D12OitNormalizationCertification = D3D12OitNormalizationCertification.NotApplicable,
+    val oitLaneOperation: D3D12OitLaneOperationCertification? = null,
 )

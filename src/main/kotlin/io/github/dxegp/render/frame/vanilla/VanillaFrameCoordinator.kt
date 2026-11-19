@@ -327,7 +327,10 @@ object VanillaFrameCoordinator {
             if (inputs.settings.reconstructionBackend == MCDR_ABI.SR_BACKEND_DLSS) {
                 DeepLearningSuperSampling.pclFrameBegin()
             }
-            recordNativeFrame { ctx -> VanillaFrameWire.begin(ctx, inputs) }
+            recordNativeFrame { ctx ->
+                val begun = VanillaFrameWire.begin(ctx, inputs)
+                if (begun == 1) MCDR_ABI.D3D12VanillaRegisterWorldDepthV1(ctx, frameDepthHandle) else begun
+            }
             D3D12ShadingRateImage.prepareFrame()
             val encoder = checkNotNull(D3D12Device.sharedCommandEncoder())
             D3D12RasterMotion.begin(encoder, identity, frameColorHandle, frameDepthHandle)

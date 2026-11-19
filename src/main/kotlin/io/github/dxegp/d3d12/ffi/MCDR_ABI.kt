@@ -5,6 +5,7 @@ package io.github.dxegp.d3d12.ffi
 import io.github.dxegp.diagnostics.IllusionLogger
 import io.github.dxegp.d3d12.command.D3D12FenceCallback
 import java.lang.foreign.*
+import java.lang.foreign.MemoryLayout.PathElement.groupElement
 import java.lang.invoke.MethodHandle
 import java.lang.invoke.MethodHandles
 import java.lang.invoke.MethodType
@@ -221,6 +222,10 @@ object MCDR_ABI {
     private var MH_creategraphicspipeline: MethodHandle? = null
     private var MH_creategraphicsconstants: MethodHandle? = null
     private var MH_createoitnormalizationpipelinev1: MethodHandle? = null
+    private var MH_createoitlaneoperationpipelinev1: MethodHandle? = null
+    private var MH_createopaqueseedpipelinev1: MethodHandle? = null
+    private var MH_createoittileiapipelinev1: MethodHandle? = null
+    private var MH_attachoittileiaroutev1: MethodHandle? = null
     private var MH_oitshaderprelude: MethodHandle? = null
     private var MH_creategraphicscapture: MethodHandle? = null
     private var MH_createmeshcaptureroot: MethodHandle? = null
@@ -229,7 +234,9 @@ object MCDR_ABI {
     private var MH_createterrantilroute: MethodHandle? = null
     private var MH_bindterrantileroute: MethodHandle? = null
     private var MH_bindterraintilepipeline: MethodHandle? = null
-    private var MH_bindterraintilestagev2: MethodHandle? = null
+    private var MH_bindterraintilestagev3: MethodHandle? = null
+    private var MH_bindterrainopaqueseedv1: MethodHandle? = null
+    private var MH_bindterraintileenvelopev1: MethodHandle? = null
     private var MH_destroyterraintileroute: MethodHandle? = null
     private var MH_oitbegin: MethodHandle? = null
     private var MH_oitbeginv2: MethodHandle? = null
@@ -279,6 +286,9 @@ object MCDR_ABI {
     private var MH_compileshaderdxc: MethodHandle? = null
     private var MH_createworkgraph: MethodHandle? = null
     private var MH_vanillabegin: MethodHandle? = null
+    private var MH_vanillaregisterworlddepth: MethodHandle? = null
+    private var MH_vanillaarmworlddepthseed: MethodHandle? = null
+    private var MH_vanillasealworlddepthseed: MethodHandle? = null
     private var MH_vanillaworld: MethodHandle? = null
     private var MH_vanillagui: MethodHandle? = null
     private var MH_vanillapublish: MethodHandle? = null
@@ -296,7 +306,7 @@ object MCDR_ABI {
     private var MH_vanillafinishdeclared: MethodHandle? = null
     private var MH_invalidatereconstructioninputs: MethodHandle? = null
     private var MH_prewarmframeprep: MethodHandle? = null
-    private var MH_prepareframeprograms: MethodHandle? = null
+    private var MH_prepareframeprogramsv2: MethodHandle? = null
     private var MH_commitframeprograms: MethodHandle? = null
     private var MH_abortframeprograms: MethodHandle? = null
     private var MH_producereactivemask: MethodHandle? = null
@@ -309,6 +319,7 @@ object MCDR_ABI {
     private var MH_destroyterrainworkgraph: MethodHandle? = null
     private var MH_prepareterrainworkgraph: MethodHandle? = null
     private var MH_drawterrainworkgraph: MethodHandle? = null
+    private var MH_drawterrainworkgraphv2: MethodHandle? = null
     private var MH_destroyterrainbatch: MethodHandle? = null
     private var MH_destroyworkgraph: MethodHandle? = null
     private var MH_dispatchworkgraph: MethodHandle? = null
@@ -355,7 +366,7 @@ object MCDR_ABI {
     private var MH_setscissor: MethodHandle? = null
     /** 1 = set, 0 = failed. */
     private var MH_setviewport: MethodHandle? = null
-    private var MH_setvertexbuffer: MethodHandle? = null
+    private var MH_setvertexbufferrangev1: MethodHandle? = null
     /** 1 = cleared, 0 = failed. */
     private var MH_clearstenciltexture: MethodHandle? = null
     private var MH_setindexbuffer: MethodHandle? = null
@@ -495,7 +506,7 @@ object MCDR_ABI {
      * This constant, the Kotlin mirrors and the native `layoutTable()` must agree — [verifyABI]
      * aborts before device creation otherwise.
      */
-    const val MCDR_ABI_VERSION: Int = 26
+    const val MCDR_ABI_VERSION: Int = 34
     internal const val OIT_RESOLVE_UNRECORDED_COVERAGE_UNAVAILABLE: Int = 1
     /** `MCDR_FG_BACKEND_*`, value for value with `mcdr_abi.h`. */
     const val FG_BACKEND_NONE: Int = 0
@@ -632,6 +643,7 @@ object MCDR_ABI {
                 val key = cstringUtf8(arena, name)
                 val valSeg = if (value == null) MemorySegment.NULL else cstringUtf8(arena, value)
                 handle.invokeExact(key, valSeg)
+                Unit
             }
         } catch (ignored: Throwable) {
         // configuration propagation must never fail start-up
@@ -1995,6 +2007,7 @@ object MCDR_ABI {
             try {
                 MH_beginrenderpass!!.invokeExact(ptr(ctx), views, colorCount, mips, flags, colors,
                     ptr(depthTexture), depthMip, depthClearFlag.toInt(), depthClearValue, x, y, w, h)
+                Unit // Keep the signature-polymorphic call in statement position.
             } catch (t: Throwable) {
                 throw unexpected(t)
             }
@@ -2189,6 +2202,52 @@ object MCDR_ABI {
         }
     }
 
+    internal fun D3D12CreateOitLaneOperationPipelineV1(
+        desc: MCDRPipelineDesc, kind: Int, programGeneration: Long, projectionBinding: Int,
+    ): Long {
+        requireLoaded()
+        return Arena.ofConfined().use { arena ->
+            val packed = desc.pack(arena)
+            addr(checkNotNull(MH_createoitlaneoperationpipelinev1)
+                .invokeExact(packed, kind, programGeneration, projectionBinding) as MemorySegment)
+        }
+    }
+
+    internal fun D3D12CreateOitTileIAPipelineV1(desc: MCDRPipelineDesc, pushBytes: Int,
+        tileVertex: String, tileFragment: String, generation: Long, laneRegisters: IntArray, stage: Int): Long {
+        requireLoaded()
+        require(stage in 0..2 && laneRegisters.size == 5 && laneRegisters.all { it >= -1 })
+        return Arena.ofConfined().use { arena ->
+            val vertex = tileVertex.toByteArray(StandardCharsets.UTF_8)
+            val fragment = tileFragment.toByteArray(StandardCharsets.UTF_8)
+            val vertexCode = arena.allocate(vertex.size.toLong()).copyFrom(MemorySegment.ofArray(vertex))
+            val fragmentCode = arena.allocate(fragment.size.toLong()).copyFrom(MemorySegment.ofArray(fragment))
+            val registers = arena.allocateFfmArray(laneRegisters.size, MCDRLayout.I32)
+            MemorySegment.copy(laneRegisters, 0, registers, MCDRLayout.I32, 0L, laneRegisters.size)
+            addr(checkNotNull(MH_createoittileiapipelinev1).invokeExact(desc.pack(arena), pushBytes,
+                vertexCode, vertex.size, fragmentCode, fragment.size, generation, registers, stage) as MemorySegment)
+        }
+    }
+
+    internal fun D3D12AttachOitTileIARouteV1(sourcePipeline: Long, basePipeline: Long): Boolean {
+        requireLoaded()
+        return ok(checkNotNull(MH_attachoittileiaroutev1).invokeExact(ptr(sourcePipeline), ptr(basePipeline)) as Int)
+    }
+
+    internal fun D3D12CreateOpaqueSeedPipelineV1(desc: MCDRPipelineDesc, pushConstantBytes: Int,
+        tileVertex: String, tileFragment: String, programGeneration: Long): Long {
+        requireLoaded()
+        val vertex = tileVertex.toByteArray(Charsets.UTF_8)
+        val fragment = tileFragment.toByteArray(Charsets.UTF_8)
+        return Arena.ofConfined().use { arena ->
+            val packed = desc.pack(arena)
+            val vertexSource = arena.allocateBytes(vertex)
+            val fragmentSource = arena.allocateBytes(fragment)
+            addr(checkNotNull(MH_createopaqueseedpipelinev1).invokeExact(packed, pushConstantBytes,
+                vertexSource, vertex.size, fragmentSource, fragment.size, programGeneration) as MemorySegment)
+        }
+    }
+
     internal fun D3D12OitShaderPreludeV1(): OitShaderPreludeV1 {
         requireLoaded()
         Arena.ofConfined().use { arena ->
@@ -2292,22 +2351,34 @@ object MCDR_ABI {
         return ok(MH_bindterraintilepipeline!!.invokeExact(ptr(route), ptr(tilePipeline)) as Int)
     }
 
+    internal fun D3D12BindTerrainTileEnvelopeV1(route: Long, dxil: ByteArray): Boolean {
+        requireLoaded()
+        require(route != 0L && dxil.isNotEmpty())
+        Arena.ofConfined().use { arena ->
+            return ok(MH_bindterraintileenvelopev1!!.invokeExact(
+                ptr(route), arena.allocateBytes(dxil), dxil.size,
+            ) as Int)
+        }
+    }
+
     internal fun D3D12BindTerrainTileRouteV1(capturePipeline: Long, route: Long): Boolean {
         requireLoaded()
         require(capturePipeline != 0L && route != 0L)
         return ok(MH_bindterrantileroute!!.invokeExact(ptr(capturePipeline), ptr(route)) as Int)
     }
 
-    internal fun D3D12BindTerrainTileStageV2(sourcePipeline: Long, route: Long, shaderAbiVersion: Int,
-        shaderContractHash: Long, programGeneration: Long, stage: Int, quadsPerMeshlet: Int): Boolean {
+    internal fun D3D12BindTerrainTileStageV3(sourcePipeline: Long, route: Long, shaderAbiVersion: Int,
+        shaderContractHash: Long, programGeneration: Long, stage: Int, quadsPerMeshlet: Int,
+        laneRegisters: List<Int>): Boolean {
         requireLoaded()
         require(sourcePipeline != 0L && route != 0L)
         require(shaderAbiVersion == OitShaderPreludeV1.SUPPORTED_SHADER_ABI && programGeneration > 0L)
         require(stage in 0..2 &&
             (quadsPerMeshlet == 16 || quadsPerMeshlet == 32 || quadsPerMeshlet == 64))
+        require(laneRegisters.size == 5)
         val layout = MCDRLayout.TERRAIN_TILE_STAGE_V2
-        return withScratch(layout.byteSize(), layout.byteAlignment()) { temporary ->
-            val contract = scratch(0, layout.byteSize(), temporary, layout.byteAlignment())
+        return Arena.ofConfined().use { arena ->
+            val contract = arena.allocate(layout)
             contract.set(MCDRLayout.I32, MCDRLayout.TERRAIN_TILE_STAGE_SCHEMA, 2)
             contract.set(MCDRLayout.I32, MCDRLayout.TERRAIN_TILE_STAGE_SIZE, layout.byteSize().toInt())
             contract.set(MCDRLayout.I32, MCDRLayout.TERRAIN_TILE_STAGE_SHADER_ABI, shaderAbiVersion)
@@ -2316,8 +2387,19 @@ object MCDR_ABI {
             contract.set(MCDRLayout.I32, MCDRLayout.TERRAIN_TILE_STAGE_ADDRESSING, 1)
             contract.set(MCDRLayout.I64, MCDRLayout.TERRAIN_TILE_STAGE_HASH, shaderContractHash)
             contract.set(MCDRLayout.I64, MCDRLayout.TERRAIN_TILE_STAGE_GENERATION, programGeneration)
-            ok(MH_bindterraintilestagev2!!.invokeExact(ptr(sourcePipeline), ptr(route), contract) as Int)
+            val registers = arena.allocateInts(laneRegisters.toIntArray())
+            ok(MH_bindterraintilestagev3!!.invokeExact(ptr(sourcePipeline), ptr(route), contract, registers) as Int)
         }
+    }
+
+    internal fun D3D12BindTerrainOpaqueSeedV1(sourcePipeline: Long, route: Long, programGeneration: Long,
+        quadsPerMeshlet: Int): Boolean {
+        requireLoaded()
+        require(sourcePipeline != 0L && route != 0L && programGeneration > 0L)
+        require(quadsPerMeshlet == 16 || quadsPerMeshlet == 32 || quadsPerMeshlet == 64)
+        return ok(MH_bindterrainopaqueseedv1!!.invokeExact(
+            ptr(sourcePipeline), ptr(route), programGeneration, quadsPerMeshlet,
+        ) as Int)
     }
 
     internal fun D3D12DestroyTerrainTileRouteV1(route: Long) {
@@ -2499,6 +2581,14 @@ object MCDR_ABI {
         return checkNotNull(MH_oitexecutionsealv2).invokeExact(ptr(ctx), ptr(stream), manifest, output, result) as Int
     }
 
+    private var MH_oitexecutetilestreamv2: MethodHandle? = null
+
+    internal fun D3D12OitExecuteTileStreamV2(ctx: Long, stream: Long, batch: MemorySegment, corrected: Long): Int {
+        requireLoaded()
+        require(batch.byteSize() == 4 * MCDRLayout.TERRAIN_TILE_BATCH_V2.byteSize())
+        return checkNotNull(MH_oitexecutetilestreamv2).invokeExact(ptr(ctx), ptr(stream), batch, ptr(corrected)) as Int
+    }
+
     internal fun D3D12OitAbortExecutionStreamV2(ctx: Long, stream: Long): Int {
         requireLoaded()
         return checkNotNull(MH_oitexecutionabortv2).invokeExact(ptr(ctx), ptr(stream)) as Int
@@ -2634,6 +2724,18 @@ object MCDR_ABI {
     fun D3D12VanillaBeginFrame(ctx: Long, input: MemorySegment): Int =
         vanillaFrameCall(MH_vanillabegin, ctx, input)
 
+    internal fun D3D12VanillaRegisterWorldDepthV1(ctx: Long, depth: Long): Int =
+        vanillaFrameCall(MH_vanillaregisterworlddepth, ctx, ptr(depth))
+
+    internal fun D3D12VanillaArmWorldDepthSeedV1(ctx: Long, maxEvents: Int, totalBudgetBytes: Long): Int {
+        requireLoaded()
+        return MH_vanillaarmworlddepthseed!!.invokeExact(ptr(ctx), maxEvents, totalBudgetBytes) as Int
+    }
+
+    internal fun D3D12VanillaSealWorldDepthSeedV1(ctx: Long): Int {
+        requireLoaded()
+        return MH_vanillasealworlddepthseed!!.invokeExact(ptr(ctx)) as Int
+    }
     fun D3D12VanillaWorldReady(ctx: Long, input: MemorySegment): Int =
         vanillaFrameCall(MH_vanillaworld, ctx, input)
 
@@ -2791,13 +2893,40 @@ object MCDR_ABI {
         check(result > 0) { "Display Work Graph prewarm failed: ${D3D12LastError()}" }
     }
 
-    fun D3D12PrepareFramePrograms(ctx: Long, generation: Long, flags: Int): Long {
+    internal fun D3D12PrepareFramePrograms(ctx: Long, generation: Long, flags: Int,
+        normalizationLanes: List<ByteArray>, normalizationAverage: ByteArray): Long {
         requireLoaded()
         require(ctx != 0L && generation > 0L && flags in 0..3)
+        require(normalizationLanes.size == 3 && normalizationLanes.all { it.isNotEmpty() } &&
+            normalizationAverage.isNotEmpty())
         Arena.ofConfined().use { arena ->
+            val layout = MCDRLayout.OIT_NORMALIZATION_PROGRAM_V1
+            val size = layout.byteSize()
+            val schemaOffset = layout.byteOffset(groupElement("schemaVersion"))
+            val sizeOffset = layout.byteOffset(groupElement("structSize"))
+            val targetCountOffset = layout.byteOffset(groupElement("targetCount"))
+            val generationOffset = layout.byteOffset(groupElement("programGeneration"))
+            val laneDxilOffset = layout.byteOffset(groupElement("laneDxil"))
+            val laneBytesOffset = layout.byteOffset(groupElement("laneDxilBytes"))
+            val averageDxilOffset = layout.byteOffset(groupElement("averageDxil"))
+            val averageBytesOffset = layout.byteOffset(groupElement("averageDxilBytes"))
+            val programs = arena.allocateFfmArray(normalizationLanes.size, layout)
+            val average = arena.allocate(normalizationAverage.size.toLong()).copyFrom(MemorySegment.ofArray(normalizationAverage))
+            for ([index, lane] in normalizationLanes.withIndex()) {
+                val row = programs.asSlice(index * size, layout)
+                val laneCode = arena.allocate(lane.size.toLong()).copyFrom(MemorySegment.ofArray(lane))
+                row.set(MCDRLayout.I32, schemaOffset, 1)
+                row.set(MCDRLayout.I32, sizeOffset, size.toInt())
+                row.set(MCDRLayout.I32, targetCountOffset, 1 shl index)
+                row.set(MCDRLayout.I64, generationOffset, generation)
+                row.set(MCDRLayout.PTR, laneDxilOffset, laneCode)
+                row.set(MCDRLayout.I64, laneBytesOffset, laneCode.byteSize())
+                row.set(MCDRLayout.PTR, averageDxilOffset, average)
+                row.set(MCDRLayout.I64, averageBytesOffset, average.byteSize())
+            }
             val output = arena.allocate(MCDRLayout.PTR)
-            output.set(MCDRLayout.PTR, 0L, MemorySegment.NULL)
-            val result = MH_prepareframeprograms!!.invokeExact(ptr(ctx), generation, flags, output) as Int
+            val result = checkNotNull(MH_prepareframeprogramsv2).invokeExact(
+                ptr(ctx), generation, flags, programs, normalizationLanes.size, output) as Int
             requireFrameProgramsSuccess("prepare", result)
             val candidate = addr(output.get(MCDRLayout.PTR, 0L))
             if (candidate == 0L) {
@@ -2921,17 +3050,19 @@ object MCDR_ABI {
 
     fun D3D12PrepareTerrainWorkGraph(ctx: Long, program: Long, buffers: LongArray,
                                      offsets: LongArray, lengths: LongArray,
-                                     sectionCount: Int, meshletCapacity: Int): Long {
+                                     sectionCount: Int, meshletCapacity: Int,
+                                     bindingCount: Int): Long {
         requireLoaded()
         require(sectionCount > 0 && meshletCapacity > 0)
-        require(buffers.isNotEmpty() && buffers.size <= 32 && buffers.size == offsets.size && offsets.size == lengths.size)
-        val count = buffers.size
+        require(bindingCount in 1..32 && bindingCount <= buffers.size &&
+            bindingCount <= offsets.size && bindingCount <= lengths.size)
+        val count = bindingCount
         val maximumBytes = maxOf(checkedArrayBytes(count, MCDRLayout.PTR), checkedArrayBytes(count, MCDRLayout.I64))
         return withScratch(maximumBytes, maxOf(MCDRLayout.PTR.byteAlignment(), MCDRLayout.I64.byteAlignment())) { temporary ->
             val handles = scratchArray(0, count, MCDRLayout.PTR, temporary)
             val starts = scratchArray(1, count, MCDRLayout.I64, temporary)
             val sizes = scratchArray(2, count, MCDRLayout.I64, temporary)
-            for (index in buffers.indices) {
+            for (index in 0 until count) {
                 require(buffers[index] != 0L && offsets[index] >= 0L && lengths[index] > 0L)
                 handles.set(MCDRLayout.PTR, index * MCDRLayout.PTR.byteSize(), ptr(buffers[index]))
             }
@@ -2946,6 +3077,14 @@ object MCDR_ABI {
         requireLoaded()
         require(vertexOffset >= 0L)
         return ok(MH_drawterrainworkgraph!!.invokeExact(ptr(ctx), ptr(batch), ptr(vertexBuffer), vertexOffset) as Int)
+    }
+
+    internal fun D3D12DrawTerrainWorkGraphV2(ctx: Long, batch: Long, vertexBuffer: Long,
+        vertexOffset: Long, vertexBytes: Long): Boolean {
+        requireLoaded()
+        require(vertexOffset >= 0L && vertexBytes > 0L)
+        return ok(checkNotNull(MH_drawterrainworkgraphv2).invokeExact(
+            ptr(ctx), ptr(batch), ptr(vertexBuffer), vertexOffset, vertexBytes) as Int)
     }
 
     fun D3D12DestroyTerrainBatch(batch: Long) {
@@ -3368,10 +3507,11 @@ object MCDR_ABI {
         }
     }
     /** [slot] 0..15. */
-    fun D3D12SetVertexBuffer(ctx: Long, slot: Int, buffer: Long, offset: Long, stride: Int): Boolean {
+    internal fun D3D12SetVertexBufferRangeV1(ctx: Long, slot: Int, buffer: Long,
+        offset: Long, length: Long, stride: Int): Boolean {
         requireLoaded()
         try {
-            return ok(MH_setvertexbuffer!!.invokeExact(ptr(ctx), slot, ptr(buffer), offset, stride) as Int)
+            return ok(MH_setvertexbufferrangev1!!.invokeExact(ptr(ctx), slot, ptr(buffer), offset, length, stride) as Int)
         } catch (t: Throwable) {
             throw unexpected(t)
         }
@@ -4013,8 +4153,16 @@ object MCDR_ABI {
             MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32))
         MH_drawterrainworkgraph = skip("mcdr_dx12DrawTerrainWorkGraph", fd(MCDRLayout.I32,
             MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I64))
+        MH_drawterrainworkgraphv2 = skip("mcdr_dx12DrawTerrainWorkGraphV2", fd(MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.I64))
         MH_destroyterrainbatch = skip("mcdr_dx12DestroyTerrainBatch", fdv(MCDRLayout.PTR))
         MH_vanillabegin = skip("mcdr_dx12VanillaBeginFrame", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
+        MH_vanillaregisterworlddepth = skip("mcdr_dx12VanillaRegisterWorldDepthV1",
+            fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
+        MH_vanillaarmworlddepthseed = skip("mcdr_dx12VanillaArmWorldDepthSeedV1",
+            fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.I64))
+        MH_vanillasealworlddepthseed = skip("mcdr_dx12VanillaSealWorldDepthSeedV1",
+            fd(MCDRLayout.I32, MCDRLayout.PTR))
         MH_vanillaworld = skip("mcdr_dx12VanillaWorldReady", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_vanillagui = skip("mcdr_dx12VanillaGuiReady", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_vanillapublish = skip("mcdr_dx12VanillaPublishPreparedFrame", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
@@ -4038,8 +4186,8 @@ object MCDR_ABI {
         MH_invalidatereconstructioninputs = skip("mcdr_dx12InvalidateReconstructionInputs", fd(MCDRLayout.I32, MCDRLayout.PTR))
         MH_prewarmframeprep = skip("mcdr_dx12PrewarmFrameprep", fd(MCDRLayout.I32,
             MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.I32))
-        MH_prepareframeprograms = skip("mcdr_dx12PrepareFramePrograms", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.I32, MCDRLayout.PTR))
+        MH_prepareframeprogramsv2 = skip("mcdr_dx12PrepareFrameProgramsV2", fd(MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.PTR))
         MH_commitframeprograms = skip("mcdr_dx12CommitFramePrograms", fd(MCDRLayout.I32,
             MCDRLayout.PTR, MCDRLayout.PTR))
         MH_abortframeprograms = skip("mcdr_dx12AbortFramePrograms", fdv(MCDRLayout.PTR))
@@ -4072,6 +4220,16 @@ object MCDR_ABI {
         MH_creategraphicsconstants = skip("mcdr_dx12CreateGraphicsPipelineWithConstants", fd(MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
         MH_createoitnormalizationpipelinev1 = skip("mcdr_dx12CreateOitNormalizationPipelineV1", fd(MCDRLayout.PTR,
             MCDRLayout.PTR, MCDRLayout.PTR))
+        MH_createoitlaneoperationpipelinev1 = skip("mcdr_dx12CreateOitLaneOperationPipelineV1", fd(MCDRLayout.PTR,
+            MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.I64, MCDRLayout.I32))
+        MH_createopaqueseedpipelinev1 = skip("mcdr_dx12CreateOpaqueSeedPipelineV1", fd(MCDRLayout.PTR,
+            MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.PTR,
+            MCDRLayout.I32, MCDRLayout.I64))
+        MH_createoittileiapipelinev1 = skip("mcdr_dx12CreateOitTileIAPipelineV1", fd(MCDRLayout.PTR,
+            MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32,
+            MCDRLayout.I64, MCDRLayout.PTR, MCDRLayout.I32))
+        MH_attachoittileiaroutev1 = skip("mcdr_dx12AttachOitTileIARouteV1", fd(MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.PTR))
         MH_oitshaderprelude = skip("mcdr_dx12OitShaderPreludeV1", fd(MCDRLayout.I32,
             MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_creategraphicscapture = skip("mcdr_dx12CreateGraphicsCapturePipelineV1", fd(MCDRLayout.PTR,
@@ -4088,8 +4246,12 @@ object MCDR_ABI {
              MCDRLayout.PTR, MCDRLayout.PTR))
          MH_bindterraintilepipeline = skip("mcdr_dx12BindTerrainTilePipelineV1", fd(MCDRLayout.I32,
              MCDRLayout.PTR, MCDRLayout.PTR))
-         MH_bindterraintilestagev2 = skip("mcdr_dx12BindTerrainTileStageV2", fd(MCDRLayout.I32,
-             MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
+         MH_bindterraintilestagev3 = skip("mcdr_dx12BindTerrainTileStageV3", fd(MCDRLayout.I32,
+             MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
+         MH_bindterrainopaqueseedv1 = skip("mcdr_dx12BindTerrainOpaqueSeedV1", fd(MCDRLayout.I32,
+             MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.I32))
+         MH_bindterraintileenvelopev1 = skip("mcdr_dx12BindTerrainTileEnvelopeV1", fd(MCDRLayout.I32,
+             MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
          MH_destroyterraintileroute = skip("mcdr_dx12DestroyTerrainTileRouteV1", fdv(MCDRLayout.PTR))
         MH_oitbegin = skip("mcdr_dx12OitBeginFrameV1", fd(MCDRLayout.I32,
             MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
@@ -4148,6 +4310,8 @@ object MCDR_ABI {
             MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_oitexecutionabortv2 = skipOptional("mcdr_dx12OitAbortExecutionStreamV2", fd(MCDRLayout.I32,
             MCDRLayout.PTR, MCDRLayout.PTR))
+        MH_oitexecutetilestreamv2 = skip("mcdr_dx12OitExecuteTileStreamV2", fd(MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_oitsampledcontentv1 = skipOptional("mcdr_dx12CaptureSampledTextureContentV1", fd(MCDRLayout.I32,
             MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I64,
             MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR,
@@ -4307,11 +4471,12 @@ object MCDR_ABI {
             MCDRLayout.PTR,
             MCDRLayout.I32
         ))
-        MH_setvertexbuffer = skip("mcdr_dx12SetVertexBuffer", fd(
+        MH_setvertexbufferrangev1 = skip("mcdr_dx12SetVertexBufferRangeV1", fd(
             MCDRLayout.I32,
             MCDRLayout.PTR,
             MCDRLayout.I32,
             MCDRLayout.PTR,
+            MCDRLayout.I64,
             MCDRLayout.I64,
             MCDRLayout.I32
         ))

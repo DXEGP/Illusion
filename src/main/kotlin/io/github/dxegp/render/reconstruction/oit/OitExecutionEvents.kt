@@ -135,6 +135,7 @@ internal data class OitExecutionJournalEntry(val sequence: Long, val fact: OitEx
 
 internal class OitExecutionRecording(
     val frame: OitFrameFacts,
+    val recordingSerial: Long,
     producers: List<OitExecutionProducer>,
     scopes: List<OitExecutionScope>,
     passes: List<OitExecutionPass>,

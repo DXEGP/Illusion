@@ -29,9 +29,16 @@ internal object OitTerrainReplayReadSet {
             }
         }
         check(prepared.batchHandle != 0L && facts.pipeline == prepared.pipeline)
-        val uploadReads = facts.uploadReads.map { fact ->
-            val read = fact.read as? D3D12UploadRead.Available
-                ?: return OitTerrainReadSetRegistration.UPLOAD_UNAVAILABLE
+        val uploadReads = facts.uploadReads.mapNotNull { fact ->
+            val read = when (val bound = fact.read) {
+                is D3D12UploadRead.Available -> bound
+                is D3D12UploadRead.Unavailable -> {
+                    // Native freezes DEFAULT uniforms from the original graphics bindings.
+                    if (bound.reason == D3D12UploadRead.Reason.NOT_UPLOAD &&
+                        fact.input is D3D12MeshDrawCapture.TerrainUploadInput.Uniform) return@mapNotNull null
+                    return OitTerrainReadSetRegistration.UPLOAD_UNAVAILABLE
+                }
+            }
             if (!read.isCurrent(recording.context)) return OitTerrainReadSetRegistration.UPLOAD_UNAVAILABLE
             val role = when (val input = fact.input) {
                 is D3D12MeshDrawCapture.TerrainUploadInput.Uniform -> input.graphicsBindingSlot

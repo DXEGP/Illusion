@@ -7,6 +7,7 @@ import io.github.dxegp.d3d12.ffi.allocateFfmArray
 import io.github.dxegp.d3d12.ffi.MCDRLayout
 import io.github.dxegp.d3d12.ffi.OitShaderPreludeV1
 import io.github.dxegp.d3d12.shader.D3D12OitCaptureProfile
+import io.github.dxegp.d3d12.shader.D3D12OitTileBinningHandles
 import io.github.dxegp.render.terrain.mesh.D3D12MeshDrawCapture
 import io.github.dxegp.render.frame.vanilla.VanillaFrameCoordinator
 import net.minecraft.client.renderer.oit.OitStage
@@ -67,8 +68,21 @@ internal object OitTerrainRecords {
     private var worldEpoch = 0L
     private var terrainProducerUnavailable: OitTerrainTileProducer.UnavailableReason? = null
     private val terrainFacts = ArrayList<OitTerrainTileProducer.Facts>()
+    internal var tileBinning: D3D12OitTileBinningHandles? = null
+        private set
 
     internal fun capturedTerrainFacts(): List<OitTerrainTileProducer.Facts> = terrainFacts.toList()
+
+    internal fun attachSealedEvents(recording: OitExecutionRecording?, compositeInput: OitCompositeInputCapture) {
+        if (recording == null || terrainFacts.isEmpty()) return
+        val normalization = (compositeInput as? OitCompositeInputCapture.Available)?.input
+        for (index in terrainFacts.indices) {
+            terrainFacts[index] = OitTerrainTileProducer.attachSealedEvents(
+                terrainFacts[index], recording, normalization,
+            )
+        }
+    }
+
     internal fun submitTileReplay(): OitTerrainTilePreparation {
         terrainProducerUnavailable?.let {
             return OitTerrainTilePreparation.Unavailable(
@@ -76,12 +90,15 @@ internal object OitTerrainRecords {
         }
         if (terrainFacts.isEmpty()) return OitTerrainTilePreparation.Unavailable(
             OitTerrainTilePreparation.Reason.NO_TILE_BATCH)
+        if (terrainFacts.any { !it.sealedEvents.complete }) return OitTerrainTilePreparation.Unavailable(
+            OitTerrainTilePreparation.Reason.SEALED_EVENTS_INCOMPLETE)
         return OitTerrainTilePreparation.Unavailable(OitTerrainTilePreparation.Reason.EXECUTION_STREAM_UNAVAILABLE)
     }
 
     internal fun clearTileReplay() {
         terrainProducerUnavailable = null
         terrainFacts.clear()
+        tileBinning = null
     }
 
     fun recordPreparedStage(invocation: OitTerrainStageInvocation, draw: D3D12TerrainDraw,
@@ -89,20 +106,26 @@ internal object OitTerrainRecords {
         try {
             val facts = prepared as? D3D12MeshDrawCapture.TerrainPreparedFacts
                 ?: error("Terrain stage facts came from an incompatible producer")
+            if (tileBinning == null) tileBinning = draw.pipeline.terrainTileBinning()
             val view = draw.stageMaterialView
             val sampler = draw.stageMaterialSampler
             val primary = if (view != null && sampler != null) OitTerrainMaterials.capture(view, sampler) else null
             val lightmap = draw.lightmap?.let { OitTerrainMaterials.capture(it.view, it.sampler) }
-            val material = when {
-                view == null -> OitTerrainStageMaterial.Unavailable(OitTerrainGroupUnavailable.MATERIAL_VIEW_UNAVAILABLE)
-                sampler == null -> OitTerrainStageMaterial.Unavailable(OitTerrainGroupUnavailable.MATERIAL_SAMPLER_UNAVAILABLE)
-                primary == null -> OitTerrainStageMaterial.Unavailable(OitTerrainGroupUnavailable.MATERIAL_IDENTITY_UNAVAILABLE)
-                draw.lightmap != null && lightmap == null ->
-                    OitTerrainStageMaterial.Unavailable(OitTerrainGroupUnavailable.LIGHTMAP_IDENTITY_UNAVAILABLE)
-                else -> OitTerrainStageMaterial.Known(OitTerrainSampledMaterial(primary, view, sampler),
-                    draw.lightmap?.let { sampled -> OitTerrainSampledMaterial(checkNotNull(lightmap), sampled.view, sampled.sampler) })
-            }
+            val material = captureStageMaterial(draw, view, sampler, primary, lightmap)
             OitProducerCapture.recordTerrainStage(invocation, draw, facts, material, receipt)
+            if (invocation.scope.stage == OitStage.ACCUMULATE) {
+                val batch = D3D12MeshDrawCapture.batch(draw.commands)
+                if (batch == null) {
+                    terrainProducerUnavailable = OitTerrainTileProducer.UnavailableReason.PREPARED_FACTS_MISMATCH
+                    return
+                }
+                when (val tile = OitTerrainTileProducer.capture(
+                    VanillaFrameCoordinator.currentFrame(), batch, facts, invocation, material, receipt,
+                )) {
+                    is OitTerrainTileProducer.Result.Captured -> terrainFacts += tile.facts
+                    is OitTerrainTileProducer.Result.Unavailable -> terrainProducerUnavailable = tile.reason
+                }
+            }
         } catch (failure: Throwable) {
             OitProducerCapture.recordTerrainStageFailure(invocation, failure)
             throw failure
@@ -182,7 +205,7 @@ internal object OitTerrainRecords {
         return object : D3D12PreparedRasterCapture {
             override val pipeline = pipeline
             private var consumed = false
-            private var preparedFacts: D3D12MeshDrawCapture.TerrainPreparedFacts? = null
+            private var terrainFactsBound = false
 
             override fun bindTerrainFacts(facts: D3D12TerrainPreparedFacts) {
                 val terrainFacts = facts as? D3D12MeshDrawCapture.TerrainPreparedFacts
@@ -193,21 +216,11 @@ internal object OitTerrainRecords {
                     facts.bindingHandles.size >= 3) {
                     "Terrain Work Graph facts changed between draw and preparation"
                 }
-                preparedFacts = terrainFacts.copyImmutable()
-                when (val tile = OitTerrainTileProducer.capture(
-                    VanillaFrameCoordinator.currentFrame(), batch, terrainFacts,
-                )) {
-                    is OitTerrainTileProducer.Result.Captured -> {
-                        this@OitTerrainRecords.terrainFacts += tile.facts
-                    }
-                    is OitTerrainTileProducer.Result.Unavailable -> {
-                        terrainProducerUnavailable = tile.reason
-                    }
-                }
+                terrainFactsBound = true
             }
 
             override fun <Result> recordDraw(action: () -> Result): Result {
-                check(!consumed && OitProducerCapture.drawInputs() === facts && preparedFacts != null)
+                check(!consumed && OitProducerCapture.drawInputs() === facts && terrainFactsBound)
                 consumed = true
                 val result = records.recordTerrainDraw(metadata, scope.serial, action)
                 OitProducerCapture.recordDraw {
@@ -216,6 +229,18 @@ internal object OitTerrainRecords {
                 return result
             }
         }
+    }
+
+    private fun captureStageMaterial(draw: D3D12TerrainDraw, view: com.mojang.renderpearl.api.textures.GpuTextureView?,
+        sampler: com.mojang.renderpearl.api.textures.GpuSampler?, primary: OitSurfaceMaterial?,
+        lightmap: OitSurfaceMaterial?): OitTerrainStageMaterial = when {
+        view == null -> OitTerrainStageMaterial.Unavailable(OitTerrainGroupUnavailable.MATERIAL_VIEW_UNAVAILABLE)
+        sampler == null -> OitTerrainStageMaterial.Unavailable(OitTerrainGroupUnavailable.MATERIAL_SAMPLER_UNAVAILABLE)
+        primary == null -> OitTerrainStageMaterial.Unavailable(OitTerrainGroupUnavailable.MATERIAL_IDENTITY_UNAVAILABLE)
+        draw.lightmap != null && lightmap == null ->
+            OitTerrainStageMaterial.Unavailable(OitTerrainGroupUnavailable.LIGHTMAP_IDENTITY_UNAVAILABLE)
+        else -> OitTerrainStageMaterial.Known(OitTerrainSampledMaterial(primary, view, sampler),
+            draw.lightmap?.let { sampled -> OitTerrainSampledMaterial(checkNotNull(lightmap), sampled.view, sampled.sampler) })
     }
 
 }

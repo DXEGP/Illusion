@@ -137,6 +137,8 @@ class D3D12GpuBuffer(private val usageFlags: Int, private val bufferSize: Long, 
     }
 
     companion object {
+        internal const val USAGE_STORAGE = 1024
+
         /**
          * `Map` 失败最常见的原因是设备已被移除（`0x887A0005`）：那一刻起每个 GPU 调用都会失败，
          * 崩溃点只是恰好落在第一个 `Map` 上。单独识别它，避免被误读成"某个 buffer 有问题"。

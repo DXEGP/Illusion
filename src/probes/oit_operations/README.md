@@ -1,6 +1,10 @@
 # OIT operation receipts
 
-该独立程序使用正式 ABI 25 创建两个 64×64 Vanilla/OIT 帧，各提交三次真实三角形 draw。它检查真实 receipt 的原始 ID、帧身份、nativeSequence、packet/read-set ID、PSO 与 command ordinal，并覆盖重复 append、伪造身份、跨帧 receipt、遗漏 receipt 的错误报告。原有四项缺帧检查仍保留。
+该独立程序用当前 ABI 创建三个 64×64 Vanilla/OIT 帧，各提交三次真实三角形 draw。它检查真实 receipt 的 ID、帧身份、nativeSequence、packet/read-set ID、PSO 与 command ordinal，也检查遗漏、重复及跨帧的 receipt。
+
+另外三个独立帧各录制一次真实 `COPY_BOUNDS`：pixel shader 用 `Texture2D.Load` 读取双 mip bounds 纹理的 mip 0，再写入实际 color attachment。V2 资源行使用 `OBJECT_ONLY`，`resourceIdentity` 是实际纹理对象地址，owner/content 字段为零，版本取同帧；`BOUNDS` 声明读，`CULLED_BOUNDS` 声明写。正确对象和 mip 必须消除 `GAP_READ_SET`；把读对象换成另一张真实纹理，或把读取范围声明成实际未绑定的 mip 1，append 仍须接受合法资源行，seal 必须返回 `GAP_READ_SET` 和该真实 receipt 的 ID。其它 replay 缺项继续使 seal 返回 unavailable，不要求完整执行流成功。
+
+所有 encoder 均未登记 motion target。第一帧验证 clear 后不能登记世界深度。第二帧采集实际 clear 和深度 draw，验证 OIT 在显式封口后取得 journal。第三帧让同一深度 draw 超出事件上限，验证原 draw 和 OIT 提交继续成功，seed 缺项保留。
 
 graphics pipeline 接收入口为 `main` 的 HLSL 源码，由实际生产编译器生成设备对应的 DXIL。附件在 render pass 结束后回到 COMMON；提交入口负责关闭当前 command list。显示帧通过公开 begin/abort 入口建立和退休，不改写生产内部状态。
 
@@ -16,4 +20,4 @@ draw 后请求销毁 PSO 与目标纹理，再提交并等待真实 fence；opaq
 ./src/probes/oit_operations/run.ps1 -NativeRoot D:/Projects/MinecraftMod/DXRMC/rebuild/MCDR
 ```
 
-加 `-BuildOnly` 只编译链接。运行要求新 ABI 25 DLL/import library，构建脚本会记录所用 DLL 的 SHA256。
+加 `-BuildOnly` 只编译链接。构建脚本记录所用 DLL 的 SHA256。

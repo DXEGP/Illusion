@@ -69,7 +69,7 @@ internal sealed interface OitNativeExecutionResult {
         val missingMask: Int = 0,
         val firstIssueSequence: Long = 0,
     ) : OitNativeExecutionResult
-    data class Sealed(val info: OitNativeExecutionInfo) : OitNativeExecutionResult
+    data class Sealed(val handle: Long, val info: OitNativeExecutionInfo) : OitNativeExecutionResult
 }
 
 internal class OitNativeExecutionStream(

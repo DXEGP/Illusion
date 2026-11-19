@@ -2,6 +2,28 @@
 
 本页跟踪 [架构方案](vanilla-work-graph-plan.md) 的实际实施状态。范围限定光栅、mesh、AA/SR 与呈现；完整 A–K 目标尚未完成。已实现接线、具体实现缺口与尚未运行确认的场景分别记录，最新配套产物的构建和用户确认集中在[当前构建与运行](#当前构建与运行)。
 
+## 光栅 Work Graph 增量（2026-11-18）
+
+`D3D12TerrainWorkGraph.prepare` 要求渲染线程调用，batch、上传事实和原始 command recording 使用同一线程和 fence。`Prepared.recordPreparedFacts` 对每批事实只回调一次。uniform 到 graphics binding slot 的弱缓存只保存名称与 slot。
+
+terrain packet 的内容复制遵守 `ContentPolicy`：只有完整执行器绑定 `FreezeBindings` 且 tile adapter 已注册时才冻结 VBO、atlas、纹理和其它绑定；默认 `FactsOnly` 只保留命令事实，避免在当前 V2 执行器仍 unavailable 时复制不会被消费的资源。冻结范围的 buffer offset、长度和纹理子资源必须与原 draw 一致，`length == 0` 也不放宽起始 offset 匹配。
+
+capture/prepared-facts 路径还在第一次写 section table 时同步保存 meshlet descriptor offset，构造 `TerrainPreparedFacts` 直接复用这组偏移；普通 terrain raster 不分配这组数组。这样去掉了同一 draw 列表的第二次遍历和 descriptor map 查找，`D3D12MeshletResidency` 的 generation、read lease 和 fence 退休保持原语义。
+
+普通 terrain prepare 路径按渲染线程复用 `ThreadLocal` binding scratch；每次只遍历本批的实际 `bindingCount`，FFM 同样只校验、编码并提交这个有效前缀。切换到绑定更少的管线时，缓存容量和尾部内容不进入 native。capture 与 prepared-facts 路径继续使用独立数组，避免事实对象引用后续批次的可变 scratch。
+
+修正已有 tile envelope 的 64 B 写入顺序：`pixelBounds → identity → draw → properties`，`forceAllTiles` 现在写入 shader 读取的 `properties.x`。本机 DXC 已编译 TileEnvelope、Initialize、Prefix、Scatter 的 SM6.9 入口。native OIT seed 校验删除了没有读取方的 `opaqueSeedPackets` 重复 vector，继续直接读取 Frame journal；journal、packet 和 recording lease 的 fence 生命周期不变。native ABI 保持 26，完整四 lane OIT/tile executor 仍明确返回 unavailable，不把资源准备或 shader 编译通过当成执行完成。
+
+native Work Graph dispatch 还把每次调用创建的 binding 地址和资源状态去重表改为固定 32 槽数组；program 创建阶段已有 `bindingCount <= 32` 约束，因此不改变 ABI、地址顺序、资源去重或状态冲突校验。terrain prepare 根据 Work Graph 的 `uniformCount <= 28` 上限和固定的三项 terrain 输入，把 `bindingCount + 1` 个地址及 `bindingCount + 2` 个声明放进固定数组，避免每次 prepare 的两次堆分配；C ABI 两个 host/GPU 派发入口也用 32 槽数组承接句柄，去掉每次调用的临时堆分配。Work Graph command-list ring 现在在 encoder 创建、槽位切换、abort 重建和销毁时缓存 `ID3D12GraphicsCommandList10`，dispatch 不再每次调用 `QueryInterface`，接口缺失仍返回原 unavailable。`drawTerrainWorkGraph` 在当前录制线程复用动态声明容器的容量，仍按 `graphicsInputRanges` 实际数量增长，不跨线程共享声明内容。mesh 与普通 raster draw 都复用同一 `CommandContext` 中 `pushDescriptors` 已展开的 graphics binding read ranges；命中前校验 root、binding 类型和数量，根签名切换、绑定追加、render pass 附件变化、新 command list 和 push 失败都会清效，cache hit 只合并额外的 vertex/index/indirect 范围，带 layout miss 的路径保留完整重算。`D3D12RenderPassBackend.pushConstants` 在已有 snapshot 容量足够时复用大缓冲，pipeline 在不同常量块大小之间切换不再重复分配；`D3D12SceneDisplay.pushSourceMapping` 复用渲染线程独占的 8 B heap buffer，不再为每次深度传递创建 direct buffer。
+
+terrain draw 的 pass declarations 使用当前录制线程的动态容器，按本次 `graphicsInputRanges` 扩容并在每次录制前清空。输入范围没有固定上限，不能改成固定数组；声明只同步传给 `beginDeclaredPass`，随后由原版侧复制。`CommandContext`、`TerrainProgram` 的 batch/signature 缓存和 D3D12 command list 都遵守单线程录制约束；容器不能跨线程共享或重入。
+
+terrain packet 在原 mesh draw 前准备冻结范围。`FreezeBindings`、已注册 tile adapter 和同一 recording 的 route lease 都齐备时才调用 `retainPacketContent`。vertex、globals、atlas 和材质按实际读取范围保留。visible 和 arguments 使用原 Work Graph `TerrainBatch` 的强租约，由录制 fence 保活，避免两次 GPU 复制。`Texture2D` 和 `Cube` 按 SRV 展开 mip 和 array layer，`MipLevels == UINT32_MAX` 取资源剩余 mip。零长度 buffer binding 取 offset 到资源尾部。默认 `FactsOnly` 只保存 packet 事实。sealed depth、cull、normalization 和 composite 仍待完整执行器接入。
+
+`validateTerrainTileReplay` 校验单阶段的 shader 路由和绑定。`prepareTerrainTilePacketV2Impl` 可以构建阶段计划，消费结果仍为 `UnsupportedContent`。完整执行计划需要录制 opaque seed、water/cloud depth、cull、所有阶段和四 lane 归一化，再发布 `Consumed`。
+
+当前构建和检查结果见[当前构建与运行](#当前构建与运行)。`tile_binning` 已通过 26 个 GPU prefix 用例，报告位于 `build/reports/workgraph/tile-binning/20261118-185430/`。该组用例只检查 prefix。
+
 ## Composite 内容租约与 normalization 来源（2026-11-16）
 
 普通 graphics observer 默认只登记命令事实，不触发逐 draw 内容复制。native `ContentPolicy::FreezeBindings` 是执行器的显式请求：只有 adapter 已经准备好、并且同 recording 会消费冻结绑定时，才允许复制精确 buffer 范围或取得 sampled texture COW；冻结失败沿 recording failure 返回。COM 对象租约只保活资源，不能把 `Unfrozen` 当成可重放内容。
@@ -14,7 +36,7 @@ Composite 输入在原 render pass 创建前交给 records.seal。native Frame �
 
 ## Kotlin 热路径与 FFM 分配整理（2026-11-16）
 
-`FfmScratch` 拥有小型参数缓存和大目标调用作用域，大小、对齐与生命周期规则统一见 [FFM ABI](../misc/ffm-abi.md#24-数组与结构体数组)。批量 draw、描述符、查询和附件数组都按真实布局计算长度；同次调用的全部指针一起覆盖 native 同步消费和返回值复制。`recordCommands`、编码作用域和 staging writer 显式内联，分配器主体保持普通函数；作用域只调用一次业务 lambda，避免内联把整个批量编码复制到大小两条分支。查询结果拒绝短输出数组，不静默截断。
+`FfmScratch` 拥有小型参数缓存和大目标调用作用域，大小、对齐与生命周期规则统一见 [FFM ABI](../misc/ffm-abi.md#24-数组与结构体数组)。批量 draw、描述符、查询和附件数组都按真实布局计算长度；同次调用的全部指针一起覆盖 native 同步消费和返回值复制。`recordCommands`、编码作用域和 staging writer 显式内联，分配器主体保持普通函数；作用域只调用一次业务 lambda，避免内联把整个批量编码复制到大小两条分支。查询结果拒绝短输出数组，不静默截断。OIT 事件链按实际 pass 资源和事件内 native sequence 的最小/最大区间校验，区间交错时保持 unavailable。
 
 原版按设备限制拆分 indirect command 时，`D3D12MeshDrawCapture` 接受同 owner 内合法、非空且按 20 B command 对齐的连续子范围，保持原顺序并缓存对应 batch。prepared facts 在 native batch 分配前完成构建，防止事实构建失败遗留句柄。地形生产 shader 保持五节点与现有布局。
 
@@ -30,7 +52,7 @@ native 的 normalization 描述按实际字段为 288 B，C++ 静态断言和 JV
 
 CPU-record 派发现在先完成设备归属、stride/对齐、记录范围、heap/UAV 能力和资源别名检查，再登记录制租约或改资源状态；同一底层资源的 CBV/SRV 读绑定合并为读状态，UAV 与读绑定冲突直接拒绝，重复 UAV 允许合并，零记录保持无副作用。地形 Work Graph 的 initialize/finalize 会暂时使用 compute PSO，正式 `ExecuteIndirect` 前按当前深度路径恢复 graphics PSO，并同步 `cachedPso`。
 
-当前 DLL 由 `MCDR.vcxproj` Release|x64 使用依赖根 `D:/Projects/MinecraftMod/DXRMC/MCDR` 和 `VcpkgTriplet=x64-windows` 构建，0 个警告、0 个错误；两份 Work Graph 对象文件的编译时间均晚于对应源码修改，地形单元在本次构建重新编译。最新 DLL SHA256 为 `AD1498BF24F735E49B1447A8CB79B4499AFD454E4A1C606A0CB02F65A1300617`。`src/probes/workgraph_reuse/run.ps1` 在 RTX 5070 Laptop（SM6.9、Work Graph Tier 1.0）上通过 CBV/SRV alias、重复 UAV、冲突 alias、非法 CPU records、废弃初始化、双 pending context、提交前释放 program 和 submitted-slot 复用；`src/probes/tile_binning/run.ps1` 26 个 GPU prefix 用例全部通过；`src/probes/ffi_allocation/run.ps1` 通过实际 FFM 分配与布局检查。报告分别位于 `build/reports/workgraph/reuse/20261117-210953`、`build/reports/workgraph/tile-binning/20261117-211013` 和 `build/reports/workgraph/ffm-allocation-check/`。本次没有运行游戏；地形 PSO 恢复尚未进行实际绘制验证，完整 OIT executor 的接线缺口仍按上文记录。
+Work Graph 通用资源状态和租约使用 `src/probes/workgraph_reuse/run.ps1` 验证，tile prefix 使用 `src/probes/tile_binning/run.ps1` 验证。FFM 分配和 DLL 布局使用 `src/probes/ffi_allocation/run.ps1` 验证。
 
 native seed 预检现在只读检查已确认的 graphics packet：它核对 recording/fence/frame/program/resource 身份、首个完整深度清除、D32 DSV、真实深度 attachment、PSO/pipeline generation、command family，以及 packet 的 content/adapter/route 状态。seal 阶段不会冻结内容、创建 descriptor 或清除缺失掩码；任何缺项继续返回 `Unavailable`，不会伪造 sealed executor。该变更随上述 DLL 构建通过，未把只读事实检查当作完整 OIT executor。
 
@@ -86,7 +108,7 @@ JVM `TerrainPipelineCompiler` 现在在真实 16/32/64 meshlet 生成点消费�
 
 native 的 tile replay 接线已经存在：terrain binning 按 initialize → Work Graph → prefix → scatter 四个 declared pass 录制，scatter 结束前把 commands/control 从 UAV 转为 INDIRECT_ARGUMENT；三个 replay stage 也分别声明实际输入、RT/DSV 和最终 COMMON 状态。stage 输出按原版语义检查：`DEPTH_BOUNDS` 只写原 bounds，`TRANSMITTANCE` 写实际 1/2/4 个 coefficient targets，`ACCUMULATE` 只写 Q；cull、terrain/cloud depth 与 normalization 各自属于独立执行事件。
 
-当前仍未发布可消费的 tile packet：JVM 尚未取得真实 tile regions、完整 visible/arguments 事件和与 replay stage 对应的输出资源。`BatchV2` 还没有表达 seal 后的 depth/cull/normalization 事件；旧 history capture 直接保存 typed `UnsupportedContent` 与 recording 身份，不执行冻结复制。native 边界的冻结能力已实现 UPLOAD/DEFAULT buffer 精确范围、单采样单 plane 非 depth Texture2D/cube 子资源与独立 SRV，支持范围、所有权和运行开销限制集中在 [TRANSMITTANCE tile 执行契约](transmittance-tile-execution.md#内容冻结与失败语义)。完整执行流仍需接入真实 allocation owner，避免逐 draw 镜像静态 VBO/atlas。`UnsupportedRoute` 保留实际 route 缺失的语义。
+当前仍未发布可消费的 tile packet。`BatchV2` 还没有表达 seal 后的 depth/cull/normalization 事件。native terrain capture 按精确范围冻结 buffer、Texture2D/Cube 子资源与独立 SRV。支持范围、所有权和运行开销限制集中在 [TRANSMITTANCE tile 执行契约](transmittance-tile-execution.md#内容冻结与失败语义)。完整执行流使用真实 allocation owner，避免逐 draw 镜像静态 VBO/atlas。`UnsupportedRoute` 保留实际 route 缺失的语义。V2 normalization 的 `recordingSerial` 必须与当前 OIT recording 相等。V2 seal 从真实地形 receipt 和已登记的读取范围构建有序 selection，供完整执行器创建 resident batch 的 replay plan。旧 V3 按历史 ordinal 准备的 plan 不参与 V2 selection。完整 replay 仍为 unavailable。
 
 `compileKotlin compileJava processResources` 已通过。2026-11-16 的事件采集在实际成功 draw 点保存 depth copy、bounds copy/cull 和 composite 的输入输出，不再靠 pipeline 名称分类或外层方法返回宣告完成。tile envelope 原有 HLSL 80 B / CPU 64 B 错位已统一为 64 B；DXC 编译 node、initialize、prefix、scatter 均通过，node/scatter 反射确认 stride=64。tile 录制后失败新增 `RecordingFailed`，JVM 按 Rejected 终止本帧，避免误走 unavailable。
 
@@ -514,11 +536,21 @@ mask V2 用真实颜色/深度历史、motion、jitter 差与 OIT 来源区分 r
 
 ## 当前构建与运行
 
+### Lane 拷贝与原版 PSO
+
+ABI31 使用 Minecraft 26.3.0.95 的原版源码，四条全屏 depth/bounds 管线通过生产 Naga 编译与源码认证，并在 RTX 5070 Laptop 上创建 PSO。三条 blit 使用 `InSampler` SRV 0，cull 使用 `Projection` CBV 0 和 `DepthBoundsSampler` SRV 1。native 可根据已认证 receipt 录制 tile array 拷贝和 cull。cull 的独立 GPU 验证覆盖两层各 68×68 个像素的 RGBA 和深度，包括通过测试写入与未通过时保留原值。完整帧调度尚未调用该入口。
+
+### 地形可见表分桶
+
+ABI30 用原地形 VS 将实际 visible meshlet 转为屏幕包围框，再完成 tile 分类、prefix 和间接命令生成。Kotlin 只分配 GPU scratch 和常量，各 stage 独立持有根签名。见[分桶契约](transmittance-tile-execution.md)。
+
+RTX 5070 Laptop 创建了全部 18 个 envelope PSO。独立 D3D12 GPU 检查覆盖 ACCUMULATE 的 normal/flipY、跨近裁面、同一 meshlet 覆盖两 tile 和 visible 表尾项。两种朝向均得到 mask `[2, 3, 0]`、3 条有效间接绘制命令、错误字段为 0。native、JVM 构建和 FFM 测试通过，`copyNative` 配套 DLL 哈希一致。完整帧仍等待四 lane 执行器。
+
 ### World depth seed 采集边界
 
-native 已提供显式启用的 seed journal，默认帧只保留有限计数，删除了每帧约 4 MiB 的完整事件表预分配。实际主 terrain WG 的 `ExecuteIndirect`、IA/indirect/mesh 和 depth clear 接入同一注册状态，tile replay 不反写 seed。opaque-before-composite 封口与资源寿命规则见 [完整事件流](transmittance-tile-execution.md#实际命令内容与-adapter-的实施契约)。目前没有 arm 的生产调用方或 seed executor，`GAP_OPAQUE_SEED` 继续保留。
+ABI29 将世界深度事实采集接入需要 OIT 重建且 resolve program 已发布的帧。在首个世界 depth clear 前开启，在 `executeOit` 入口封口。完整 clear 和真实 draw 通过原录制身份验证后清除 `GAP_OPAQUE_SEED`；四 lane 回放仍需要绑定冻结和 adapter。见[完整事件流](transmittance-tile-execution.md#实际命令内容与-adapter-的实施契约)。
 
-native Release/x64 编译链接通过，ABI 保持 25，日志为 `MCDR/target/depth-seed-scope-native-build.log`。DLL 为 4,458,496 字节，SHA256 `681C624DB4AC8E1FEABE6323FC2A64DC72435870DD2EFAEC6A0631923C992E7F`；独立 FFM 检查加载该 DLL，831 个布局字段与当前 JVM 镜像一致。当前结果覆盖编译、ABI 与 CPU 分配，未打包或替换客户端，seed 重放、四 lane 输出和游戏性能尚无本轮结果。
+native Release/x64 和 JVM `compileKotlin compileJava` 通过。`copyNative` 后构建目录和开发客户端使用的 DLL 哈希与 native 产物一致。FFM 检查通过 839 个布局字段及分配用例。RTX 5070 Laptop 的 `build/reports/workgraph/oit-operations/20261119-124750/gpu.log` 覆盖三帧和九条普通 OIT draw，其中一帧验证实际深度 clear/draw 和重复封口，一帧验证达到事件上限后仍可提交。`build/reports/workgraph/reuse/20261119-125506/gpu.log` 覆盖 Work Graph 资源别名、在途 context 和提交槽复用。游戏画面、地形四 lane 回放和性能尚无实测结果。
 
 ### Kotlin 内联与嵌套 FFM 分配
 

@@ -68,6 +68,16 @@ internal data class OitTerrainSelectionKey(
     val material: OitTerrainStageMaterial.Known,
 )
 
+internal data class OitTerrainStageOccurrenceKey(
+    val selection: OitTerrainSelectionKey,
+    val stage: net.minecraft.client.renderer.oit.OitStage,
+)
+
+internal data class OitTerrainOccurrenceKey(
+    val selection: OitTerrainSelectionKey,
+    val ordinal: Int,
+)
+
 internal data class OitTerrainPreparedBinding(
     val name: String, val handle: Long, val byteOffset: Long, val byteLength: Long,
 )

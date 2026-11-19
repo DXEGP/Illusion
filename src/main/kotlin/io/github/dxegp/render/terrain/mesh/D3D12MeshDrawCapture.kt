@@ -61,9 +61,6 @@ object D3D12MeshDrawCapture {
             }
         }
 
-        fun copyImmutable(): TerrainPreparedFacts = TerrainPreparedFacts(batch, pipeline, vertexBuffer,
-            vertexOffset, bindingHandles.copyOf(), bindingOffsets.copyOf(), bindingLengths.copyOf(),
-            meshletDescriptorOffsets.copyOf(), sectionCount, meshletCount, commandSelections, exactReadSet, uploadReads)
     }
 
     internal sealed interface TerrainUploadInput {
@@ -283,7 +280,8 @@ object D3D12MeshDrawCapture {
     }
 
     internal class BatchTables(val sections: GpuBufferSlice, val meshlets: GpuBufferSlice, val sectionCount: Int,
-                      val meshletCount: Int, val descriptors: D3D12MeshletResidency.PreparedDescriptors)
+                      val meshletCount: Int, val descriptors: D3D12MeshletResidency.PreparedDescriptors,
+                      val descriptorOffsets: IntArray?)
 
     private data class CommandRange(val offset: Long, val length: Long)
 
@@ -411,11 +409,13 @@ object D3D12MeshDrawCapture {
     internal fun facts(commands: GpuBufferSlice): TerrainBatchFacts? = batch(commands)?.facts
 
     internal fun buildTables(batch: Batch, layer: String, vertexSliceOffset: Long, ctx: Long,
-                    staging: D3D12TransientMemory, residency: D3D12MeshletResidency): BatchTables? {
+                    staging: D3D12TransientMemory, residency: D3D12MeshletResidency,
+                    descriptorOffsets: IntArray?): BatchTables? {
         if (vertexSliceOffset < 0L || batch.layer != layer) return null
         val meshletCount = batch.meshletCount ?: return null
         val dynamicBytes = batch.drawCount * 40L
         if (dynamicBytes > Int.MAX_VALUE) return null
+        require(descriptorOffsets == null || descriptorOffsets.size == batch.drawCount)
 
         val descriptors = residency.prepare(ctx, staging, batch.geometries)
         val sectionsSlice = staging.writeIntoStagingBlock(dynamicBytes, 256L) { destination ->
@@ -425,7 +425,9 @@ object D3D12MeshDrawCapture {
                 val baseVertex = draw.command.baseVertex()
                 sections.putInt(baseVertex)
                 sections.putInt(baseVertex / D3D12MeshletBuilder.VERTICES_PER_QUAD)
-                sections.putInt(descriptors.offset(draw.geometry))
+                val descriptorOffset = descriptors.offset(draw.geometry)
+                descriptorOffsets?.set(drawIndex, descriptorOffset)
+                sections.putInt(descriptorOffset)
                 sections.putInt(draw.geometry.meshlets.size)
                 sections.putInt(draw.section.x())
                 sections.putInt(draw.section.y())
@@ -436,7 +438,8 @@ object D3D12MeshDrawCapture {
             }
             dynamicBytes
         }.getOrThrow().first
-        return BatchTables(sectionsSlice, descriptors.buffer.slice(), batch.drawCount, meshletCount, descriptors)
+        return BatchTables(sectionsSlice, descriptors.buffer.slice(), batch.drawCount, meshletCount,
+            descriptors, descriptorOffsets)
     }
 
     private const val INDEXED_COMMAND_BYTES = 5L * Int.SIZE_BYTES

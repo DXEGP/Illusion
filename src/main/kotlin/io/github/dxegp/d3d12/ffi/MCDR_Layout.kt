@@ -814,6 +814,13 @@ object MCDRLayout {
     ).withName("mcdr_oit_normalization_pipeline_v1")
 
     @JvmField
+    val OIT_NORMALIZATION_PROGRAM_V1: MemoryLayout = MemoryLayout.structLayout(
+        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("targetCount"), I32.withName("reserved"),
+        I64.withName("programGeneration"), PTR.withName("laneDxil"), I64.withName("laneDxilBytes"),
+        PTR.withName("averageDxil"), I64.withName("averageDxilBytes"),
+    ).withName("mcdr_oit_normalization_program_v1")
+
+    @JvmField
     val OIT_EXECUTION_TEXTURE_V1: MemoryLayout = MemoryLayout.structLayout(
         I32.withName("schemaVersion"), I32.withName("structSize"), I64.withName("captureId"), PTR.withName("texture"),
         I64.withName("ownerIdentity"), I64.withName("ownerGeneration"), I64.withName("contentVersion"),
@@ -894,6 +901,7 @@ object MCDRLayout {
         arrayOf<Any>("mcdr_oit_execution_event_v2", OIT_EXECUTION_EVENT_V2, 168L),
         arrayOf<Any>("mcdr_oit_execution_texture_v1", OIT_EXECUTION_TEXTURE_V1, 64L),
         arrayOf<Any>("mcdr_oit_normalization_pipeline_v1", OIT_NORMALIZATION_PIPELINE_V1, 136L),
+        arrayOf<Any>("mcdr_oit_normalization_program_v1", OIT_NORMALIZATION_PROGRAM_V1, 56L),
         arrayOf<Any>("mcdr_oit_execution_normalization_v2", OIT_EXECUTION_NORMALIZATION_V2, 224L),
         arrayOf<Any>("mcdr_oit_execution_normalization_v1", OIT_EXECUTION_NORMALIZATION_V1, 288L),
         arrayOf<Any>("mcdr_oit_execution_scope_v2", OIT_EXECUTION_SCOPE_V2, 56L),
@@ -1015,6 +1023,7 @@ object MCDRLayout {
         STRUCTS["mcdr_oit_execution_event_v2"] = OIT_EXECUTION_EVENT_V2
         STRUCTS["mcdr_oit_execution_texture_v1"] = OIT_EXECUTION_TEXTURE_V1
         STRUCTS["mcdr_oit_normalization_pipeline_v1"] = OIT_NORMALIZATION_PIPELINE_V1
+        STRUCTS["mcdr_oit_normalization_program_v1"] = OIT_NORMALIZATION_PROGRAM_V1
         STRUCTS["mcdr_oit_execution_normalization_v2"] = OIT_EXECUTION_NORMALIZATION_V2
         STRUCTS["mcdr_oit_execution_normalization_v1"] = OIT_EXECUTION_NORMALIZATION_V1
         STRUCTS["mcdr_oit_execution_scope_v2"] = OIT_EXECUTION_SCOPE_V2

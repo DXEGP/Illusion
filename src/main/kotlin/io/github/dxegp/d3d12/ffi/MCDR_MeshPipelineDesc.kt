@@ -201,11 +201,6 @@ class MCDRMeshPipelineDesc {
      * never NULL while the length is 0.
      */
     private fun blob(arena: Arena, data: ByteArray?): MemorySegment {
-        if (data == null || data.size == 0) {
-            return arena.allocate(1)
-        }
-        val seg = arena.allocate(data.size.toLong())
-        MemorySegment.copy(data, 0, seg, BYTE, 0, data.size)
-        return seg
+        return if (data == null) arena.allocate(1L) else arena.allocateBytes(data)
     }
 }

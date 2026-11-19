@@ -71,9 +71,14 @@ class D3D12ShaderCompiler internal constructor(private val output: D3D12ShaderOu
         }
         var compiled = D3D12CompiledShader(vertexResult.hlsl, fragmentResult.hlsl, java.util.List.copyOf(entries),
             inputs, rootConstants, vertexResult.manifest.stageIo.outputs)
-        compiled = compiled.copy(oitNormalization = D3D12OitNormalizationSource.certify(
-            pipeline, globalDefines, vertex.source, fragment.source, compiled, expected, flipY,
-        ))
+        compiled = compiled.copy(
+            oitNormalization = D3D12OitNormalizationSource.certify(
+                pipeline, globalDefines, vertex.source, fragment.source, compiled, expected, flipY,
+            ),
+            oitLaneOperation = D3D12OitLaneOperationSource.certify(
+                pipeline, globalDefines, vertex.source, fragment.source, compiled, expected, flipY,
+            ),
+        )
         val tileCertification = D3D12OitCaptureSource.certifyReplayStage(fragment.source, pipeline,
             globalDefines, vertex.source)
         val tileCaptureIdentity = tileCertification?.let {

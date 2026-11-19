@@ -45,8 +45,7 @@ internal sealed interface OitCompositeInputCapture {
         val contentFailure: OitRecordFrames.SampledTextureCaptureResult.Unavailable? = null) : OitCompositeInputCapture
 }
 
-internal class OitCompositeTexture(val view: D3D12GpuTextureView, val texture: D3D12GpuTexture,
-    val content: OitRecordFrames.SampledTextureCapture) {
+internal class OitCompositeTexture(val view: D3D12GpuTextureView, val texture: D3D12GpuTexture) {
     val viewHandle = view.handle()
     val textureHandle = texture.handle()
     val format: GpuFormat = texture.format
@@ -145,15 +144,7 @@ internal class OitCompositeNormalizationInput private constructor(
             for (view in views) {
                 val d3dView = view as D3D12GpuTextureView
                 val texture = d3dView.texture() as D3D12GpuTexture
-                val capture = records.captureSampledTextureContent(d3dView.handle())
-                if (capture is OitRecordFrames.SampledTextureCaptureResult.Unavailable)
-                    return OitCompositeInputCapture.Unavailable(OitCompositeInputUnavailable.CONTENT_VERSION,
-                        certification, capture)
-                val content = (capture as OitRecordFrames.SampledTextureCaptureResult.Captured).content
-                if (content.texture != texture.handle() || content.firstSubresource != 0 || content.subresourceCount != 1)
-                    throw OitRecordException(OitRecordFailure.NATIVE_CONTRACT, "capture Composite texture",
-                        records.frame.identity, "Native capture ${content.captureId} does not match texture ${texture.handle()} or its subresource range")
-                textures += OitCompositeTexture(d3dView, texture, content)
+                textures += OitCompositeTexture(d3dView, texture)
             }
             return OitCompositeInputCapture.Available(OitCompositeNormalizationInput(records.frame,
                 records.recordingSerial, records.programGeneration, call.target, textures[0], textures[1], textures[2],
@@ -168,6 +159,7 @@ internal class OitCompositeDisplayConfirmation(
     private val originalPipeline: CompiledRenderPipeline,
     destination: RenderTarget,
     private val transparency: GpuTextureView,
+    private val transparencySampler: String,
 ) {
     private val color = checkNotNull(destination.colorTextureView)
     private val depth = checkNotNull(destination.depthTextureView)
@@ -183,7 +175,7 @@ internal class OitCompositeDisplayConfirmation(
         pass = actual
     }
 
-    fun confirmBinding(actual: RenderPass, name: String, source: GpuTextureView, effective: GpuTextureView,
+    fun confirmBinding(actual: RenderPass, name: String, source: GpuTextureView, effectiveName: String?, effective: GpuTextureView,
         sampler: GpuSampler) {
         check(pass === actual && !completed && frame === VanillaFrameCoordinator.currentFrame())
         val expected = when (name) {
@@ -195,10 +187,17 @@ internal class OitCompositeDisplayConfirmation(
         check(source === expected && sampler === original.sampler && !sampler.isClosed() && !source.isClosed()) {
             "Original Composite binding changed: $name"
         }
+        val expectedName = when {
+            name == "Sampler0" -> transparencySampler
+            transparencySampler != "Sampler0" && name.startsWith("Coeff") -> null
+            else -> name
+        }
+        check(effectiveName == expectedName) { "Display Composite binding name changed: $name" }
+        if (effectiveName == null) return
         check(effective === (if (name == "Sampler0") transparency else expected) && !effective.isClosed()) {
             "Display Composite binding changed: $name"
         }
-        bindings += name
+        bindings += effectiveName
     }
 
     fun confirmPipeline(actual: RenderPass, source: CompiledRenderPipeline, effective: CompiledRenderPipeline,
@@ -214,9 +213,14 @@ internal class OitCompositeDisplayConfirmation(
     fun confirmDraw(actual: RenderPass, vertexCount: Int, instanceCount: Int, firstVertex: Int, firstInstance: Int) {
         check(pass === actual && !completed && frame === VanillaFrameCoordinator.currentFrame())
         check(vertexCount == 3 && instanceCount == 1 && firstVertex == 0 && firstInstance == 0)
-        check(pipeline?.isClosed() == false && mapping != null && bindings.size == original.coefficients.size + 2 &&
-            "Sampler0" in bindings && "DepthBoundsSampler" in bindings &&
-            original.coefficients.indices.all { "Coeff$it" in bindings }) { "Composite display bindings are incomplete" }
+        val expectedBindings = buildSet {
+            add(transparencySampler)
+            add("DepthBoundsSampler")
+            if (transparencySampler == "Sampler0") repeat(original.coefficients.size) { add("Coeff$it") }
+        }
+        check(pipeline?.isClosed() == false && mapping != null && bindings == expectedBindings) {
+            "Composite display bindings are incomplete"
+        }
         completed = true
     }
 }

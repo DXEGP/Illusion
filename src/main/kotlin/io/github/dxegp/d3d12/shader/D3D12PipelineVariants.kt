@@ -16,6 +16,8 @@ internal class D3D12PipelineCompilation(
     val baseDescriptor: MCDRPipelineDesc,
     val createDescriptor: () -> MCDRPipelineDesc,
     val celestialMotionExact: Boolean = false,
+    val opaqueSeed: D3D12OpaqueSeedProgram? = null,
+    val iaTile: D3D12OitTileIaProgram? = null,
 ) {
     val tileRoute: D3D12OitTileCompilation get() = shaders.oitTile
 }

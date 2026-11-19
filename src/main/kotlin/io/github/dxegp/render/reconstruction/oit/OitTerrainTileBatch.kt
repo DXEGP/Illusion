@@ -1,6 +1,9 @@
 package io.github.dxegp.render.reconstruction.oit
 
 import io.github.dxegp.d3d12.ffi.MCDRLayout
+import io.github.dxegp.d3d12.shader.D3D12OitTileContract.LANE_COUNT
+import io.github.dxegp.d3d12.shader.D3D12OitTileContract.MAX_RESIDENT_TILES
+import io.github.dxegp.d3d12.shader.D3D12OitTileContract.TILE_SIZE
 import java.lang.foreign.Arena
 import java.lang.foreign.MemorySegment
 import java.lang.foreign.MemoryLayout.PathElement.groupElement
@@ -28,6 +31,38 @@ internal data class OitTerrainTileRegion(val originX: Int, val originY: Int, val
     }
 }
 
+internal class OitTerrainTileGrid(val width: Int, val height: Int) {
+    init {
+        require(width > 0 && height > 0)
+    }
+
+    private val columns = Math.ceilDiv(width, TILE_SIZE)
+    val tileCount = Math.multiplyExact(columns, Math.ceilDiv(height, TILE_SIZE))
+
+    fun writeRegions(target: MemorySegment, base: Long, firstTile: Int, count: Int) {
+        require(count in 1..MAX_RESIDENT_TILES && firstTile in 0..(tileCount - count))
+        for (index in 0 until count) {
+            val tile = firstTile + index
+            val x = tile % columns * TILE_SIZE
+            val y = tile / columns * TILE_SIZE
+            val offset = base + index * regionSize
+            target.set(MCDRLayout.I32, offset + originX, x)
+            target.set(MCDRLayout.I32, offset + originY, y)
+            target.set(MCDRLayout.I32, offset + effectiveWidth, minOf(TILE_SIZE, width - x))
+            target.set(MCDRLayout.I32, offset + effectiveHeight, minOf(TILE_SIZE, height - y))
+        }
+    }
+
+    companion object {
+        private val layout = MCDRLayout.TERRAIN_TILE
+        val regionSize = layout.byteSize()
+        private val originX = layout.byteOffset(groupElement("originX"))
+        private val originY = layout.byteOffset(groupElement("originY"))
+        private val effectiveWidth = layout.byteOffset(groupElement("effectiveWidth"))
+        private val effectiveHeight = layout.byteOffset(groupElement("effectiveHeight"))
+    }
+}
+
 internal data class OitTerrainTileStage(
     val stage: Int,
     val pipeline: Long,
@@ -36,7 +71,7 @@ internal data class OitTerrainTileStage(
     val renderTargets: List<OitTerrainTileResource>,
 ) {
     init {
-        require(stage in 0..2 && pipeline != 0L && rootSignature != 0L && renderTargets.isNotEmpty() && renderTargets.size <= 5)
+        require(stage in 0..2 && (pipeline == 0L) == (rootSignature == 0L) && renderTargets.isNotEmpty() && renderTargets.size <= 5)
     }
 }
 
@@ -47,8 +82,8 @@ internal data class OitTerrainTileBatch(
     val worldEpoch: Long,
     val programGeneration: Long,
     val resourceVersion: Long,
-    val sourceViewport: FloatArray,
-    val tiles: List<OitTerrainTileRegion>,
+    private val grid: OitTerrainTileGrid,
+    private val firstTile: Int,
     val primitiveCount: Int,
     val refCapacity: Int,
     val commandKind: Int,
@@ -71,48 +106,40 @@ internal data class OitTerrainTileBatch(
     val binningInitializePipeline: Long,
     val binningPrefixPipeline: Long,
     val binningScatterPipeline: Long,
-    val routeRootSignature: Long,
     val stages: List<OitTerrainTileStage>,
     internal val lifetime: AutoCloseable? = null,
 ) {
     init {
-        require(residentTileCount in 1..16 && laneIndex in 0..3)
+        require(residentTileCount in 1..MAX_RESIDENT_TILES && laneIndex in 0 until LANE_COUNT)
         require(frameSerial > 0L && worldEpoch > 0L && programGeneration > 0L && resourceVersion > 0L)
-        require(sourceViewport.size == 4 && sourceViewport.all(Float::isFinite) &&
-            sourceViewport[2] > 0f && sourceViewport[3] > 0f)
-        require(tiles.size == residentTileCount && primitiveCount > 0 &&
+        require(firstTile in 0..(grid.tileCount - residentTileCount) && primitiveCount > 0 &&
             refCapacity.toLong() >= Math.multiplyExact(primitiveCount.toLong(), residentTileCount.toLong()))
         require(commandKind in 0..1 && commandStride == if (commandKind == 0) 36 else 28)
         require(coefficients.size == 4 && binningWorkGraph != 0L && binningInitializePipeline != 0L &&
             binningPrefixPipeline != 0L && binningScatterPipeline != 0L)
-        require(routeRootSignature != 0L)
         require(stages.size == 3 && stages.map { it.stage } == listOf(0, 1, 2))
-        require(stages.map { it.rootSignature }.toSet() == setOf(routeRootSignature))
     }
 
-    private fun writePayload(target: MemorySegment, layout: java.lang.foreign.MemoryLayout) {
-        fun i32(name: String, value: Int) = target.set(MCDRLayout.I32, layout.byteOffset(groupElement(name)), value)
-        fun i64(name: String, value: Long) = target.set(MCDRLayout.I64, layout.byteOffset(groupElement(name)), value)
-        fun ptr(name: String, value: Long) = target.set(MCDRLayout.PTR, layout.byteOffset(groupElement(name)), MemorySegment.ofAddress(value))
-        i32("schemaVersion", 2); i32("structSize", Math.toIntExact(layout.byteSize()))
+    private fun writePayload(target: MemorySegment) {
+        fun i32(name: String, value: Int) = target.set(MCDRLayout.I32, batchLayout.byteOffset(groupElement(name)), value)
+        fun i64(name: String, value: Long) = target.set(MCDRLayout.I64, batchLayout.byteOffset(groupElement(name)), value)
+        fun ptr(name: String, value: Long) = target.set(MCDRLayout.PTR, batchLayout.byteOffset(groupElement(name)), MemorySegment.ofAddress(value))
+        i32("schemaVersion", 2); i32("structSize", Math.toIntExact(batchSize))
         i32("residentTileCount", residentTileCount); i32("laneIndex", laneIndex); i32("flags", 0); i32("reserved0", 0)
         i64("frameSerial", frameSerial); i64("worldEpoch", worldEpoch); i64("programGeneration", programGeneration); i64("resourceVersion", resourceVersion)
-        val viewport = layout.byteOffset(groupElement("sourceViewport"))
-        sourceViewport.forEachIndexed { index, value -> target.set(MCDRLayout.F32, viewport + index * MCDRLayout.F32.byteSize(), value) }
-        val tileBase = layout.byteOffset(groupElement("tiles"))
-        tiles.forEachIndexed { index, tile ->
-            val offset = tileBase + index * MCDRLayout.TERRAIN_TILE.byteSize()
-            target.set(MCDRLayout.I32, offset, tile.originX); target.set(MCDRLayout.I32, offset + 4, tile.originY)
-            target.set(MCDRLayout.I32, offset + 8, tile.width); target.set(MCDRLayout.I32, offset + 12, tile.height)
-        }
+        val floatSize = MCDRLayout.F32.byteSize()
+        target.set(MCDRLayout.F32, viewportOffset, 0f)
+        target.set(MCDRLayout.F32, viewportOffset + floatSize, 0f)
+        target.set(MCDRLayout.F32, viewportOffset + 2 * floatSize, grid.width.toFloat())
+        target.set(MCDRLayout.F32, viewportOffset + 3 * floatSize, grid.height.toFloat())
         i32("primitiveCount", primitiveCount); i32("refCapacity", refCapacity); i32("commandKind", commandKind); i32("commandStride", commandStride)
         fun resource(name: String, value: OitTerrainTileResource) {
-            value.write(target.asSlice(layout.byteOffset(groupElement(name)), MCDRLayout.TERRAIN_TILE_RESOURCE_REF.byteSize()), MCDRLayout.TERRAIN_TILE_RESOURCE_REF)
+            value.write(target.asSlice(batchLayout.byteOffset(groupElement(name)), MCDRLayout.TERRAIN_TILE_RESOURCE_REF.byteSize()), MCDRLayout.TERRAIN_TILE_RESOURCE_REF)
         }
         resource("binningConstants", binningConstants); resource("envelopes", envelopes); resource("masks", masks)
         resource("prefixes", prefixes); resource("commands", commands); resource("control", control); resource("bounds", bounds)
         resource("culledBounds", culledBounds); resource("depthTerrain", depthTerrain); resource("depthCloud", depthCloud)
-        val coefficientsOffset = layout.byteOffset(groupElement("coefficients"))
+        val coefficientsOffset = batchLayout.byteOffset(groupElement("coefficients"))
         this.coefficients.forEachIndexed { index, value ->
             value.write(
                 target.asSlice(
@@ -125,7 +152,7 @@ internal data class OitTerrainTileBatch(
         resource("q", q); resource("scratchColor", scratchColor); resource("scratchDepth", scratchDepth)
         ptr("binningWorkGraph", binningWorkGraph); ptr("binningInitializePipeline", binningInitializePipeline)
         ptr("binningPrefixPipeline", binningPrefixPipeline); ptr("binningScatterPipeline", binningScatterPipeline)
-        val stagesBase = layout.byteOffset(groupElement("stages"))
+        val stagesBase = batchLayout.byteOffset(groupElement("stages"))
         stages.forEachIndexed { index, stage ->
             val stageLayout = MCDRLayout.TERRAIN_TILE_STAGE_BINDING_V2
             val base = stagesBase + index * stageLayout.byteSize()
@@ -141,10 +168,29 @@ internal data class OitTerrainTileBatch(
     }
 
     internal fun write(arena: Arena): MemorySegment {
-        val layout = MCDRLayout.TERRAIN_TILE_BATCH_V2
-        val target = arena.allocate(layout)
-        writePayload(target, layout)
+        val target = arena.allocate(batchLayout)
+        writePayload(target)
+        grid.writeRegions(target, tilesOffset, firstTile, residentTileCount)
         return target
+    }
+
+    internal fun writeLanePayloads(target: MemorySegment) {
+        require(target.byteSize() == laneBatchBytes)
+        target.fill(0)
+        writePayload(target)
+        for (lane in 0 until LANE_COUNT) {
+            val base = lane * batchSize
+            if (lane != 0) MemorySegment.copy(target, 0, target, base, batchSize)
+            target.set(MCDRLayout.I32, base + laneIndexOffset, lane)
+        }
+    }
+
+    internal fun writeLaneRegions(target: MemorySegment, firstTile: Int) {
+        grid.writeRegions(target, tilesOffset, firstTile, residentTileCount)
+        val regionBytes = residentTileCount * OitTerrainTileGrid.regionSize
+        for (lane in 1 until LANE_COUNT) {
+            MemorySegment.copy(target, tilesOffset, target, lane * batchSize + tilesOffset, regionBytes)
+        }
     }
 
     internal fun writeV3(arena: Arena, packetOrdinal: Int, packetCount: Int): MemorySegment {
@@ -156,12 +202,24 @@ internal data class OitTerrainTileBatch(
         target.set(MCDRLayout.I32, layout.byteOffset(groupElement("packetOrdinal")), packetOrdinal)
         target.set(MCDRLayout.I32, layout.byteOffset(groupElement("packetCount")), packetCount)
         val payloadOffset = layout.byteOffset(groupElement("payload"))
-        writePayload(target.asSlice(payloadOffset, MCDRLayout.TERRAIN_TILE_BATCH_V2.byteSize()), MCDRLayout.TERRAIN_TILE_BATCH_V2)
+        val payload = target.asSlice(payloadOffset, batchSize)
+        writePayload(payload)
+        grid.writeRegions(payload, tilesOffset, firstTile, residentTileCount)
         return target
     }
 
     internal fun closeResources() {
         lifetime?.close()
+    }
+
+    companion object {
+        private val batchLayout = MCDRLayout.TERRAIN_TILE_BATCH_V2
+        private val batchSize = batchLayout.byteSize()
+        private val viewportOffset = batchLayout.byteOffset(groupElement("sourceViewport"))
+        private val tilesOffset = batchLayout.byteOffset(groupElement("tiles"))
+        private val laneIndexOffset = batchLayout.byteOffset(groupElement("laneIndex"))
+        val laneBatchBytes = LANE_COUNT * batchSize
+        val laneBatchAlignment = batchLayout.byteAlignment()
     }
 
 }

@@ -44,6 +44,12 @@ internal sealed interface OitNativeOperationReceiptQuery {
 }
 
 internal object OitNativeOperationReceipts {
+    internal object State {
+        const val RECORDED = 1
+        const val CONTENT_FROZEN = 1
+        const val ADAPTER_READY = 1
+    }
+
     private val scratch = ThreadLocal.withInitial { FfmScratch() }
     private object Begin {
         private val layout = MCDRLayout.OIT_EXECUTION_OPERATION_BEGIN_V1

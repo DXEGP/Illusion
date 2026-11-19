@@ -290,12 +290,7 @@ class MCDRPipelineDesc {
      * never NULL (native rejects NULL paired with a non-zero length).
      */
     private fun blob(arena: Arena, data: ByteArray?): MemorySegment {
-        if (data == null || data.size == 0) {
-            return arena.allocate(1)
-        }
-        val seg = arena.allocate(data.size.toLong())
-        MemorySegment.copy(data, 0, seg, BYTE, 0, data.size)
-        return seg
+        return if (data == null) arena.allocate(1L) else arena.allocateBytes(data)
     }
 
     /** NUL-terminated UTF-8, or NULL when the name is empty (native falls back to TEXCOORD). */

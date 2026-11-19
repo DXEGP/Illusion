@@ -49,6 +49,7 @@ internal object D3D12SceneDisplay : AutoCloseable {
     private var sealed = false
     private var samplingGrid = VanillaWorldOutput.SamplingGrid.CURRENT_RASTER
     private val effects = ArrayList<DisplayPostInputs>()
+    private val sourceMappingConstants = ByteBuffer.allocate(8).order(ByteOrder.nativeOrder())
 
     fun targetForFrame(): RenderTarget? = target.takeIf { frame != null && !sealed }
 
@@ -63,7 +64,8 @@ internal object D3D12SceneDisplay : AutoCloseable {
             DepthMapping.RASTER_TO_DISPLAY -> 1f
             DepthMapping.DISPLAY_TO_RASTER -> -1f
         }
-        val constants = ByteBuffer.allocateDirect(8).order(ByteOrder.nativeOrder())
+        val constants = sourceMappingConstants
+        constants.clear()
         constants.putFloat((direction * value.current.jitterX / value.identity.width).toFloat())
         constants.putFloat((-direction * value.current.jitterY / value.identity.height).toFloat())
         constants.flip()

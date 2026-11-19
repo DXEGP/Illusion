@@ -2,6 +2,7 @@ package io.github.dxegp.render.terrain.mesh
 
 import com.mojang.renderpearl.api.buffers.GpuBufferSlice
 import com.mojang.renderpearl.api.pipeline.RenderPipeline
+import com.mojang.blaze3d.systems.RenderSystem
 import io.github.dxegp.config.D3D12Settings
 import io.github.dxegp.d3d12.backend.D3D12CompiledRenderPipeline
 import io.github.dxegp.d3d12.backend.D3D12BindGroupEntry
@@ -18,8 +19,31 @@ import io.github.dxegp.d3d12.shader.D3D12CompiledShader
 import io.github.dxegp.d3d12.shader.D3D12OitGuideSource
 import io.github.dxegp.d3d12.shader.NagaVertexAdapter
 import java.nio.ByteOrder
+import java.util.WeakHashMap
 
 object D3D12TerrainWorkGraph {
+    private val uniformUploadInputs = WeakHashMap<D3D12CompiledRenderPipeline,
+        List<D3D12MeshDrawCapture.TerrainUploadInput.Uniform>>()
+
+    private class BindingScratch {
+        var handles = LongArray(0)
+            private set
+        var offsets = LongArray(0)
+            private set
+        var lengths = LongArray(0)
+            private set
+
+        fun ensure(count: Int): BindingScratch {
+            if (handles.size < count) {
+                handles = LongArray(count)
+                offsets = LongArray(count)
+                lengths = LongArray(count)
+            }
+            return this
+        }
+    }
+
+    private val bindingScratch = ThreadLocal.withInitial { BindingScratch() }
     fun requireSupport() {
         if (!D3D12Settings.meshTerrain) return
         val adapter = D3D12AdapterInfo.current
@@ -47,20 +71,23 @@ object D3D12TerrainWorkGraph {
             pipeline.colorTargetStates.any { it?.blendFunction()?.isPresent == true })
     }
 
-    internal class Prepared(override val pipeline: Long, private var batch: Long,
+    internal class Prepared(override val pipeline: Long, private var batch: Long, private val vertexBytes: Long,
         override val capture: D3D12PreparedRasterCapture?,
         override val terrainFacts: D3D12MeshDrawCapture.TerrainPreparedFacts?,
         private val preparedFactsConsumer: ((D3D12TerrainPreparedFacts) -> Unit)?) : D3D12PreparedRasterDispatch {
         internal val batchHandle: Long get() = batch
+        private var factsRecorded = false
         override fun draw(context: Long, vertexBuffer: D3D12GpuBuffer, vertexOffset: Long): Boolean {
-            check(MCDR_ABI.D3D12DrawTerrainWorkGraph(context, batch, vertexBuffer.handle(), vertexOffset)) {
+            check(MCDR_ABI.D3D12DrawTerrainWorkGraphV2(context, batch, vertexBuffer.handle(), vertexOffset, vertexBytes)) {
                 "Terrain Work Graph draw failed: ${MCDR_ABI.D3D12LastError()}"
             }
             return true
         }
 
         override fun recordPreparedFacts() {
-            if (preparedFactsConsumer != null) preparedFactsConsumer.invoke(checkNotNull(terrainFacts))
+            if (factsRecorded) return
+            factsRecorded = true
+            preparedFactsConsumer?.invoke(checkNotNull(terrainFacts))
         }
 
         override fun close() {
@@ -75,12 +102,12 @@ object D3D12TerrainWorkGraph {
     }
 
     fun source(shader: D3D12CompiledShader, backfaceCull: Boolean): String? {
-        val vertex = NagaVertexAdapter.adapt(shader) ?: return null
+        (val source, val uniforms1 = uniforms) = NagaVertexAdapter.adapt(shader) ?: return null
         val names = listOf("CameraBlockPos", "CameraOffset", "ModelViewMat", "ProjMat")
-        val uniforms = names.map { vertex.uniforms[it] ?: return null }
+        val uniforms = names.map { uniforms1[it] ?: return null }
         return buildString {
-            appendLine(vertex.source)
-            for ((index, macro) in listOf("TERRAIN_CAMERA_BLOCK", "TERRAIN_CAMERA_OFFSET",
+            appendLine(source)
+            for ([index, macro] in listOf("TERRAIN_CAMERA_BLOCK", "TERRAIN_CAMERA_OFFSET",
                 "TERRAIN_MODEL_VIEW", "TERRAIN_PROJECTION").withIndex()) {
                 appendLine("#define $macro ${uniforms[index]}")
             }
@@ -100,6 +127,7 @@ object D3D12TerrainWorkGraph {
                 rasterMotionTarget: Long = 0L, additionalAttachment: D3D12AdditionalRasterAttachment? = null,
                 capture: D3D12PreparedRasterCapture? = null,
                 preparedFactsConsumer: ((D3D12TerrainPreparedFacts) -> Unit)? = null): Prepared? {
+        RenderSystem.assertOnRenderThread()
         val location = compiled.info().location.toString()
         if (requiresOrderedDraw(compiled.info())) return null
         val layer = when {
@@ -135,7 +163,10 @@ object D3D12TerrainWorkGraph {
         }
         if (pipeline == 0L) return null
         batch.retainGeometryReads(staging, vertexBuffer, vertexOffset)
-        val tables = D3D12MeshDrawCapture.buildTables(batch, layer, vertexOffset, ctx, staging, residency)
+        val descriptorOffsets = if (capture != null || preparedFactsConsumer != null)
+            IntArray(batch.drawCount) else null
+        val tables = D3D12MeshDrawCapture.buildTables(batch, layer, vertexOffset, ctx, staging, residency,
+            descriptorOffsets)
             ?: return null
         val globals = staging.writeIntoStagingBlock(32L, 256L) { destination ->
             destination.order(ByteOrder.LITTLE_ENDIAN)
@@ -146,13 +177,25 @@ object D3D12TerrainWorkGraph {
         }.getOrThrow().first
         val uniformBindings = compiled.uniformBindings
         val uniformCount = uniformBindings.size
-        val handles = LongArray(uniformCount + 3)
-        val offsets = LongArray(handles.size)
-        val lengths = LongArray(handles.size)
+        val bindingCount = uniformCount + 3
+        val reusableBindings = if (capture == null && preparedFactsConsumer == null)
+            bindingScratch.get().ensure(bindingCount) else null
+        val handles = reusableBindings?.handles ?: LongArray(bindingCount)
+        val offsets = reusableBindings?.offsets ?: LongArray(bindingCount)
+        val lengths = reusableBindings?.lengths ?: LongArray(bindingCount)
         val uploadReads = if (capture != null || preparedFactsConsumer != null)
             ArrayList<D3D12MeshDrawCapture.TerrainUploadReadFact>(uniformCount + 2) else null
-        var uniformSlot = 0
-        for (bindingIndex in handles.indices) {
+        val uploadInputs = if (uploadReads != null) uniformUploadInputs.getOrPut(compiled) {
+            buildList(uniformCount) {
+                for ([slot, binding] in compiled.bindingLayout.entries.withIndex()) {
+                    if (binding.type != D3D12BindGroupEntry.Type.UNIFORM_BUFFER) continue
+                    check(binding.name == uniformBindings[size].name)
+                    add(D3D12MeshDrawCapture.TerrainUploadInput.Uniform(binding.name, slot))
+                }
+                check(size == uniformCount)
+            }
+        } else null
+        for (bindingIndex in 0 until bindingCount) {
             val slice = when (bindingIndex) {
                 uniformCount -> globals
                 uniformCount + 1 -> tables.sections
@@ -171,12 +214,7 @@ object D3D12TerrainWorkGraph {
                 val input = when (bindingIndex) {
                     uniformCount -> D3D12MeshDrawCapture.TerrainUploadInput.TerrainGlobals
                     uniformCount + 1 -> D3D12MeshDrawCapture.TerrainUploadInput.TerrainSections
-                    else -> {
-                        while (compiled.bindingLayout.entries[uniformSlot].type != D3D12BindGroupEntry.Type.UNIFORM_BUFFER) uniformSlot++
-                        val binding = uniformBindings[bindingIndex]
-                        check(compiled.bindingLayout.entries[uniformSlot].name == binding.name)
-                        D3D12MeshDrawCapture.TerrainUploadInput.Uniform(binding.name, uniformSlot++)
-                    }
+                    else -> checkNotNull(uploadInputs)[bindingIndex]
                 }
                 uploadReads += D3D12MeshDrawCapture.TerrainUploadReadFact(bindingIndex, input,
                     staging.retainPreparedUploadRead(slice))
@@ -186,7 +224,7 @@ object D3D12TerrainWorkGraph {
             D3D12MeshDrawCapture.TerrainPreparedFacts(
                 facts, pipeline, vertexBuffer.handle(), vertexOffset,
                 handles, offsets, lengths,
-                IntArray(batch.drawCount) { index -> tables.descriptors.offset(batch.draws[index].geometry) },
+                checkNotNull(tables.descriptorOffsets),
                 tables.sectionCount, tables.meshletCount,
                 batch.commandSelections,
                 batch.exactReadSet(vertexBuffer, vertexOffset, tables.descriptors),
@@ -195,8 +233,8 @@ object D3D12TerrainWorkGraph {
         } else null
         val handle = MCDR_ABI.D3D12PrepareTerrainWorkGraph(ctx, compiled.terrainProgram,
             handles, offsets, lengths,
-            tables.sectionCount, tables.meshletCount)
+            tables.sectionCount, tables.meshletCount, bindingCount = bindingCount)
         check(handle != 0L) { "Terrain Work Graph preparation failed: ${MCDR_ABI.D3D12LastError()}" }
-        return Prepared(pipeline, handle, capture, preparedFacts, preparedFactsConsumer)
+        return Prepared(pipeline, handle, batch.requiredVertexBytes, capture, preparedFacts, preparedFactsConsumer)
     }
 }

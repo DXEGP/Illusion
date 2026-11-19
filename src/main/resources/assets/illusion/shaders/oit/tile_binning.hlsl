@@ -1,15 +1,19 @@
-StructuredBuffer<McdrTileEnvelopeV1> McdrTileEnvelopesV1 : register(t8, space3);
-RWByteAddressBuffer McdrTileMasksV1 : register(u0, space3);
-RWByteAddressBuffer McdrTilePrefixesV1 : register(u1, space3);
-RWByteAddressBuffer McdrTileCommandsV1 : register(u2, space3);
-RWByteAddressBuffer McdrTileControlV1 : register(u3, space3);
-
 cbuffer McdrTileBinBatchV1 : register(b2, space3) {
     uint McdrTilePrimitiveCount;
     uint McdrTileRefCapacity;
     uint McdrTileCommandKind;
     uint McdrTileCommandStride;
+#ifdef MCDR_TILE_TERRAIN_ENVELOPES
+    uint McdrTileFirstVisible;
+#endif
 };
+
+#ifndef MCDR_TILE_TERRAIN_ENVELOPES
+StructuredBuffer<McdrTileEnvelopeV1> McdrTileEnvelopesV1 : register(t8, space3);
+RWByteAddressBuffer McdrTileMasksV1 : register(u0, space3);
+RWByteAddressBuffer McdrTilePrefixesV1 : register(u1, space3);
+RWByteAddressBuffer McdrTileCommandsV1 : register(u2, space3);
+RWByteAddressBuffer McdrTileControlV1 : register(u3, space3);
 
 struct McdrTileBinEntryV1 {
     uint3 grid : SV_DispatchGrid;
@@ -171,4 +175,5 @@ void ScatterTileCommandsV1(uint3 thread : SV_DispatchThreadID) {
     }
 }
 
+#endif
 #endif

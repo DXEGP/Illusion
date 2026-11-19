@@ -17,8 +17,10 @@ import io.github.dxegp.d3d12.shader.D3D12RasterMotionShader
 import io.github.dxegp.d3d12.shader.D3D12RasterMotionSource
 import io.github.dxegp.d3d12.shader.D3D12OitGuideSource
 import io.github.dxegp.d3d12.shader.D3D12OitTileCompilation
+import io.github.dxegp.d3d12.shader.D3D12OitTileContract
 import io.github.dxegp.d3d12.shader.D3D12OitTileMeshCompilation
 import io.github.dxegp.d3d12.shader.D3D12OitTileTerrainRoute
+import io.github.dxegp.d3d12.shader.D3D12OitTileShader
 import io.github.dxegp.d3d12.shader.identity
 import io.github.dxegp.render.reconstruction.oit.OitReconstructionInputs
 
@@ -96,6 +98,11 @@ internal object TerrainPipelineCompiler {
         val oitVariants = mutableMapOf<D3D12OitGuideSource, MutableMap<Int, Long>>()
         val oitMotionVariants = mutableMapOf<D3D12OitGuideSource, MutableMap<Int, Long>>()
         val captureVariants = mutableMapOf<Int, Long>()
+        val opaqueSeed = compilation.opaqueSeed?.takeIf {
+            info.depthStencilState?.writeDepth() == true &&
+                it.flipY == (compilation.orientation == D3D12PipelineOrientation.FLIPPED_Y)
+        }
+        val opaqueMeshRoutes = mutableMapOf<Int, D3D12OitTileMeshCompilation.Candidate>()
         fun terrainDescriptor(mesh: ByteArray, fragment: ByteArray): MCDRMeshPipelineDesc {
             val descriptor = MCDRMeshPipelineDesc().shaders(mesh, null, fragment)
             for (binding in rootBindings) descriptor.addBinding(binding.first, binding.second)
@@ -136,6 +143,10 @@ internal object TerrainPipelineCompiler {
                 val hlsl = checkNotNull(D3D12MeshletShader.build(compiled, format,
                     quadsPerMeshlet = quads, visibleWork = true))
                 tileCandidate?.let { tileMeshRoutes[quads] = it.routeTerrainMesh(hlsl) }
+                if (opaqueSeed != null) {
+                    val route = D3D12OitTileShader.routeTerrainMesh(hlsl, opaqueSeed.fragmentHlsl, emptyList())
+                    if (route is D3D12OitTileMeshCompilation.Candidate) opaqueMeshRoutes[quads] = route
+                }
                 val mesh = compile(hlsl, "ms_main", "ms_6_9")
                 val descriptor = terrainDescriptor(mesh, pixel)
                 val pipeline = MCDR_ABI.D3D12CreateMeshPipelineWithRootSignature(descriptor, root, info.pushConstantSize())
@@ -186,6 +197,48 @@ internal object TerrainPipelineCompiler {
             program = MCDR_ABI.D3D12CreateTerrainWorkGraph(nodes, initialize, finalize,
                 uniformRegisters, 512L * 1024 * 1024)
             check(program != 0L) { "Terrain Work Graph creation failed: ${MCDR_ABI.D3D12LastError()}" }
+            if (opaqueSeed != null && opaqueMeshRoutes.size == variants.size) {
+                val contract = MCDR_ABI.D3D12OitShaderPreludeV1()
+                val shaderAbi = contract.abi
+                val shaderHash = contract.hash
+                val generation = opaqueSeed.programGeneration
+                val tileRoot = MCDR_ABI.D3D12CreateTerrainTileRootV1(rootBindings, info.pushConstantSize(),
+                    shaderAbi, shaderHash, generation)
+                check(tileRoot != 0L) { "Terrain seed root failed: ${MCDR_ABI.D3D12LastError()}" }
+                try {
+                    val fragment = compile(opaqueSeed.fragmentHlsl, "main", "ps_6_9")
+                    for ((quads, route) in opaqueMeshRoutes) {
+                        val mesh = compile(route.meshHlsl, "ms_main", "ms_6_9")
+                        val envelope = compile(route.envelopeHlsl, D3D12OitTileContract.TERRAIN_ENVELOPE_ENTRY, "cs_6_9")
+                        val descriptor = terrainDescriptor(mesh, fragment)
+                        descriptor.colorTargets.clear()
+                        var tilePipeline = 0L
+                        var nativeRoute = 0L
+                        try {
+                            tilePipeline = MCDR_ABI.D3D12CreateMeshPipelineWithRootSignature(
+                                descriptor, tileRoot, info.pushConstantSize())
+                            check(tilePipeline != 0L) { "Terrain seed PSO failed: ${MCDR_ABI.D3D12LastError()}" }
+                            nativeRoute = MCDR_ABI.D3D12CreateTerrainTileRouteV1(
+                                tileRoot, shaderAbi, shaderHash, generation)
+                            check(nativeRoute != 0L) { "Terrain seed route failed: ${MCDR_ABI.D3D12LastError()}" }
+                            check(MCDR_ABI.D3D12BindTerrainTilePipelineV1(nativeRoute, tilePipeline) &&
+                                MCDR_ABI.D3D12BindTerrainTileEnvelopeV1(nativeRoute, envelope)) {
+                                "Terrain seed route binding failed: ${MCDR_ABI.D3D12LastError()}"
+                            }
+                            for (sourcePipeline in listOfNotNull(variants.getValue(quads), motionVariants[quads])) {
+                                check(MCDR_ABI.D3D12BindTerrainOpaqueSeedV1(sourcePipeline, nativeRoute, generation, quads)) {
+                                    "Terrain seed source registration failed: ${MCDR_ABI.D3D12LastError()}"
+                                }
+                            }
+                        } finally {
+                            MCDR_ABI.D3D12DestroyTerrainTileRouteV1(nativeRoute)
+                            if (tilePipeline != 0L) MCDR_ABI.D3D12DestroyPipeline(tilePipeline)
+                        }
+                    }
+                } finally {
+                    MCDR_ABI.D3D12ReleaseRootSignature(tileRoot)
+                }
+            }
             val tileRouteDescriptor = if (tileCandidate != null && captureIdentity != null &&
                 tileMeshRoutes.size == 3 && tileMeshRoutes.values.all { it is D3D12OitTileMeshCompilation.Candidate }) {
                 D3D12OitTileTerrainRoute(tileCandidate, captureIdentity, tileMeshRoutes.toMap())
@@ -210,6 +263,8 @@ internal object TerrainPipelineCompiler {
                         val meshRoute = (route.meshRoutes.getValue(quads) as D3D12OitTileMeshCompilation.Candidate)
                         val tileMesh = compile(meshRoute.meshHlsl, "ms_main", "ms_6_9")
                         val tilePixel = compile(meshRoute.fragmentHlsl, "main", "ps_6_9")
+                        val envelope = compile(meshRoute.envelopeHlsl,
+                            D3D12OitTileContract.TERRAIN_ENVELOPE_ENTRY, "cs_6_9")
                         var tilePipeline = 0L
                         var nativeRoute = 0L
                         try {
@@ -227,18 +282,21 @@ internal object TerrainPipelineCompiler {
                             check(MCDR_ABI.D3D12BindTerrainTilePipelineV1(nativeRoute, tilePipeline)) {
                                 "Terrain tile ${quads}-quad pipeline bind failed: ${MCDR_ABI.D3D12LastError()}"
                             }
-                            check(MCDR_ABI.D3D12BindTerrainTileStageV2(
-                                variants.getValue(quads), nativeRoute, route.capture.shaderAbiVersion,
-                                route.capture.shaderContractHash, route.capture.programGeneration,
-                                route.program.stage.ordinal, quads)) {
-                                "Terrain tile ${quads}-quad source bind failed: ${MCDR_ABI.D3D12LastError()}"
+                            check(MCDR_ABI.D3D12BindTerrainTileEnvelopeV1(nativeRoute, envelope)) {
+                                "Terrain tile ${quads}-quad envelope bind failed: ${MCDR_ABI.D3D12LastError()}"
                             }
-                            captureVariants[quads]?.let { capturePipeline ->
-                                check(MCDR_ABI.D3D12BindTerrainTileStageV2(
-                                    capturePipeline, nativeRoute, route.capture.shaderAbiVersion,
+                            val sourcePipelines = buildList {
+                                add(variants.getValue(quads))
+                                captureVariants[quads]?.let(::add)
+                                oitVariants.values.mapNotNullTo(this) { it[quads] }
+                                oitMotionVariants.values.mapNotNullTo(this) { it[quads] }
+                            }
+                            for (sourcePipeline in sourcePipelines) {
+                                check(MCDR_ABI.D3D12BindTerrainTileStageV3(
+                                    sourcePipeline, nativeRoute, route.capture.shaderAbiVersion,
                                     route.capture.shaderContractHash, route.capture.programGeneration,
-                                    route.program.stage.ordinal, quads)) {
-                                    "Terrain tile ${quads}-quad capture bind failed: ${MCDR_ABI.D3D12LastError()}"
+                                    route.program.stage.ordinal, quads, route.program.laneRegisters)) {
+                                    "Terrain tile ${quads}-quad source bind failed: ${MCDR_ABI.D3D12LastError()}"
                                 }
                             }
                             nativeBindings[quads] = D3D12OitTilePipelineBinding(nativeRoute, tilePipeline)

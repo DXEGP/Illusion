@@ -62,7 +62,7 @@ class D3D12RenderPassBackend internal constructor(
     private var lastVertexStride = 0
 
     /** 早期显示会**先绑顶点缓冲、后设管线**：stride 只能从管线推导，故先挂起等 [setPipeline] 落实；抛异常会让加载屏整条 draw 被吞掉。 */
-    private val pendingVertexBuffers = LinkedHashMap<Int, Pair<D3D12GpuBuffer, Long>>()
+    private val pendingVertexBuffers = LinkedHashMap<Int, GpuBufferSlice>()
 
     private var pipeline: D3D12CompiledRenderPipeline? = null
     private var anyDescriptorDirty = false
@@ -218,7 +218,7 @@ class D3D12RenderPassBackend internal constructor(
                         slot, base.info().location)
                     continue
                 }
-                this.applyVertexBuffer(slot, value.first, value.second, stride)
+                this.applyVertexBuffer(slot, value, stride)
             }
         }
     }
@@ -255,7 +255,7 @@ class D3D12RenderPassBackend internal constructor(
         val required = selected.info().pushConstantSize()
         require(data.remaining() == required) { "Push constant size must be $required bytes" }
         if (required == 0) return
-        val snapshot = constantSnapshot?.takeIf { it.capacity() == required } ?: ByteBuffer.allocate(required)
+        val snapshot = constantSnapshot?.takeIf { it.capacity() >= required } ?: ByteBuffer.allocate(required)
         snapshot.clear()
         snapshot.put(data.duplicate())
         snapshot.flip()
@@ -578,17 +578,19 @@ class D3D12RenderPassBackend internal constructor(
         }
         if (stride == 0) {
             // 管线还没设（早期显示先绑 buffer 后设管线）或该槽位没声明顶点布局 → 挂起；抛异常会让加载屏整条 draw 失败。
-            this.pendingVertexBuffers[slot] = (buffer as D3D12GpuBuffer) to vertexBuffer.offset()
+            this.pendingVertexBuffers[slot] = vertexBuffer
             if (slot == 0) policy.setVertexInput(buffer, vertexBuffer.offset())
             return
         }
-        this.applyVertexBuffer(slot, buffer as D3D12GpuBuffer, vertexBuffer.offset(), stride)
+        this.applyVertexBuffer(slot, vertexBuffer, stride)
     }
 
     /** 按已知 stride 真正下发顶点缓冲绑定，并维护 slot0 的 meshlet 记账。 */
-    private fun applyVertexBuffer(slot: Int, buffer: D3D12GpuBuffer, offset: Long, stride: Int) {
-        if (!MCDR_ABI.D3D12SetVertexBuffer(this.ctx, slot, buffer.handle(), offset, stride)) {
-            throw IllegalStateException("dx12SetVertexBuffer failed")
+    private fun applyVertexBuffer(slot: Int, slice: GpuBufferSlice, stride: Int) {
+        val buffer = slice.buffer() as D3D12GpuBuffer
+        val offset = slice.offset()
+        if (!MCDR_ABI.D3D12SetVertexBufferRangeV1(this.ctx, slot, buffer.handle(), offset, slice.length(), stride)) {
+            throw IllegalStateException("dx12SetVertexBufferRangeV1 failed")
         }
         if (slot == 0) {
             // MDI 批次里每个段的 `baseVertex` 都相对这块切片，Stage 2 建段表要用。

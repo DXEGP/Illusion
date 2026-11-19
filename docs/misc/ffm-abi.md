@@ -18,7 +18,13 @@ JSON/manifest 归 shader 业务适配层所有，FFM 只传输数据。必需资
 
 导出数量随实现变化，不以历史计数作为 ABI 一致性的证据。校验对象是当前头文件、JVM 绑定与运行中 DLL 的版本和布局。
 
-当前源码 ABI 为 26。Composite 的真实输入内容由 Frame 生成 captureId 并持有租约，normalization 认证随主 Composite PSO 的同一次创建保存。认证描述为 136 B，terminal normalization V2 为 224 B；Resolve V3 和世界输出 schema 3 保持原布局。ABI24 增加 graphics command packet 与 OIT operation receipt：begin 为 144 B，receipt 为 192 B，receipt 的 pipeline、shader generation 和 command family 来自实际 native draw，JVM 不从前端绑定对象猜测。ABI25 增加将真实 operation packet 交给 V2 执行流的入口，CPU 结构布局不变。ABI26 增加 40 B 的 `mcdr_terrain_tile_stage_v2` 与 terrain stage registration 导出，普通 source、capture source 与 tile PSO 共用版本化合约和有限 route 租约。构建和实际启用范围见[实施记录](../rendering/work-graph-implementation.md#当前构建与运行)。`copyNative` 通过 `-PmcdrNativeRoot=<MCDR 工程目录>` 选择实际编译产物；`-PmcdrDependencyRoot=<SDK 依赖目录>` 选择运行库和许可证来源。源码输出与 SDK 依赖可以来自不同目录，打包时核对内嵌 DLL 与所选 Release 输出的 SHA256。
+当前源码 ABI 为 31。`mcdr_dx12CreateOitLaneOperationPipelineV1` 创建通过源码认证的原版 depth copy、bounds copy 和 bounds cull PSO。调用同步读取 pipeline descriptor、操作类型、程序代际和 cull 的实际 Projection binding index。PSO 保存认证结果。CPU 结构布局保持原样。
+
+`mcdr_dx12BindTerrainTileEnvelopeV1` 在注册地形 stage 前，使用同一路由的根签名创建 envelope compute PSO。DXIL 在该调用内同步消费，JVM 用 confined Arena 按实际字节数分配。route 持有 PSO，录制租约保留 route 到提交 fence。
+
+`mcdr_dx12VanillaRegisterWorldDepthV1` 在世界帧开始后、首个世界深度 clear 前同步登记实际 D32 纹理。`mcdr_dx12VanillaArmWorldDepthSeedV1` 接收同一 context、事件上限和共享预算。`mcdr_dx12VanillaSealWorldDepthSeedV1` 在 `executeOit` 入口封口。封口返回 1 表示 journal 可读，0 表示未开启，负值报告具名失败。
+
+normalization 认证随主 Composite PSO 创建保存，认证描述为 136 B，terminal normalization V2 为 224 B。Composite 为 lane scratch 执行传入 `OBJECT_ONLY`，Frame 同时支持带版本租约的 `captureId` 输入。Resolve V3 和世界输出 schema 3 保持原布局。ABI24 增加 graphics command packet 与 OIT operation receipt，begin 为 144 B，receipt 为 192 B，pipeline、shader generation 和 command family 来自实际 native draw。ABI25 增加将真实 operation packet 交给 V2 执行流的入口。ABI26 增加 40 B 的 `mcdr_terrain_tile_stage_v2` 与 terrain stage registration 导出，普通 source、capture source 与 tile PSO 共用版本化合约和 route 租约。`copyNative` 通过 `-PmcdrNativeRoot=<MCDR 工程目录>` 选择编译产物，通过 `-PmcdrDependencyRoot=<SDK 依赖目录>` 选择运行库和许可证来源。打包时核对内嵌 DLL 与所选 Release 输出的 SHA256。构建和实际启用范围见 [实施记录](../rendering/work-graph-implementation.md#当前构建与运行)。
 
 FFM 不读取业务配置。JVM 计时开关由诊断域的 `RenderProfiling.enabled` 读取，命令和批次路径保留动态配置读取；配置到 native 的发布仍由 `D3D12Settings.pushToNative()` 显式执行。
 
@@ -55,7 +61,7 @@ terrain 经 `OitPublishTerrainMetadataV2 → OitBindTerrainDrawV2 → ExecuteInd
 
 三阶段 terrain draw 的 V2 token 在真实 draw 前开启，成功执行后取得 receipt。`mcdr_dx12OitRegisterTerrainReplayReadSetV2` 在 active token 上登记本次 prepared batch 的 geometry/meshlet 范围，`mcdr_dx12OitCancelTerrainReplayReadSetV2` 仅在 draw 消费前撤销登记；Abort 同时清理未确认登记。FFM 数组只在同步调用内有效，native 复制并保留对象与 batch 租约，JVM allocator pin 按原 context fence 退休。范围、命令对应关系与内容冻结边界统一见 [tile 读取范围注册](../rendering/transmittance-tile-execution.md#同-recording-的读取范围注册)。这组附加入口保留旧 receipt/frontier 语义，注册成功的 contentState 仍为 Unsupported。
 
-完整事件流另设 V2 begin/append/query/terrain-receipt-query/seal/abort 六个入口与十个结构，保留旧 V1 history receipt/frontier。FFM mirror 与唯一 downcall 仍由 `MCDRLayout` / `MCDR_ABI` 拥有，实际字段由新 DLL 的 `mcdrABILayout` 核对。V2 query 返回原 draw 当时的真实 shader/program/resource generation，调用方不能从 pipeline 名称推算；scope/pass 和 draw/receipt 分开计数。当前 seal 返回具体缺项且不输出 sealed 句柄，完整内容和执行条件见 [V2 事件流与 Composite 边界](../rendering/transmittance-tile-execution.md#完整-v2-事件流与-composite-边界)。
+完整事件流使用 V2 begin/append/query/terrain-receipt-query/seal/abort，保留旧 V1 history receipt/frontier。FFM mirror 与唯一 downcall 由 `MCDRLayout` / `MCDR_ABI` 拥有，实际字段由 `mcdrABILayout` 核对。V2 query 返回原 draw 的实际 shader/program/resource generation，scope/pass 和 draw/receipt 分开计数。缺项时 seal 返回原因，完整时返回可执行句柄。ABI34 的 `mcdr_dx12OitExecuteTileStreamV2` 每次同步接收连续四份 `BatchV2`。前几组传空输出，最后一组传全幅 RGBA32_FLOAT 纹理。native 录制持有 GPU 资源直到 fence 完成，批次描述的 Arena 随 downcall 返回释放。见 [V2 事件流与 Composite 边界](../rendering/transmittance-tile-execution.md#完整-v2-事件流与-composite-边界)。
 
 `mcdr_dx12OitAppendExecutionOperationEventV1` 接收 V2 事件与原 operation receipt，native 回查所属 Frame 已完成的真实命令并保留 packet 租约。输入事件的 `receiptCount=0`、`receiptIds=NULL`，旧 V2 query/manifest 的 receipt 计数继续只覆盖 terrain；operation 的唯一消费与排序由执行流内部命令表管理。FFM 只在同步调用内持有编码内存，native 不保留 Arena 地址。实际事件归属、顺序和实现范围见 [实际命令契约](../rendering/transmittance-tile-execution.md#实际命令内容与-adapter-的实施契约)。
 
@@ -369,7 +375,7 @@ FFM 变长目标的缓存规则由 `FfmScratch` 拥有：每线程四个独立�
 
 调用方的 `maximumBytes` 只是缓存选择的上界提示，不是安全前提；若实际目标后来超过大小或对齐阈值，`allocate` 会在当前作用域内惰性创建 confined arena，直到该作用域结束。惰性创建后，后续的小目标也在这个 arena 分配，保留先前已经编码的缓存地址。这样不同大小的目标可以共用一条内联编码路径，不需要为“小目标”和“大目标”复制整段业务代码。
 
-terrain Work Graph prepare 和普通 Work Graph dispatch 的 bindings 上限为 32，句柄、offset、length 分别使用三个 scratch 槽，大小和对齐按 `PTR` / `I64` 布局计算。offset 与 length 从原始 `LongArray` 直接复制，避免 vararg 展开再复制数组；普通 dispatch 的零绑定明确传三个 NULL。native 在 downcall 返回前读取这些数组并保存实际资源租约，CPU 编码内存随即可以复用；GPU 资源继续按 recording fence 持有。
+terrain Work Graph prepare 和普通 Work Graph dispatch 的 bindings 上限为 32，句柄、offset、length 分别使用三个 scratch 槽，大小和对齐按 `PTR` / `I64` 布局计算。terrain prepare 的 `bindingCount` 表示本次有效项数，复用数组的容量可更大；只校验、复制和提交有效前缀，不能把上次管线留下的尾部当作绑定。offset 与 length 从原始 `LongArray` 直接复制，避免 vararg 展开再复制数组；普通 dispatch 的零绑定明确传三个 NULL。native 在 downcall 返回前读取这些数组并保存实际资源租约，CPU 编码内存随即可以复用；GPU 资源继续按 recording fence 持有。
 
 普通 compute、SRI 和三纹理 compute 共用内联的常量编码作用域：0～8 个 dword 按实际数量从 scratch 分配并一次复制，零常量传 `NULL`。三个入口的 dispatch lambda 各展开一次，小参数调用不再逐次新建 confined arena；嵌套调用仍使用独立 arena。
 
@@ -480,7 +486,7 @@ upcall 这条要单独说：`onFenceComplete` 在 native 线程上执行，异�
 - native 侧**不抛 Java 异常**，C++ 异常也不得穿过 FFM 边界。
 - 布尔 / 三态入口一律返回 `int32_t`（1 = 成功，0 = 失败或未启用，-1 = 参数或加载失败），失败详情只从 `mcdrLastError()` 读，不要另开错误通道。
 - 需要硬失败时由 JVM 侧封装包成 `IllegalStateException`；native 侧不得感知 JVM 的存在。
-- `FunctionDescriptor` 与 `invokeExact` 的类型必须**逐字匹配**：`int32_t` 用 `I32` 并 `as Int`，`int64_t` / `size_t` / 指针用 `I64` / `PTR` 并 `as Long`；写错是运行期 `WrongMethodTypeException`，不是编译错误。
+- `FunctionDescriptor` 与 `invokeExact` 的类型必须逐字匹配。返回 `int32_t` 时用 `I32` 和 `as Int`，返回 `int64_t` 或 `size_t` 时用 `I64` 和 `as Long`，返回指针时用 `PTR` 和 `as MemorySegment`。在 Lambda 里调用返回 `void` 的句柄时，让调用落在语句位置，例如调用后单写 `Unit`。如果 Kotlin 将调用当作 Lambda 的返回表达式，可能生成返回 `Object` 的签名，第一次调用就会抛 `WrongMethodTypeException`。
 
 ## 5 常见坑（用法约束）
 

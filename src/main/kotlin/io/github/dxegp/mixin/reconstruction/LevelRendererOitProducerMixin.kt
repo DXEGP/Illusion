@@ -139,8 +139,9 @@ abstract class LevelRendererOitProducerMixin {
         sampler: GpuSampler, original: Operation<Void?>) {
         val view = if (name == "Sampler0" && LateWorldTargets.sceneTarget() != null)
             checkNotNull(OitReconstructionInputs.correctedTransparencyView()) else originalView
-        original.call(pass, name, view, sampler)
-        OitReconstructionInputs.confirmCompositeBinding(pass, name, originalView, view, sampler)
+        val effectiveName = OitReconstructionInputs.compositeSampler(name)
+        if (effectiveName != null) original.call(pass, effectiveName, view, sampler)
+        OitReconstructionInputs.confirmCompositeBinding(pass, name, originalView, effectiveName, view, sampler)
     }
 
     @WrapOperation(method = ["executeOit"], at = [At(value = "INVOKE",

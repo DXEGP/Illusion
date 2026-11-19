@@ -17,6 +17,7 @@ import io.github.dxegp.d3d12.shader.D3D12RasterMotionShader
 import io.github.dxegp.d3d12.shader.D3D12RasterMotionSource
 import io.github.dxegp.d3d12.shader.D3D12RasterMotionContract
 import io.github.dxegp.d3d12.shader.D3D12OitGuideSource
+import io.github.dxegp.d3d12.shader.D3D12OitReplayStage
 import io.github.dxegp.render.reconstruction.oit.OitReconstructionInputs
 import net.minecraft.client.renderer.RenderPipelines
 import io.github.dxegp.render.terrain.mesh.TerrainPipelineCompiler
@@ -41,6 +42,7 @@ internal class VanillaPipelineVariants : D3D12PipelineVariants {
             check(capturePipeline != 0L) { "OIT capture PSO failed for $name: ${MCDR_ABI.D3D12LastError()}" }
             var captureLineQuad = 0L
             try {
+                attachOitTileIaRoute(compilation, capturePipeline)
                 if (topology == PrimitiveTopology.LINES || topology == PrimitiveTopology.DEBUG_LINES) {
                     captureDescriptor.topology(PrimitiveTopology.TRIANGLES.ordinal, false, pipeline.polygonMode.ordinal)
                     captureLineQuad = MCDR_ABI.D3D12CreateGraphicsCapturePipelineV1(captureDescriptor,
@@ -72,6 +74,7 @@ internal class VanillaPipelineVariants : D3D12PipelineVariants {
                 check(guidePipeline != 0L) { "OIT $source PSO failed for $name: ${MCDR_ABI.D3D12LastError()}" }
                 var guideLineQuad = 0L
                 try {
+                    attachOitTileIaRoute(compilation, guidePipeline)
                     if (topology == PrimitiveTopology.LINES || topology == PrimitiveTopology.DEBUG_LINES) {
                         guideDescriptor.topology(PrimitiveTopology.TRIANGLES.ordinal, false, pipeline.polygonMode.ordinal)
                         guideLineQuad = MCDR_ABI.D3D12CreateGraphicsPipeline(guideDescriptor, pipeline.pushConstantSize())
@@ -116,11 +119,23 @@ internal class VanillaPipelineVariants : D3D12PipelineVariants {
                     .addBinding(0, motion.parameterBinding)
                     .addBinding(2, motion.historyBinding)
                 motionDescriptor.rasterMotion = true
-                val motionPipeline = MCDR_ABI.D3D12CreateGraphicsPipeline(motionDescriptor, pipeline.pushConstantSize())
+                val opaqueSeed = compilation.opaqueSeed
+                val motionPipeline = if (opaqueSeed != null) {
+                    check(opaqueSeed.flipY == (compilation.orientation == D3D12PipelineOrientation.FLIPPED_Y) &&
+                        !lineTopology && source in setOf(D3D12RasterMotionSource.VERTEX_HISTORY,
+                            D3D12RasterMotionSource.CAMERA_REPROJECTION, D3D12RasterMotionSource.CONTRIBUTION_ONLY)) {
+                        "Opaque seed raster motion contract does not match $name"
+                    }
+                    // 仅复用保留原 clip/varyings、先调用原 PS 的 motion 包装，避免丢失 discard。
+                    // 保留完整 motion desc，否则 seed 的 root 布局与实际源 PSO 会错配。
+                    MCDR_ABI.D3D12CreateOpaqueSeedPipelineV1(motionDescriptor, pipeline.pushConstantSize(),
+                        opaqueSeed.directVertexHlsl, opaqueSeed.fragmentHlsl, opaqueSeed.programGeneration)
+                } else MCDR_ABI.D3D12CreateGraphicsPipeline(motionDescriptor, pipeline.pushConstantSize())
                 check(motionPipeline != 0L) { "Raster motion PSO failed for $name: ${MCDR_ABI.D3D12LastError()}" }
                 var motionLineQuad = 0L
                 var motionAttached = false
                 try {
+                    attachOitTileIaRoute(compilation, motionPipeline)
                     if (lineTopology) {
                         motionDescriptor.topology(PrimitiveTopology.TRIANGLES.ordinal, false, pipeline.polygonMode.ordinal)
                         motionLineQuad = MCDR_ABI.D3D12CreateGraphicsPipeline(motionDescriptor, pipeline.pushConstantSize())
@@ -156,6 +171,7 @@ internal class VanillaPipelineVariants : D3D12PipelineVariants {
                         }
                         var combinedLineQuad = 0L
                         try {
+                            attachOitTileIaRoute(compilation, combinedPipeline)
                             if (lineTopology) {
                                 combinedDescriptor.topology(PrimitiveTopology.TRIANGLES.ordinal, false, pipeline.polygonMode.ordinal)
                                 combinedLineQuad = MCDR_ABI.D3D12CreateGraphicsPipeline(combinedDescriptor,
@@ -196,6 +212,20 @@ internal class VanillaPipelineVariants : D3D12PipelineVariants {
                 "Terrain requires Work Graph Tier 1.0"
             }
             TerrainPipelineCompiler.compile(compilation)
+        }
+    }
+
+    private fun attachOitTileIaRoute(compilation: D3D12PipelineCompilation, sourcePipeline: Long) {
+        val program = compilation.iaTile ?: return
+        if (program.stage != D3D12OitReplayStage.ACCUMULATE) return
+        val name = compilation.pipeline.info().location.toString()
+        check(name.startsWith("minecraft:pipeline/oit_accumulate_") &&
+            program.flipY == (compilation.orientation == D3D12PipelineOrientation.FLIPPED_Y)) {
+            "OIT tile IA variant does not match $name"
+        }
+        // guide/motion/capture 只追加导出；tile 复用基础 MRT，避免重放附加写入。
+        check(MCDR_ABI.D3D12AttachOitTileIARouteV1(sourcePipeline, compilation.pipeline.handle())) {
+            "OIT tile IA variant attachment failed for $name: ${MCDR_ABI.D3D12LastError()}"
         }
     }
 

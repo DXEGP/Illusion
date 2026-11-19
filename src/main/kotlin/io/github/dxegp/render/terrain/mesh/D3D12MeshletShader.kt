@@ -254,15 +254,21 @@ SectionDesc loadSection(uint id) {
     s.visibility = asfloat(gSections.Load(b + 28u));
     return s;
 }
-MeshletDesc loadMeshlet(uint id) {
-    uint2 work = gSections.Load2(${workOffset}gMeshletGlobalsPad1 * 32u + id * 8u);
-    uint b = work.x * 16u;
+uint2 loadMeshletWork(uint id) {
+    return gSections.Load2(${workOffset}gMeshletGlobalsPad1 * 32u + id * 8u);
+}
+MeshletDesc loadMeshletDescriptor(uint descriptor, uint section) {
+    uint b = descriptor * 16u;
     MeshletDesc m;
     m.packedMin = gMeshlets.Load(b + 0u);
     m.packedMax = gMeshlets.Load(b + 4u);
-    m.sectionId = work.y;
+    m.sectionId = section;
     m.localVertexOffset = gMeshlets.Load(b + 8u);
     return m;
+}
+MeshletDesc loadMeshlet(uint id) {
+    uint2 work = loadMeshletWork(id);
+    return loadMeshletDescriptor(work.x, work.y);
 }
 
 $globalsExtra
@@ -310,6 +316,12 @@ uint4 meshReadUInt16(uint a, uint count) {
     return uint4(w.x & 65535u, w.x >> 16, w.y & 65535u, w.y >> 16);
 }
 uint4 meshReadUInt32(uint a, uint count) { return meshReadWords(a, count); }
+D3D12VertexInput loadTerrainVertex(SectionDesc s, uint vertexIndex) {
+    D3D12VertexInput vin = (D3D12VertexInput)0;
+$decode    return vin;
+}
+
+#ifndef MCDR_TILE_TERRAIN_ENVELOPES
 $asBlock$vrsPrimStruct
 // 线程组 = 一个 meshlet：前 quadCount*4 线程各解一个顶点，前 quadCount 线程算术写出一个 quad 的两个三角形；不读索引，带 AS 时 meshlet 号来自 payload。
 [numthreads($threads, 1, 1)]
@@ -336,8 +348,8 @@ $vrsRate
     uint vid = tid.x;
     for (uint outputVertex = vid; outputVertex < vertexCount; outputVertex += ${threads}u) {
         uint vertexIndex = s.vertexBase + m.localVertexOffset + outputVertex;
-        D3D12VertexInput vin = (D3D12VertexInput)0;
-$decode$vertexStore
+        D3D12VertexInput vin = loadTerrainVertex(s, vertexIndex);
+$vertexStore
     }
 
     // 算术索引：MC 的每个 quad 固定 4 个顶点、绕序 (0,1,2) / (0,2,3)。
@@ -347,6 +359,7 @@ $decode$vertexStore
         tris[vid * 2u + 1u] = uint3(baseV, baseV + 2u, baseV + 3u);
 $vrsStore    }
 }
+#endif
 """
     }
 
