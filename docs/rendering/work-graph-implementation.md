@@ -2,6 +2,18 @@
 
 本页跟踪 [架构方案](vanilla-work-graph-plan.md) 的实际实施状态。范围限定光栅、mesh、AA/SR 与呈现；完整 A–K 目标尚未完成。已实现接线、具体实现缺口与尚未运行确认的场景分别记录，最新配套产物的构建和用户确认集中在[当前构建与运行](#当前构建与运行)。
 
+## 透明记录追加与正常帧接线（2026-11-20）
+
+正常帧不再走四子样本 tile 重放：`VanillaPipelineCompiler` 只创建普通图形 PSO，
+`OitReconstructionInputs` 去掉 opaque depth seed 的 arm/seal、去掉 execution stream V2 与 `executeTiles`，
+`OitRecordFrames.seal` 只封 native recording。启动期那批 `Depth PSO creation failed: HRESULT 0x80070057`
+来自 tile 变体的 depth-only PSO，随变体一起消失；transparency 由当帧 per-draw records 的 V3 resolve 产出。
+
+帧时间热点是 `rebuild\MCDR\include\mcdr_oit_shader.h` 的 `AppendV1` 全局分配器 compare-exchange 重试循环：
+每个透明片元都 CAS 同一个 uint32。改为单次 `InterlockedAdd` 后，隔离世界 854×480 从 108.5 ms 降到 31 ms、
+2560×1334 从 411 ms 降到 32.5 ms，GPU 利用率 100% → 13%。记录预算饱和（`maxRecords` 4096）的对照实验也停在
+27.8 ms，证明其余 resolve/history 计算不是瓶颈。逐像素计数 CAS、链表头交换和 144 B 记录写入保留原样。
+
 ## 光栅 Work Graph 增量（2026-11-18）
 
 `D3D12TerrainWorkGraph.prepare` 要求渲染线程调用，batch、上传事实和原始 command recording 使用同一线程和 fence。`Prepared.recordPreparedFacts` 对每批事实只回调一次。uniform 到 graphics binding slot 的弱缓存只保存名称与 slot。

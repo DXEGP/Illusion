@@ -7,7 +7,6 @@ import io.github.dxegp.d3d12.ffi.MCDR_ABI
 import io.github.dxegp.render.frame.vanilla.VanillaFrameCoordinator
 import io.github.dxegp.render.reconstruction.SuperResolution
 import io.github.dxegp.render.reconstruction.oit.OitReconstructionInputs
-import io.github.dxegp.render.reconstruction.oit.OitTileNormalizationPrograms
 import io.github.dxegp.render.vrs.D3D12VariableShadingRate
 
 object FramePrepPrograms {
@@ -78,10 +77,8 @@ object FramePrepPrograms {
                 adapter.shadingRateTier >= 2 && adapter.shadingRateTileSize > 0) {
                 flags = flags or 2
             }
-            val normalizationLanes = listOf(1, 2, 4).map(OitTileNormalizationPrograms::compileLane)
-            val normalizationAverage = OitTileNormalizationPrograms.compileAverage(1)
             candidate = encoder.contextControl { context ->
-                MCDR_ABI.D3D12PrepareFramePrograms(context, generation, flags, normalizationLanes, normalizationAverage)
+                MCDR_ABI.D3D12PrepareFramePrograms(context, generation, flags)
             }
             prepared = Prepared(generation, encoder, resourceReload, program, candidate)
             encoder.retainUntilCommandsClosed(prepared)
@@ -99,3 +96,4 @@ object FramePrepPrograms {
         }
     }
 }
+

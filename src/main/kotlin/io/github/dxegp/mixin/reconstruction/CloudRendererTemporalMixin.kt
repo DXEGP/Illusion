@@ -7,8 +7,6 @@ import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation
 import com.mojang.blaze3d.buffers.Std140Builder
 import com.mojang.renderpearl.api.textures.GpuTextureView
 import io.github.dxegp.render.reconstruction.oit.OitCloudFace
-import io.github.dxegp.render.reconstruction.oit.OitExecutionEventKind
-import io.github.dxegp.render.reconstruction.oit.OitProducerCapture
 import com.mojang.renderpearl.api.commands.RenderPass
 import io.github.dxegp.render.reconstruction.oit.OitReconstructionInputs
 import io.github.dxegp.render.reconstruction.oit.OitSurfaceInputs
@@ -31,9 +29,7 @@ abstract class CloudRendererTemporalMixin {
         target = "Lcom/mojang/renderpearl/api/commands/RenderPass;draw(IIII)V")])
     private fun illusionRecordCloudDepthCopy(pass: RenderPass, vertexCount: Int, instanceCount: Int,
         firstVertex: Int, firstInstance: Int, original: Operation<Void?>) {
-        OitProducerCapture.recordExecutionOperation(OitExecutionEventKind.CLOUD_DEPTH_COPY) {
-            original.call(pass, vertexCount, instanceCount, firstVertex, firstInstance)
-        }
+        original.call(pass, vertexCount, instanceCount, firstVertex, firstInstance)
     }
 
     @WrapMethod(method = ["prepare(ILnet/minecraft/client/CloudStatus;FILnet/minecraft/world/phys/Vec3;JF)V"])

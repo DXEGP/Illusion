@@ -306,6 +306,7 @@ object MCDR_ABI {
     private var MH_vanillafinishdeclared: MethodHandle? = null
     private var MH_invalidatereconstructioninputs: MethodHandle? = null
     private var MH_prewarmframeprep: MethodHandle? = null
+        private var MH_prepareframeprograms: MethodHandle? = null
     private var MH_prepareframeprogramsv2: MethodHandle? = null
     private var MH_commitframeprograms: MethodHandle? = null
     private var MH_abortframeprograms: MethodHandle? = null
@@ -2893,40 +2894,13 @@ object MCDR_ABI {
         check(result > 0) { "Display Work Graph prewarm failed: ${D3D12LastError()}" }
     }
 
-    internal fun D3D12PrepareFramePrograms(ctx: Long, generation: Long, flags: Int,
-        normalizationLanes: List<ByteArray>, normalizationAverage: ByteArray): Long {
+    internal fun D3D12PrepareFramePrograms(ctx: Long, generation: Long, flags: Int): Long {
         requireLoaded()
         require(ctx != 0L && generation > 0L && flags in 0..3)
-        require(normalizationLanes.size == 3 && normalizationLanes.all { it.isNotEmpty() } &&
-            normalizationAverage.isNotEmpty())
         Arena.ofConfined().use { arena ->
-            val layout = MCDRLayout.OIT_NORMALIZATION_PROGRAM_V1
-            val size = layout.byteSize()
-            val schemaOffset = layout.byteOffset(groupElement("schemaVersion"))
-            val sizeOffset = layout.byteOffset(groupElement("structSize"))
-            val targetCountOffset = layout.byteOffset(groupElement("targetCount"))
-            val generationOffset = layout.byteOffset(groupElement("programGeneration"))
-            val laneDxilOffset = layout.byteOffset(groupElement("laneDxil"))
-            val laneBytesOffset = layout.byteOffset(groupElement("laneDxilBytes"))
-            val averageDxilOffset = layout.byteOffset(groupElement("averageDxil"))
-            val averageBytesOffset = layout.byteOffset(groupElement("averageDxilBytes"))
-            val programs = arena.allocateFfmArray(normalizationLanes.size, layout)
-            val average = arena.allocate(normalizationAverage.size.toLong()).copyFrom(MemorySegment.ofArray(normalizationAverage))
-            for ([index, lane] in normalizationLanes.withIndex()) {
-                val row = programs.asSlice(index * size, layout)
-                val laneCode = arena.allocate(lane.size.toLong()).copyFrom(MemorySegment.ofArray(lane))
-                row.set(MCDRLayout.I32, schemaOffset, 1)
-                row.set(MCDRLayout.I32, sizeOffset, size.toInt())
-                row.set(MCDRLayout.I32, targetCountOffset, 1 shl index)
-                row.set(MCDRLayout.I64, generationOffset, generation)
-                row.set(MCDRLayout.PTR, laneDxilOffset, laneCode)
-                row.set(MCDRLayout.I64, laneBytesOffset, laneCode.byteSize())
-                row.set(MCDRLayout.PTR, averageDxilOffset, average)
-                row.set(MCDRLayout.I64, averageBytesOffset, average.byteSize())
-            }
             val output = arena.allocate(MCDRLayout.PTR)
-            val result = checkNotNull(MH_prepareframeprogramsv2).invokeExact(
-                ptr(ctx), generation, flags, programs, normalizationLanes.size, output) as Int
+            val result = checkNotNull(MH_prepareframeprograms).invokeExact(
+                ptr(ctx), generation, flags, output) as Int
             requireFrameProgramsSuccess("prepare", result)
             val candidate = addr(output.get(MCDRLayout.PTR, 0L))
             if (candidate == 0L) {
@@ -4186,6 +4160,8 @@ object MCDR_ABI {
         MH_invalidatereconstructioninputs = skip("mcdr_dx12InvalidateReconstructionInputs", fd(MCDRLayout.I32, MCDRLayout.PTR))
         MH_prewarmframeprep = skip("mcdr_dx12PrewarmFrameprep", fd(MCDRLayout.I32,
             MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.I32))
+        MH_prepareframeprograms = skip("mcdr_dx12PrepareFramePrograms", fd(MCDRLayout.I32,
+            MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.I32, MCDRLayout.PTR))
         MH_prepareframeprogramsv2 = skip("mcdr_dx12PrepareFrameProgramsV2", fd(MCDRLayout.I32,
             MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.PTR))
         MH_commitframeprograms = skip("mcdr_dx12CommitFramePrograms", fd(MCDRLayout.I32,
@@ -4557,3 +4533,4 @@ object MCDR_ABI {
         ))
     }
 }
+

@@ -7,9 +7,6 @@ import com.mojang.renderpearl.api.commands.RenderPass
 import com.mojang.renderpearl.api.textures.GpuSampler
 import com.mojang.renderpearl.api.textures.GpuTexture
 import com.mojang.renderpearl.api.textures.GpuTextureView
-import com.mojang.renderpearl.api.buffers.GpuBuffer
-import io.github.dxegp.d3d12.command.D3D12TerrainDraw
-import io.github.dxegp.render.terrain.mesh.D3D12MeshDrawCapture
 import io.github.dxegp.d3d12.resource.D3D12GpuTexture
 import io.github.dxegp.render.frame.vanilla.VanillaFrameIdentity
 import io.github.dxegp.render.frame.vanilla.VanillaFrameInputs
@@ -56,6 +53,36 @@ internal class OitTextureViewFacts(view: GpuTextureView) {
 }
 
 internal class OitSampledView(val view: OitTextureViewFacts, val sampler: GpuSampler)
+
+internal sealed interface OitColorAttachmentLoad {
+    data object Load : OitColorAttachmentLoad
+    data class Clear(val red: Float, val green: Float, val blue: Float, val alpha: Float) : OitColorAttachmentLoad
+}
+
+internal sealed interface OitDepthAttachmentLoad {
+    data object Load : OitDepthAttachmentLoad
+    data class Clear(val depth: Double) : OitDepthAttachmentLoad
+}
+
+internal enum class OitAttachmentStore { UNKNOWN }
+
+internal data class OitColorAttachmentFacts(val view: OitTextureViewFacts,
+    val load: OitColorAttachmentLoad, val store: OitAttachmentStore)
+
+internal data class OitDepthAttachmentFacts(val view: OitTextureViewFacts,
+    val load: OitDepthAttachmentLoad, val store: OitAttachmentStore)
+
+internal class OitPassDescriptorFacts(
+    val passId: Long,
+    colors: List<OitColorAttachmentFacts?>,
+    val depth: OitDepthAttachmentFacts?,
+    val renderX: Int,
+    val renderY: Int,
+    val renderWidth: Int,
+    val renderHeight: Int,
+) {
+    val colors: List<OitColorAttachmentFacts?> = Collections.unmodifiableList(ArrayList(colors))
+}
 
 internal class OitPassFacts(
     val frame: OitFrameFacts,
@@ -110,15 +137,9 @@ internal class OitFrameResult(val frame: OitFrameFacts, producers: List<OitProdu
 }
 
 internal object OitProducerCapture {
-    private class DrawRecording(val disposition: OitDrawDisposition, val selection: OitDrawSelection,
-        val sourceDrawId: Long?,
-        val parentSourceDrawId: Long?) {
+    private class DrawRecording(val disposition: OitDrawDisposition, val selection: OitDrawSelection) {
         val contributions = ArrayList<() -> Unit>()
         var facts: OitDrawFacts? = null
-        var nativeReceiptFailure: Throwable? = null
-        var terrainStageFailure: Throwable? = null
-        var terrainStageFacts: MutableList<OitTerrainStageFacts>? = null
-        var operationReceipts: OitNativeOperationReceiptQuery = OitNativeOperationReceiptQuery.NotQueried
     }
 
     private class ScopeRecording(val facts: OitProducerScope) {
@@ -131,95 +152,20 @@ internal object OitProducerCapture {
         val results = ArrayList<OitProducerResult>()
         val passes = IdentityHashMap<Any, OitPassFacts>()
         val pipelineLocations = IdentityHashMap<Any, String>()
-        val executionSampledViews = IdentityHashMap<Any, MutableMap<String, OitSampledView>>()
-        val executionEvents = ArrayList<OitExecutionEvent>()
-        val journalEntries = ArrayList<OitExecutionJournalEntry>()
-        private var journalSequence = 0L
-        val producers = ArrayList<OitExecutionProducer>()
         val producerIds = OitProducerKind.entries.associateWith { IdentityHashMap<Any, Long>() }
-        val executionScopes = ArrayList<OitExecutionScope>()
-        val executionPasses = LinkedHashMap<Long, OitExecutionPass>()
-        val failures = ArrayList<OitExecutionFailure>()
         var nextProducerId = 0L
         var nextPassId = 0L
-        var nextSourceDrawId = 0L
         val textures = Collections.newSetFromMap(IdentityHashMap<D3D12GpuTexture, Boolean>())
         var activePass: Any? = null
         var providerStage: OitStage? = null
         var draw: DrawRecording? = null
-        var executionKind: OitExecutionEventKind? = null
         var failed = false
-        var executionSequence = 0L
-        val assignedTerrainReceiptIds = HashSet<Long>()
-        val assignedTerrainStageReceiptIds = HashSet<Long>()
-        var lastTerrainStageSequence = 0L
-        val terrainBufferIds = IdentityHashMap<GpuBuffer, Long>()
-        val terrainOccurrenceCounts = HashMap<OitTerrainStageOccurrenceKey, Int>()
-        val terrainGroups = HashMap<OitTerrainOccurrenceKey, Long>()
-        var nextTerrainBufferId = 0L
-        var nextTerrainGroupId = 0L
-
-        fun recordJournal(fact: OitExecutionJournalFact) {
-            journalSequence = Math.incrementExact(journalSequence)
-            journalEntries += OitExecutionJournalEntry(journalSequence, fact)
-        }
-
-        fun recordFailure(failure: OitExecutionFailure) {
-            failures += failure
-            recordJournal(OitExecutionJournalFact.Failure(failure))
-        }
 
         fun retainView(view: GpuTextureView): OitTextureViewFacts {
             val facts = OitTextureViewFacts(view)
             val texture = facts.texture as? D3D12GpuTexture
             if (texture != null && textures.add(texture)) texture.addViews()
             return facts
-        }
-
-        fun recordExecution(passKey: Any, pass: OitPassFacts, draw: DrawRecording,
-            kind: OitExecutionEventKind, pipelineLocation: String?, nativeReceipts: OitNativeReceiptQuery) {
-            val sampled = Collections.unmodifiableMap(LinkedHashMap(executionSampledViews[passKey].orEmpty()))
-            val evidence = when (kind) {
-                OitExecutionEventKind.WATER_DEPTH_COPY,
-                OitExecutionEventKind.CLOUD_DEPTH_COPY,
-                OitExecutionEventKind.TERRAIN_DEPTH_COPY -> {
-                    val source = sampled["InSampler"]
-                    val destination = pass.depthTarget
-                    if (source != null && destination != null) OitExecutionResourceEvidence.DepthCopy(source, destination)
-                    else OitExecutionResourceEvidence.Unavailable("Depth copy source or destination unavailable")
-                }
-                OitExecutionEventKind.DEPTH_BOUNDS_COPY -> {
-                    val source = sampled["InSampler"]
-                    val destination = pass.colorTargets.singleOrNull()
-                    if (source != null && destination != null) OitExecutionResourceEvidence.ColorCopy(source, destination)
-                    else OitExecutionResourceEvidence.Unavailable("Depth bounds copy source or destination unavailable")
-                }
-                OitExecutionEventKind.DEPTH_BOUNDS_CULL -> {
-                    if (sampled["DepthBoundsSampler"] != null && pass.colorTargets.singleOrNull() != null &&
-                        pass.depthTarget != null) OitExecutionResourceEvidence.PassResources(pass, sampled)
-                    else OitExecutionResourceEvidence.Unavailable("Depth bounds cull source or destination unavailable")
-                }
-                OitExecutionEventKind.COMPOSITE -> {
-                    if (sampled.keys.containsAll(OitPassFacts.guideSamplerNames) && sampled["Sampler0"] != null &&
-                        pass.colorTargets.singleOrNull() != null && pass.depthTarget != null)
-                        OitExecutionResourceEvidence.PassResources(pass, sampled)
-                    else OitExecutionResourceEvidence.Unavailable("Composite source or destination unavailable")
-                }
-                else -> OitExecutionResourceEvidence.PassResources(pass, sampled)
-            }
-            executionSequence = Math.incrementExact(executionSequence)
-            val event = OitExecutionEvent(executionSequence, checkNotNull(draw.sourceDrawId),
-                draw.parentSourceDrawId, OitDrawCountUnit.FRONTEND_INVOCATION,
-                draw.disposition, draw.selection, nativeReceipts,
-                draw.terrainStageFacts?.singleOrNull()?.drawGroup ?: OitDrawGroupEvidence.Unavailable, kind,
-                pass.providerStage ?: scopes.lastOrNull()?.facts?.stage,
-                scopes.lastOrNull()?.facts, pass, pipelineLocation,
-                facts.identity.resourceVersion,
-                evidence, draw.terrainStageFacts.orEmpty(), draw.operationReceipts)
-            executionEvents += event
-            if (nativeReceipts != OitNativeReceiptQuery.Failed) {
-                recordJournal(OitExecutionJournalFact.Observation(event))
-            }
         }
     }
 
@@ -238,12 +184,9 @@ internal object OitProducerCapture {
         nextScopeSerial = Math.incrementExact(nextScopeSerial)
         val producerId = current.producerIds.getValue(producer.kind).getOrPut(producer.owner) {
             current.nextProducerId = Math.incrementExact(current.nextProducerId)
-            current.producers += OitExecutionProducer(current.nextProducerId, producer.kind)
             current.nextProducerId
         }
         val scope = ScopeRecording(OitProducerScope(current.facts, producer, stage, nextScopeSerial, producerId))
-        current.recordJournal(OitExecutionJournalFact.ScopeBegin(scope.facts, current.scopes.lastOrNull()?.facts?.serial,
-            current.activePass?.let(current.passes::get)?.descriptor?.passId))
         current.scopes.addLast(scope)
         var completion = OitScopeCompletion.FAILED
         var customHandled: Boolean? = null
@@ -255,20 +198,7 @@ internal object OitProducerCapture {
         } finally {
             check(current.scopes.removeLast() === scope) { "OIT producer scopes retired out of order" }
             current.results.add(OitProducerResult(scope.facts, scope.drawCalls, completion, customHandled))
-            val executionCompletion = when {
-                completion == OitScopeCompletion.FAILED -> OitExecutionScopeCompletion.FAILED
-                scope.actualDrawCalls == 0L -> OitExecutionScopeCompletion.EMPTY
-                else -> OitExecutionScopeCompletion.RETURNED
-            }
-            val executionScope = OitExecutionScope(scope.facts, scope.actualDrawCalls,
-                executionCompletion, customHandled)
-            current.executionScopes += executionScope
-            current.recordJournal(OitExecutionJournalFact.ScopeEnd(executionScope))
-            if (completion == OitScopeCompletion.FAILED) {
-                current.failed = true
-                current.recordFailure(OitExecutionFailure(OitExecutionFailureKind.SCOPE, null,
-                    current.activePass?.let(current.passes::get)?.descriptor?.passId, scope.facts.serial))
-            }
+            if (completion == OitScopeCompletion.FAILED) current.failed = true
         }
     }
 
@@ -286,9 +216,6 @@ internal object OitProducerCapture {
             return pass
         } catch (failure: Throwable) {
             current.failed = true
-            current.recordFailure(OitExecutionFailure(OitExecutionFailureKind.PROVIDER_STAGE,
-                current.draw?.sourceDrawId, current.activePass?.let(current.passes::get)?.descriptor?.passId,
-                current.scopes.lastOrNull()?.facts?.serial))
             throw failure
         } finally {
             current.providerStage = previous
@@ -325,10 +252,7 @@ internal object OitProducerCapture {
             area.x(), area.y(), area.width(), area.height())
         current.passes[pass] = OitPassFacts(current.facts, stage ?: OitStage.ACCUMULATE,
             current.providerStage, colors, depth, emptyMap(), null, stage == OitStage.ACCUMULATE, descriptorFacts)
-        current.executionPasses[descriptorFacts.passId] = OitExecutionPass(descriptorFacts, OitExecutionPassCompletion.ACTIVE)
-        current.executionSampledViews[pass] = LinkedHashMap()
         current.activePass = pass
-        current.recordJournal(OitExecutionJournalFact.PassBegin(descriptorFacts, current.scopes.lastOrNull()?.facts, stage))
     }
 
     fun recordPipeline(pass: Any, location: String) {
@@ -340,132 +264,23 @@ internal object OitProducerCapture {
     fun recordTextureBinding(pass: Any, name: String, view: GpuTextureView, sampler: GpuSampler) {
         val current = recording ?: return
         val facts = current.passes[pass] ?: return
-        if (name !in OitPassFacts.guideSamplerNames && name != "InSampler" && name != "Sampler0") return
-        val executionViews = checkNotNull(current.executionSampledViews[pass])
-        val captured = executionViews[name]?.takeIf { it.view.source === view && it.sampler === sampler }
-            ?: OitSampledView(current.retainView(view), sampler).also { executionViews[name] = it }
         if (name !in OitPassFacts.guideSamplerNames) return
         if (facts.sampledViews[name]?.let { it.view.source === view && it.sampler === sampler } == true) return
         val sampled = LinkedHashMap(facts.sampledViews)
-        sampled[name] = captured
+        sampled[name] = OitSampledView(current.retainView(view), sampler)
         current.passes[pass] = OitPassFacts(facts.frame, facts.stage, facts.providerStage,
             facts.colorTargets, facts.depthTarget, sampled, facts.originalSampledViews, facts.historyEligible, facts.descriptor)
     }
 
     fun retirePass(pass: Any) {
         val current = recording ?: return
-        current.passes.remove(pass)?.descriptor?.let { descriptor ->
-            val completion = current.executionPasses.getValue(descriptor.passId).completion
-            val executionPass = OitExecutionPass(descriptor,
-                if (completion == OitExecutionPassCompletion.FAILED) completion else OitExecutionPassCompletion.RETURNED)
-            current.executionPasses[descriptor.passId] = executionPass
-            current.recordJournal(OitExecutionJournalFact.PassEnd(executionPass))
-        }
+        current.passes.remove(pass)
         current.pipelineLocations.remove(pass)
-        current.executionSampledViews.remove(pass)
         if (current.activePass === pass) current.activePass = null
     }
 
     fun recordPassFailure() {
-        val current = recording ?: return
-        current.failed = true
-        val descriptor = current.activePass?.let(current.passes::get)?.descriptor
-        descriptor?.let { current.executionPasses[it.passId] = OitExecutionPass(it, OitExecutionPassCompletion.FAILED) }
-        current.recordFailure(OitExecutionFailure(OitExecutionFailureKind.PASS, current.draw?.sourceDrawId,
-            descriptor?.passId, current.scopes.lastOrNull()?.facts?.serial))
-    }
-
-    fun <Result> recordExecutionOperation(kind: OitExecutionEventKind, action: () -> Result): Result {
-        val current = recording ?: return action()
-        val previous = current.executionKind
-        current.executionKind = kind
-        try {
-            return action()
-        } catch (failure: Throwable) {
-            current.failed = true
-            current.recordFailure(OitExecutionFailure(OitExecutionFailureKind.OPERATION, current.draw?.sourceDrawId,
-                current.activePass?.let(current.passes::get)?.descriptor?.passId, current.scopes.lastOrNull()?.facts?.serial))
-            throw failure
-        } finally {
-            current.executionKind = previous
-        }
-    }
-
-    fun terrainStageInvocation(): OitTerrainStageInvocation? {
-        val current = recording ?: return null
-        val draw = current.draw ?: return null
-        val sourceDrawId = draw.sourceDrawId ?: return null
-        val scope = current.scopes.lastOrNull()?.facts ?: return null
-        if (scope.producer.kind != OitProducerKind.TERRAIN) return null
-        val pass = current.activePass?.let(current.passes::get) ?: return null
-        if (scope.frame !== current.facts || pass.frame !== current.facts ||
-            scope.stage != pass.stage || scope.stage != pass.providerStage) return null
-        return OitTerrainStageInvocation(current.facts, scope, sourceDrawId,
-            draw.parentSourceDrawId, pass.descriptor.passId)
-    }
-
-    fun recordTerrainStage(invocation: OitTerrainStageInvocation, draw: D3D12TerrainDraw,
-        prepared: D3D12MeshDrawCapture.TerrainPreparedFacts, material: OitTerrainStageMaterial,
-        receipt: OitNativeTerrainStageReceiptResult) {
-        val current = checkNotNull(recording)
-        val drawRecording = checkNotNull(current.draw)
-        check(current.facts === invocation.frame && drawRecording.sourceDrawId == invocation.sourceDrawId &&
-            current.scopes.lastOrNull()?.facts === invocation.scope &&
-            current.activePass?.let(current.passes::get)?.descriptor?.passId == invocation.passId)
-        val commandOwner = current.terrainBufferIds.getOrPut(draw.commands.buffer()) {
-            current.nextTerrainBufferId = Math.incrementExact(current.nextTerrainBufferId)
-            current.nextTerrainBufferId
-        }
-        val vertexOwner = current.terrainBufferIds.getOrPut(draw.vertexBuffer) {
-            current.nextTerrainBufferId = Math.incrementExact(current.nextTerrainBufferId)
-            current.nextTerrainBufferId
-        }
-        val commandRange = OitTerrainBufferRange(commandOwner, draw.commands.offset(), draw.commands.length())
-        val vertexRange = OitTerrainBufferRange(vertexOwner, prepared.vertexOffset, prepared.batch.requiredVertexBytes)
-        val group = when (material) {
-            is OitTerrainStageMaterial.Known -> {
-                val selectionKey = OitTerrainSelectionKey(invocation.scope.producerId, commandRange, vertexRange,
-                    draw.drawCount, prepared.commandSelections, material)
-                val occurrenceKey = OitTerrainStageOccurrenceKey(selectionKey, invocation.scope.stage)
-                val occurrence = current.terrainOccurrenceCounts.getOrDefault(occurrenceKey, 0)
-                current.terrainOccurrenceCounts[occurrenceKey] = Math.incrementExact(occurrence)
-                val groupKey = OitTerrainOccurrenceKey(selectionKey, occurrence)
-                val groupId = current.terrainGroups.getOrPut(groupKey) {
-                    current.nextTerrainGroupId = Math.incrementExact(current.nextTerrainGroupId)
-                    current.nextTerrainGroupId
-                }
-                OitDrawGroupEvidence.TerrainSelection(groupId)
-            }
-            is OitTerrainStageMaterial.Unavailable -> OitDrawGroupEvidence.TerrainUnavailable(material.reason)
-        }
-        val pending = drawRecording.terrainStageFacts ?: ArrayList<OitTerrainStageFacts>().also {
-            drawRecording.terrainStageFacts = it
-        }
-        if (receipt is OitNativeTerrainStageReceiptResult.Available) {
-            val actual = receipt.receipt
-            check(actual.sourceDrawId == invocation.sourceDrawId && actual.parentSourceDrawId == invocation.parentSourceDrawId &&
-                actual.passId == invocation.passId && actual.producerId == invocation.scope.producerId &&
-                actual.producerScopeSerial == invocation.scope.serial && actual.stage == invocation.scope.stage &&
-                actual.pipelineIdentity == prepared.pipeline) {
-                "Terrain stage receipt does not match the actual prepared draw"
-            }
-            check(actual.nativeSequence > current.lastTerrainStageSequence &&
-                current.assignedTerrainStageReceiptIds.add(actual.receiptId)) {
-                "Terrain stage receipt was repeated or returned out of order"
-            }
-            current.lastTerrainStageSequence = actual.nativeSequence
-        }
-        pending += OitTerrainStageFacts(invocation, draw, prepared, commandRange, vertexRange, material, group, receipt)
-    }
-
-    fun recordTerrainStageFailure(invocation: OitTerrainStageInvocation, failure: Throwable) {
-        val current = checkNotNull(recording)
-        val draw = checkNotNull(current.draw)
-        check(current.facts === invocation.frame && draw.sourceDrawId == invocation.sourceDrawId)
-        current.failed = true
-        draw.terrainStageFailure = failure
-        current.recordFailure(OitExecutionFailure(OitExecutionFailureKind.TERRAIN_STAGE,
-            invocation.sourceDrawId, invocation.passId, invocation.scope.serial))
+        recording?.failed = true
     }
 
     fun drawInputs(): OitDrawFacts? {
@@ -508,133 +323,22 @@ internal object OitProducerCapture {
         val current = recording ?: return action()
         if (!current.passes.containsKey(pass)) return action()
         val previous = current.draw
-        val sourceDrawId = if (disposition == OitDrawDisposition.EMPTY) null else {
-            current.nextSourceDrawId = Math.incrementExact(current.nextSourceDrawId)
-            current.nextSourceDrawId
-        }
-        val draw = DrawRecording(disposition, selection(), sourceDrawId, previous?.sourceDrawId)
-        val terrainScope = current.scopes.lastOrNull()?.facts?.takeIf {
-            it.producer.kind == OitProducerKind.TERRAIN && it.stage == OitStage.ACCUMULATE
-        }
-        val receiptOwner = if (terrainScope != null && disposition != OitDrawDisposition.EMPTY)
-            OitReconstructionInputs.terrainRecordFrames() else null
+        val draw = DrawRecording(disposition, selection())
         current.draw = draw
         try {
-            val preceding = try {
-                receiptOwner?.queryNativeDrawFrontier()
-            } catch (failure: Throwable) {
-                current.failed = true
-                current.recordFailure(OitExecutionFailure(OitExecutionFailureKind.NATIVE_RECEIPT,
-                    draw.sourceDrawId, current.passes[pass]?.descriptor?.passId, terrainScope?.serial))
-                previous?.nativeReceiptFailure = failure
-                throw failure
-            }
-            val result = try {
-                val operationOwner = OitReconstructionInputs.terrainRecordFrames()?.takeIf {
-                    disposition != OitDrawDisposition.EMPTY &&
-                        current.scopes.lastOrNull()?.facts?.producer?.kind != OitProducerKind.TERRAIN
-                }
-                if (operationOwner != null) {
-                    val passFacts = checkNotNull(current.passes[pass])
-                    val scope = current.scopes.lastOrNull()?.facts
-                    val kind = current.executionKind ?: when (passFacts.providerStage) {
-                        OitStage.DEPTH_BOUNDS -> OitExecutionEventKind.DEPTH_BOUNDS
-                        OitStage.TRANSMITTANCE -> OitExecutionEventKind.TRANSMITTANCE
-                        OitStage.ACCUMULATE -> OitExecutionEventKind.ACCUMULATE
-                        null -> OitExecutionEventKind.UNCLASSIFIED_DRAW
-                    }
-                    val nativeKind = when (kind) {
-                        OitExecutionEventKind.DEPTH_BOUNDS, OitExecutionEventKind.TRANSMITTANCE,
-                        OitExecutionEventKind.ACCUMULATE -> 1
-                        OitExecutionEventKind.WATER_DEPTH_COPY, OitExecutionEventKind.TERRAIN_DEPTH_COPY -> 7
-                        OitExecutionEventKind.CLOUD_DEPTH_COPY -> 13
-                        OitExecutionEventKind.DEPTH_BOUNDS_COPY -> 8
-                        OitExecutionEventKind.DEPTH_BOUNDS_CULL -> 9
-                        OitExecutionEventKind.WATER_MASK -> 12
-                        OitExecutionEventKind.COMPOSITE, OitExecutionEventKind.UNCLASSIFIED_DRAW -> 14
-                    }
-                    val stage = when (kind) {
-                        OitExecutionEventKind.WATER_DEPTH_COPY, OitExecutionEventKind.WATER_MASK -> 4
-                        OitExecutionEventKind.CLOUD_DEPTH_COPY -> 5
-                        OitExecutionEventKind.COMPOSITE -> 6
-                        else -> when (scope?.stage ?: passFacts.providerStage) {
-                            OitStage.DEPTH_BOUNDS -> 1
-                            OitStage.TRANSMITTANCE -> 2
-                            OitStage.ACCUMULATE -> 3
-                            null -> 0
-                        }
-                    }
-                    val facts = OitNativeOperationReceipts.OperationFacts(nativeKind, 0,
-                        operationOwner.recordingSerial, current.facts.identity, scope?.producerId ?: 0L,
-                        scope?.serial ?: 0L, passFacts.descriptor.passId, checkNotNull(sourceDrawId),
-                        draw.parentSourceDrawId, scope?.producer?.kind?.ordinal ?: -1, stage,
-                        operationOwner.programGeneration, 0L, 0L)
-                    operationOwner.recordExecutionOperation(facts, action).let { (value, receipts) ->
-                        draw.operationReceipts = receipts
-                        value
-                    }
-                } else action()
-            } catch (failure: Throwable) {
-                current.failed = true
-                if (draw.nativeReceiptFailure === failure) previous?.nativeReceiptFailure = failure
-                else if (draw.terrainStageFailure === failure) previous?.terrainStageFailure = failure
-                else current.recordFailure(OitExecutionFailure(OitExecutionFailureKind.DRAW, draw.sourceDrawId,
-                    current.passes[pass]?.descriptor?.passId, current.scopes.lastOrNull()?.facts?.serial))
-                throw failure
-            }
-            val passFacts = current.passes[pass]
-            if (passFacts != null && disposition != OitDrawDisposition.EMPTY) {
+            val result = action()
+            if (disposition != OitDrawDisposition.EMPTY) {
                 current.scopes.lastOrNull()?.let { it.actualDrawCalls = Math.incrementExact(it.actualDrawCalls) }
-                val location = current.pipelineLocations[pass]
-                val kind = current.executionKind ?: when (passFacts.providerStage) {
-                    OitStage.DEPTH_BOUNDS -> OitExecutionEventKind.DEPTH_BOUNDS
-                    OitStage.TRANSMITTANCE -> OitExecutionEventKind.TRANSMITTANCE
-                    OitStage.ACCUMULATE -> OitExecutionEventKind.ACCUMULATE
-                    null -> OitExecutionEventKind.UNCLASSIFIED_DRAW
-                }
-                val nativeReceipts = try {
-                    if (preceding is OitNativeReceiptFrontier.Available) {
-                        val queried = checkNotNull(receiptOwner).queryNativeDrawReceipts(preceding.sequence)
-                        if (queried is OitNativeReceiptQuery.Available) {
-                            val unassigned = queried.receipts.filterNot {
-                                it.receiptId in current.assignedTerrainReceiptIds
-                            }
-                            check(unassigned.all { receipt ->
-                                receipt.producerScopeSerial == terrainScope?.serial &&
-                                    receipt.producerKind == OitProducerKind.TERRAIN
-                            }) { "Terrain native receipts belong to another producer invocation" }
-                            OitNativeReceiptQuery.Available(unassigned)
-                        } else queried
-                    } else if (preceding == OitNativeReceiptFrontier.EntryUnavailable) {
-                        OitNativeReceiptQuery.EntryUnavailable
-                    } else OitNativeReceiptQuery.NotQueried
-                } catch (failure: Throwable) {
-                    current.failed = true
-                    current.recordFailure(OitExecutionFailure(OitExecutionFailureKind.NATIVE_RECEIPT,
-                        draw.sourceDrawId, passFacts.descriptor.passId, terrainScope?.serial))
-                    current.recordExecution(pass, passFacts, draw, kind, location, OitNativeReceiptQuery.Failed)
-                    previous?.nativeReceiptFailure = failure
-                    throw failure
-                }
-                current.recordExecution(pass, passFacts, draw, kind, location, nativeReceipts)
-                if (nativeReceipts is OitNativeReceiptQuery.Available) {
-                    current.assignedTerrainReceiptIds.addAll(nativeReceipts.receipts.map { it.receiptId })
-                }
             }
-            try {
-                if (previous != null) previous.contributions.addAll(draw.contributions)
-                else for (contribution in draw.contributions) {
-                    contribution()
-                    current.scopes.lastOrNull()?.let { it.drawCalls = Math.incrementExact(it.drawCalls) }
-                }
-            } catch (failure: Throwable) {
-                current.failed = true
-                current.recordFailure(OitExecutionFailure(OitExecutionFailureKind.HISTORY_CONTRIBUTION,
-                    draw.sourceDrawId, current.passes[pass]?.descriptor?.passId,
-                    current.scopes.lastOrNull()?.facts?.serial))
-                throw failure
+            if (previous != null) previous.contributions.addAll(draw.contributions)
+            else for (contribution in draw.contributions) {
+                contribution()
+                current.scopes.lastOrNull()?.let { it.drawCalls = Math.incrementExact(it.drawCalls) }
             }
             return result
+        } catch (failure: Throwable) {
+            current.failed = true
+            throw failure
         } finally {
             current.draw = previous
         }
@@ -643,20 +347,6 @@ internal object OitProducerCapture {
     fun frameResult(): OitFrameResult? = recording?.let { current ->
         OitFrameResult(current.facts, current.results,
             current.failed || current.scopes.isNotEmpty() || current.activePass != null)
-    }
-
-    fun executionResult(recordingSerial: Long): OitExecutionRecording? = recording?.let { current ->
-        val scopes = current.executionScopes + current.scopes.map {
-            OitExecutionScope(it.facts, it.actualDrawCalls, OitExecutionScopeCompletion.ACTIVE, null)
-        }
-        OitExecutionRecording(current.facts, recordingSerial, current.producers, scopes.sortedBy { it.scope.serial },
-            current.executionPasses.values.toList(), current.executionEvents, current.failures,
-            setOf(OitNativeExecutionGap.DRAW_RECEIPT_UNAVAILABLE,
-                OitNativeExecutionGap.FROZEN_CONTENT_LEASE_UNAVAILABLE,
-                OitNativeExecutionGap.CROSS_STAGE_DRAW_SELECTION_UNAVAILABLE,
-                OitNativeExecutionGap.ATTACHMENT_STORE_UNKNOWN,
-                OitNativeExecutionGap.NATIVE_COMMAND_GRANULARITY_UNAVAILABLE,
-                OitNativeExecutionGap.BULK_DRAW_SELECTION_UNAVAILABLE), current.failed, current.journalEntries)
     }
 
     fun retireFrame() {

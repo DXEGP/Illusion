@@ -4,7 +4,6 @@ import io.github.dxegp.d3d12.backend.D3D12CompiledRenderPipeline
 import io.github.dxegp.render.frame.vanilla.VanillaFrameInputs
 import io.github.dxegp.render.reconstruction.oit.OitReconstructionInputs
 import io.github.dxegp.render.reconstruction.oit.OitDisplayGuideAvailability
-import io.github.dxegp.render.reconstruction.oit.OitTileNormalizationPrograms
 import io.github.dxegp.render.temporal.D3D12RasterMotionCapture
 import net.minecraft.client.renderer.RenderPipelines
 
@@ -67,7 +66,6 @@ internal object WorldTransparencyCapture {
             D3D12RasterMotionCapture.worldHistoryBindingSerial() > bindingSerialBeforeDraw
         when (pipeline.location) {
             RenderPipelines.OIT_COMPOSITE.location,
-            OitTileNormalizationPrograms.normalizedCompositePipeline.location,
             OitReconstructionInputs.compositePipeline.location -> {
                 oitColorResolved = true
             }
@@ -103,3 +101,4 @@ internal object WorldTransparencyCapture {
         sealed = null
     }
 }
+

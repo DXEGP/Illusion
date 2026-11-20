@@ -41,8 +41,7 @@ internal enum class OitCompositeInputUnavailable {
 internal sealed interface OitCompositeInputCapture {
     data class Available(val input: OitCompositeNormalizationInput) : OitCompositeInputCapture
     data class Unavailable(val reason: OitCompositeInputUnavailable,
-        val certification: D3D12OitNormalizationCertification? = null,
-        val contentFailure: OitRecordFrames.SampledTextureCaptureResult.Unavailable? = null) : OitCompositeInputCapture
+        val certification: D3D12OitNormalizationCertification? = null) : OitCompositeInputCapture
 }
 
 internal class OitCompositeTexture(val view: D3D12GpuTextureView, val texture: D3D12GpuTexture) {
@@ -77,7 +76,6 @@ internal class OitCompositeNormalizationInput private constructor(
     val pipelineHandle = pipeline.handle()
     val pipelineDefines: Map<String, String> = Collections.unmodifiableMap(LinkedHashMap(pipeline.info().shaderDefines.values()))
     val pipelineFlags: Set<String> = Collections.unmodifiableSet(LinkedHashSet(pipeline.info().shaderDefines.flags()))
-    val normalizationRecipe: OitTileNormalizationRecipe = OitTileNormalizationPrograms.recipe(coefficients.size)
     val inputCount: Int get() = coefficients.size + 4
 
     inline fun forEachTexture(action: (Int, OitCompositeTexture) -> Unit) {
@@ -224,3 +222,5 @@ internal class OitCompositeDisplayConfirmation(
         completed = true
     }
 }
+
+

@@ -39,7 +39,6 @@ import io.github.dxegp.d3d12.shader.injectShaderDefines
 import io.github.dxegp.render.frameprep.FramePrepPrograms
 import io.github.dxegp.render.presentation.D3D12SceneDisplay
 import io.github.dxegp.render.reconstruction.oit.OitReconstructionInputs
-import io.github.dxegp.render.reconstruction.oit.OitTileNormalizationPrograms
 import net.minecraft.client.renderer.ShaderDefines
 import net.minecraft.resources.Identifier
 import org.lwjgl.system.MemoryUtil
@@ -140,7 +139,6 @@ internal class VanillaPipelineCompiler(
         inventory.addAll(required)
         inventory.addAll(optional)
         inventory.add(OitReconstructionInputs.compositePipeline)
-        inventory.add(OitTileNormalizationPrograms.normalizedCompositePipeline)
         inventory.addAll(D3D12SceneDisplay.pipelines)
         inventory.addAll(D3D12PipelineBridge.inventory())
         inventory.addAll(pipelineCache.keys)
@@ -516,39 +514,7 @@ internal class VanillaPipelineCompiler(
                 check(compiler.generation == expectedGeneration) { "Pipeline compilation was revoked by a shader reload" }
             }
             val desc = buildNativeDesc(compiled, pipeline, flipY)
-            val normalization = compiled.oitNormalization
-            val laneOperation = compiled.oitLaneOperation
-            val iaTile = D3D12OitTileShader.buildIa(compiled, pipeline,
-                getOrCreateCompiler().globalDefines, vertexShader.source, fragmentShader.source, expectedGeneration, flipY)
-            val opaqueSeed = D3D12OitTileShader.buildOpaqueSeed(compiled, pipeline,
-                getOrCreateCompiler().globalDefines, vertexShader.source, fragmentShader.source, expectedGeneration, flipY)
-                .let { seed ->
-                    if (seed === D3D12OpaqueSeedCompilation.NotApplicable) VanillaDepthOperationSource.buildWaterMask(
-                        compiled, pipeline, getOrCreateCompiler().globalDefines,
-                        vertexShader.source, fragmentShader.source, expectedGeneration, flipY) else seed
-                }
-            val handle = when {
-                normalization is D3D12OitNormalizationCertification.Certified -> MCDR_ABI.D3D12CreateOitNormalizationPipelineV1(
-                    desc, normalization.certificationVersion, normalization.targetCount, normalization.generation,
-                    normalization.fragmentSourceHashBytes(), normalization.vertexSourceHashBytes(),
-                    normalization.contractHashBytes(),
-                )
-                laneOperation != null -> MCDR_ABI.D3D12CreateOitLaneOperationPipelineV1(
-                    desc, laneOperation.kind, laneOperation.generation, laneOperation.projectionBinding,
-                )
-                opaqueSeed is D3D12OpaqueSeedCompilation.Candidate -> {
-                    val program = opaqueSeed.program
-                    MCDR_ABI.D3D12CreateOpaqueSeedPipelineV1(desc, pipeline.pushConstantSize(),
-                        program.directVertexHlsl, program.fragmentHlsl, program.programGeneration)
-                }
-                iaTile is D3D12OitTileIaCompilation.Candidate -> {
-                    val program = iaTile.program
-                    MCDR_ABI.D3D12CreateOitTileIAPipelineV1(desc, pipeline.pushConstantSize(),
-                        program.directVertexHlsl, program.fragmentHlsl, program.programGeneration,
-                        program.laneRegisters.toIntArray(), program.stage.ordinal)
-                }
-                else -> MCDR_ABI.D3D12CreateGraphicsPipeline(desc, pipeline.pushConstantSize())
-            }
+            val handle = MCDR_ABI.D3D12CreateGraphicsPipeline(desc, pipeline.pushConstantSize())
             if (handle == 0L) {
                 LOGGER.error("{} COMPILE FAILED (native): pipeline creation returned 0",
                     pipeName)
@@ -576,8 +542,6 @@ internal class VanillaPipelineCompiler(
                     { buildNativeDesc(compiled, pipeline, flipY) },
                     celestialMotionExact = !flipY && CameraReprojectionSources.supportsCelestial(pipeline,
                         vertexShader.source, fragmentShader.source, getOrCreateCompiler().globalDefines),
-                    opaqueSeed = (opaqueSeed as? D3D12OpaqueSeedCompilation.Candidate)?.program,
-                    iaTile = (iaTile as? D3D12OitTileIaCompilation.Candidate)?.program,
                 ))
                 check(getOrCreateCompiler().generation == expectedGeneration && !closed) {
                     "Pipeline compilation was revoked by a shader reload"

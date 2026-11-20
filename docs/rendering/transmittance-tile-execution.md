@@ -2,6 +2,12 @@
 
 本文件把四子样本透明覆盖的执行边界固定下来。完整实现由内容冻结、shader 路由、GPU 分桶、tile executor 和最终归一化五部分组成；任何一部分缺失时，当前帧保留原版透明颜色并记录 typed unavailable，不能把原始 `ExecuteIndirect` 当作 tile consumer。
 
+## 正常帧的当前接线
+
+正常帧不建立 tile 变体。`VanillaPipelineCompiler` 只为每条原版管线创建普通图形 PSO；`OitReconstructionInputs` 不 arm opaque depth seed、不建立 execution stream V2、不调用 `executeTiles`。Composite 消费当帧 per-draw records 经 V3 resolve 得到的 corrected transparency，tile executor、四 lane depth/coverage 与 normalization 都不可达；下面的五部分契约只在显式恢复这些接点后才成立，恢复时必须同时提供 lane 管线变体与 opaque seed，否则 native 返回 `-2`。JVM 侧的 tile、lane 执行流、terrain 回放与归一化文件已删除；native 侧 `d3d12_oit_records.cpp` 的执行流与 tile 重放、`d3d12_oit_normalization.cpp` 以及 opaque seed 的 depth-only PSO 变体仍编译，但正常帧没有入口，且仍被 mesh 地形的 stage receipt 校验引用——删净它们必须同时改造实时地形绘制分支。
+
+记录追加对每个透明片元只做一次全帧分配器原子：`rebuild\MCDR\include\mcdr_oit_shader.h` 的 `AppendV1` 用 `McdrOitAllocatorV1.InterlockedAdd(0u, 1u, index)` 取记录索引。禁止改回 compare-exchange 重试循环——它把全帧所有透明片元串行化到同一条 cache line 上，实测 854×480 帧间隔 108.5 → 31 ms、2560×1334 411 → 32.5 ms。索引只决定记录落点，顺序仍由逐像素 `InterlockedExchange` 的链表和 `previous` 链决定。
+
 ## 固定参数
 
 - resident batch 最多 16 个 tile；每 tile 有效区域为 `64×64`，四边各保留 `2 px` guard。

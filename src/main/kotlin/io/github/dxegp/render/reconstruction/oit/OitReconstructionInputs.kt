@@ -68,7 +68,6 @@ internal class PendingOitContributionResolve(
 )
 
 internal object OitReconstructionInputs : AutoCloseable {
-    private var lastTileStatus: String? = null
     val compositePipeline: RenderPipeline = RenderPipeline.builder(RenderPipelines.OIT_SNIPPET)
         .withLocation(Identifier.fromNamespaceAndPath("dxr_mc", "pipeline/oit_reconstruction_composite"))
         .withBindGroupLayout(BindGroupLayouts.PROJECTION)
@@ -108,21 +107,6 @@ internal object OitReconstructionInputs : AutoCloseable {
             }
             correctedView = null
             failure?.let { throw it }
-        }
-    }
-
-    private class NormalizedTransparency(val width: Int, val height: Int) : AutoCloseable {
-        val texture = D3D12GpuTexture(GpuTexture.USAGE_TEXTURE_BINDING or GpuTexture.USAGE_COPY_DST,
-            "OIT four-lane transparency", GpuFormat.RGBA32_FLOAT, width, height, 1, 1)
-        val view = try {
-            D3D12GpuTextureView(texture, 0, 1)
-        } catch (failure: Throwable) {
-            try { texture.close() } catch (cleanup: Throwable) { failure.addSuppressed(cleanup) }
-            throw failure
-        }
-
-        override fun close() {
-            try { view.close() } finally { texture.close() }
         }
     }
 
@@ -171,7 +155,6 @@ internal object OitReconstructionInputs : AutoCloseable {
     private var recordFrames: OitRecordFrames? = null
     private var unrecordedCoverage: D3D12GpuTexture? = null
     private var recordResolveAttachments: RecordResolveAttachments? = null
-    private var normalizedTransparency: NormalizedTransparency? = null
     private var compositeDisplay: OitCompositeDisplayConfirmation? = null
     internal var pendingContributionResolve: PendingOitContributionResolve? = null
         private set
@@ -226,14 +209,6 @@ internal object OitReconstructionInputs : AutoCloseable {
         frame = inputs
         OitSurfaceInputs.beginFrame(inputs)
         frameResolveProgram = resolveProgram
-        if (frameResolveProgram != null) {
-            encoder.recordCommands { context ->
-                val result = MCDR_ABI.D3D12VanillaArmWorldDepthSeedV1(
-                    context, MAX_OPAQUE_SEED_EVENTS, RECORD_LIMITS.totalBudgetBytes,
-                )
-                if (result != 1 && result != -3) throwOpaqueSeedFailure(result, "arm opaque seed", inputs)
-            }
-        }
         drawnCloud = null
         parameters = null
         incomplete = false
@@ -244,12 +219,6 @@ internal object OitReconstructionInputs : AutoCloseable {
         val inputs = frame ?: return
         check(inputs === VanillaFrameCoordinator.currentFrame() && owner === encoder) {
             "OIT opaque capture belongs to another frame or command owner"
-        }
-        encoder.recordCommands { context ->
-            when (val result = MCDR_ABI.D3D12VanillaSealWorldDepthSeedV1(context)) {
-                1, 0, -3, -6, -7 -> Unit
-                else -> throwOpaqueSeedFailure(result, "seal opaque seed", inputs)
-            }
         }
         val opaque = ReconstructionFrameInputs.captureOpaque(encoder, minecraft)
         OitProducerCapture.beginFrame(inputs)
@@ -293,43 +262,7 @@ internal object OitReconstructionInputs : AutoCloseable {
             OitUnrecordedCoverageAvailability.UNAVAILABLE else capture.coverageAvailability
         val coverage = OitUnrecordedCoverage(PreparedBinding(checkNotNull(unrecordedCoverage).handle()), availability)
         drawCapture = null
-        val stream = records.seal(input)
-        if (stream is OitNativeExecutionResult.Sealed) {
-            val capturedBinning = OitTerrainRecords.tileBinning
-            val binning = capturedBinning ?: (RenderSystem.getCompiledPipeline(RenderPipelines.OIT_TERRAIN
-                .getPipeline(OitStage.ACCUMULATE)) as? FrontendRenderPipeline)?.let {
-                (it.backendRenderPipeline() as? D3D12CompiledRenderPipeline)?.terrainTileBinning()
-            }
-            if (binning != null) {
-                val pipeline = RenderSystem.getCompiledPipeline(OitTileNormalizationPrograms.normalizedCompositePipeline)
-                val nativePipeline = (pipeline as? FrontendRenderPipeline)?.backendRenderPipeline() as? D3D12CompiledRenderPipeline
-                check(nativePipeline?.isValid() == true && !pipeline.isClosed()) { "OIT normalized Composite pipeline is unavailable" }
-                val normalized = normalizedTransparency?.takeIf {
-                    it.width == identity.width && it.height == identity.height
-                } ?: NormalizedTransparency(identity.width, identity.height).also {
-                    val old = normalizedTransparency
-                    normalizedTransparency = it
-                    old?.close()
-                }
-                if (records.executeTiles(stream, call.coefficients.size, binning, normalized.texture.handle())) {
-                    if (lastTileStatus != "active") {
-                        lastTileStatus = "active"
-                        IllusionLogger.debugMessage("OIT tile composite active")
-                    }
-                    return PendingOitContributionResolve(records.frame, normalized.view, pipeline, "NormalizedTransparencySampler")
-                }
-            }
-        } else if (stream is OitNativeExecutionResult.Unavailable && IllusionLogger.debugEnabled()) {
-            val inputFailure = input as? OitCompositeInputCapture.Unavailable
-            val status = "${stream.reason} (${stream.missingMask.toString(16)})"
-            if (lastTileStatus != status) {
-                lastTileStatus = status
-                IllusionLogger.debugFormat("OIT tile unavailable: %s (event %d)", status, stream.firstIssueSequence)
-                if (inputFailure != null)
-                    IllusionLogger.debugFormat("OIT Composite input: %s (%s)", inputFailure.reason,
-                        inputFailure.contentFailure?.detail ?: inputFailure.certification)
-            }
-        }
+        records.seal()
         val existing = recordResolveAttachments
         val output = if (existing != null && existing.width == identity.width && existing.height == identity.height)
             existing else RecordResolveAttachments(identity.width, identity.height).also {
@@ -448,17 +381,6 @@ internal object OitReconstructionInputs : AutoCloseable {
     private fun reconstructionRequired(inputs: VanillaFrameInputs): Boolean =
         inputs.settings.reconstructionBackend != MCDR_ABI.SR_BACKEND_NONE || inputs.settings.antiAliasing == 2
 
-    private fun throwOpaqueSeedFailure(result: Int, operation: String, inputs: VanillaFrameInputs): Nothing {
-        val failure = when (result) {
-            -1 -> OitRecordFailure.INVALID_CONTRACT
-            -2 -> OitRecordFailure.UNSUPPORTED
-            -4 -> OitRecordFailure.BUSY
-            -5 -> OitRecordFailure.STALE
-            -8 -> OitRecordFailure.RECORDING_FAILED
-            else -> OitRecordFailure.NATIVE_CONTRACT
-        }
-        throw OitRecordException(failure, operation, inputs.identity, MCDR_ABI.D3D12LastError())
-    }
 
     fun retireRecords() {
         pendingContributionResolve = null
@@ -662,7 +584,6 @@ internal object OitReconstructionInputs : AutoCloseable {
     fun stagePresented(inputs: VanillaFrameInputs) {
         check(recordFrames == null) { "OIT records must retire before the native frame reset" }
         if (frame === inputs) OitSurfaceInputs.stagePresented(inputs) else OitSurfaceInputs.invalidate()
-        OitTerrainRecords.clearTileReplay()
         frame = null
         frameResolveProgram = null
         drawnCloud = null
@@ -680,7 +601,6 @@ internal object OitReconstructionInputs : AutoCloseable {
 
     fun invalidate() {
         retireRecords()
-        OitTerrainRecords.clearTileReplay()
         frame = null
         frameResolveProgram = null
         drawnCloud = null
@@ -695,24 +615,20 @@ internal object OitReconstructionInputs : AutoCloseable {
         val current = attachments
         val coverage = unrecordedCoverage
         val recordOutput = recordResolveAttachments
-        val normalizedOutput = normalizedTransparency
         attachments = null
         unrecordedCoverage = null
         recordResolveAttachments = null
-        normalizedTransparency = null
         resolveProgram = null
         owner = null
         var failure: Throwable? = null
-        for (resource in listOfNotNull<AutoCloseable>(current, coverage, recordOutput, normalizedOutput)) {
+        for (resource in listOfNotNull<AutoCloseable>(current, coverage, recordOutput)) {
             try { resource.close() } catch (cleanup: Throwable) {
                 if (failure == null) failure = cleanup else failure.addSuppressed(cleanup)
             }
         }
         failure?.let { throw it }
     }
-
     private const val PARAMETER_NAME = "IllusionOitParameters"
-    private const val MAX_OPAQUE_SEED_EVENTS = 4096
     private val RECORD_LIMITS = OitRecordLimits(512L * 1024L * 1024L,
         262144, 32, 4096, 65536, 65536)
     private val RESOLVE_VERTEX = """

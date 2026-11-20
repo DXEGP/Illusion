@@ -9,13 +9,10 @@ import io.github.dxegp.d3d12.command.D3D12PreparedRasterDispatch
 import io.github.dxegp.d3d12.command.D3D12RasterPassPolicy
 import io.github.dxegp.d3d12.command.D3D12RasterRoute
 import io.github.dxegp.d3d12.command.D3D12TerrainDraw
-import io.github.dxegp.d3d12.command.D3D12TerrainPreparedFacts
 import io.github.dxegp.d3d12.command.D3D12AdditionalRasterBindings
 import io.github.dxegp.render.reconstruction.oit.OitReconstructionInputs
 import io.github.dxegp.render.reconstruction.oit.OitTerrainMaterials
 import io.github.dxegp.render.reconstruction.oit.OitTerrainRecords
-import io.github.dxegp.render.reconstruction.oit.OitProducerCapture
-import io.github.dxegp.render.reconstruction.oit.OitNativeTerrainStageReceiptResult
 import io.github.dxegp.d3d12.resource.D3D12TransientMemory
 import io.github.dxegp.render.compilation.VanillaPipelineSemantics
 import io.github.dxegp.render.temporal.D3D12RasterMotion
@@ -98,29 +95,21 @@ internal class VanillaRasterPassPolicy(
     override fun recordTerrain(draw: D3D12TerrainDraw, record: (D3D12PreparedRasterDispatch) -> Unit) {
         D3D12VariableShadingRate.scope(context, draw.pipeline.info().location.toString()) {
             check(D3D12Settings.meshTerrain) { "Selected terrain Work Graph rendering is disabled" }
-            val stageInvocation = OitProducerCapture.terrainStageInvocation()
-            var stageReceipt: OitNativeTerrainStageReceiptResult = OitNativeTerrainStageReceiptResult.EntryUnavailable
-            val stageFactsConsumer: ((D3D12TerrainPreparedFacts) -> Unit)? = if (stageInvocation == null) null else {
-                preparedFacts -> OitTerrainRecords.recordPreparedStage(stageInvocation, draw, preparedFacts, stageReceipt)
-            }
             val capture = OitTerrainRecords.prepare(draw)
             val prepared = checkNotNull(D3D12TerrainWorkGraph.prepare(
                 draw.pipeline, draw.commands, draw.drawCount, draw.vertexBuffer, draw.vertexOffset,
                 context, transientMemory, residency, draw.uniforms, D3D12Settings.meshTerrainCull,
                 D3D12VariableShadingRate.msBand(), draw.rasterMotionTarget, draw.additionalAttachment, capture,
-                stageFactsConsumer,
+                null,
             )) { "Selected terrain Work Graph draw could not be prepared" }
             prepared.use {
                 if (capture != null) {
                     D3D12TerrainWorkGraph.bindCaptureFacts(it, capture)
                 }
-                val records = if (stageInvocation == null) null else OitReconstructionInputs.terrainRecordFrames()
-                if (records == null) record(it)
-                else records.recordTerrainStage(checkNotNull(stageInvocation), it) {
-                    record(it)
-                }.also { receipt -> stageReceipt = receipt }
+                record(it)
                 it.recordPreparedFacts()
             }
         }
     }
+
 }

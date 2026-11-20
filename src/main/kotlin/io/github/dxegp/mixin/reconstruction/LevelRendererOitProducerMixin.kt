@@ -11,7 +11,6 @@ import com.mojang.renderpearl.api.textures.GpuTextureView
 import io.github.dxegp.render.reconstruction.oit.OitProducer
 import io.github.dxegp.render.reconstruction.oit.OitProducerCapture
 import io.github.dxegp.render.reconstruction.oit.OitProducerKind
-import io.github.dxegp.render.reconstruction.oit.OitExecutionEventKind
 import io.github.dxegp.render.reconstruction.oit.OitReconstructionInputs
 import io.github.dxegp.render.reconstruction.oit.OitOriginalCompositeCall
 import io.github.dxegp.d3d12.device.D3D12Device
@@ -71,45 +70,35 @@ abstract class LevelRendererOitProducerMixin {
         target = "Lcom/mojang/renderpearl/api/commands/RenderPass;draw(IIII)V")])
     private fun illusionRecordWaterDepthCopy(pass: RenderPass, vertexCount: Int, instanceCount: Int,
         firstVertex: Int, firstInstance: Int, original: Operation<Void?>) {
-        OitProducerCapture.recordExecutionOperation(OitExecutionEventKind.WATER_DEPTH_COPY) {
-            original.call(pass, vertexCount, instanceCount, firstVertex, firstInstance)
-        }
+        original.call(pass, vertexCount, instanceCount, firstVertex, firstInstance)
     }
 
     @WrapOperation(method = ["executeOitWaterMask"], at = [At(value = "INVOKE",
         target = "Lnet/minecraft/client/renderer/feature/FeatureRenderDispatcher\$PreparedFrame;executeWaterMask(Lcom/mojang/renderpearl/api/commands/RenderPass;)V")])
     private fun illusionRecordWaterMask(features: FeatureRenderDispatcher.PreparedFrame, pass: RenderPass,
         original: Operation<Void?>) {
-        OitProducerCapture.recordExecutionOperation(OitExecutionEventKind.WATER_MASK) {
-            original.call(features, pass)
-        }
+        original.call(features, pass)
     }
 
     @WrapOperation(method = ["executeDepthBoundsCull"], at = [At(value = "INVOKE", ordinal = 0,
         target = "Lcom/mojang/renderpearl/api/commands/RenderPass;draw(IIII)V")])
     private fun illusionRecordDepthBoundsCopy(pass: RenderPass, vertexCount: Int, instanceCount: Int,
         firstVertex: Int, firstInstance: Int, original: Operation<Void?>) {
-        OitProducerCapture.recordExecutionOperation(OitExecutionEventKind.DEPTH_BOUNDS_COPY) {
-            original.call(pass, vertexCount, instanceCount, firstVertex, firstInstance)
-        }
+        original.call(pass, vertexCount, instanceCount, firstVertex, firstInstance)
     }
 
     @WrapOperation(method = ["executeDepthBoundsCull"], at = [At(value = "INVOKE", ordinal = 1,
         target = "Lcom/mojang/renderpearl/api/commands/RenderPass;draw(IIII)V")])
     private fun illusionRecordDepthBoundsCull(pass: RenderPass, vertexCount: Int, instanceCount: Int,
         firstVertex: Int, firstInstance: Int, original: Operation<Void?>) {
-        OitProducerCapture.recordExecutionOperation(OitExecutionEventKind.DEPTH_BOUNDS_CULL) {
-            original.call(pass, vertexCount, instanceCount, firstVertex, firstInstance)
-        }
+        original.call(pass, vertexCount, instanceCount, firstVertex, firstInstance)
     }
 
     @WrapOperation(method = ["executeOit"], at = [At(value = "INVOKE",
         target = "Lcom/mojang/renderpearl/api/commands/RenderPass;draw(IIII)V")])
     private fun illusionRecordCompositeDraw(pass: RenderPass, vertexCount: Int, instanceCount: Int,
         firstVertex: Int, firstInstance: Int, original: Operation<Void?>) {
-        OitProducerCapture.recordExecutionOperation(OitExecutionEventKind.COMPOSITE) {
-            original.call(pass, vertexCount, instanceCount, firstVertex, firstInstance)
-        }
+        original.call(pass, vertexCount, instanceCount, firstVertex, firstInstance)
         OitReconstructionInputs.confirmCompositeDraw(pass, vertexCount, instanceCount, firstVertex, firstInstance)
     }
 
@@ -228,3 +217,5 @@ abstract class LevelRendererOitProducerMixin {
         }
     }
 }
+
+

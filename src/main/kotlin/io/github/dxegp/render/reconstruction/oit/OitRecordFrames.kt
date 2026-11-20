@@ -1,21 +1,14 @@
 package io.github.dxegp.render.reconstruction.oit
 
 import com.mojang.blaze3d.systems.RenderSystem
-import com.mojang.renderpearl.api.GpuFormat
 import io.github.dxegp.d3d12.command.D3D12CommandEncoderBackend
-import io.github.dxegp.d3d12.ffi.FfmScratch
 import io.github.dxegp.d3d12.ffi.MCDRLayout
 import io.github.dxegp.d3d12.ffi.MCDR_ABI
 import io.github.dxegp.d3d12.ffi.allocateFfmArray
-import io.github.dxegp.d3d12.shader.D3D12OitReplayStage
-import io.github.dxegp.d3d12.shader.D3D12OitTileBinning
-import io.github.dxegp.d3d12.shader.D3D12OitTileBinningHandles
-import io.github.dxegp.d3d12.shader.D3D12OitTileContract
 import io.github.dxegp.render.frame.vanilla.PreparedBinding
 import io.github.dxegp.render.frame.vanilla.VanillaFrameCoordinator
 import io.github.dxegp.render.frame.vanilla.VanillaFrameIdentity
 import io.github.dxegp.render.reconstruction.OpaqueReconstructionInputs
-import io.github.dxegp.render.terrain.mesh.D3D12TerrainWorkGraph
 import org.joml.Matrix4f
 import java.lang.foreign.Arena
 import java.lang.foreign.MemoryLayout
@@ -24,30 +17,6 @@ import java.lang.foreign.MemorySegment
 
 internal enum class OitRecordFailure {
     INVALID_CONTRACT, UNSUPPORTED, OVER_BUDGET, BUSY, STALE, UNKNOWN_SUBMISSION, RECORDING_FAILED, NATIVE_CONTRACT,
-}
-
-internal sealed interface OitTerrainTilePreparation {
-    data class Consumed(val batches: List<OitTerrainTileBatch>) : OitTerrainTilePreparation {
-        init {
-            require(batches.isNotEmpty())
-        }
-    }
-    data class Unavailable(val reason: Reason) : OitTerrainTilePreparation
-    data class Rejected(val result: Int, val detail: String) : OitTerrainTilePreparation
-
-    enum class Reason {
-        NO_TILE_BATCH,
-        INCOMPLETE_PACKET_SET,
-        EXECUTION_STREAM_UNAVAILABLE,
-        NATIVE_ENTRY_UNAVAILABLE,
-        INVALID_RESOURCES,
-        UNSUPPORTED_ROUTE,
-        UNSUPPORTED_CONTENT,
-        FRAME_NOT_SEALED,
-        STALE_FRAME,
-        TERRAIN_PRODUCER_FACTS_UNAVAILABLE,
-        SEALED_EVENTS_INCOMPLETE,
-    }
 }
 
 internal class OitRecordException(
@@ -78,68 +47,6 @@ internal class OitRecordFrames private constructor(
     val recordingSerial: Long,
     private val handle: Long,
 ) : AutoCloseable {
-    internal data class SampledTextureCapture(
-        val captureId: Long,
-        val texture: Long,
-        val ownerIdentity: Long,
-        val ownerGeneration: Long,
-        val contentVersion: Long,
-        val firstSubresource: Int,
-        val subresourceCount: Int,
-        val resourceVersion: Long,
-    )
-
-    internal sealed interface SampledTextureCaptureResult {
-        data class Captured(val content: SampledTextureCapture) : SampledTextureCaptureResult
-        data class Unavailable(val failure: OitRecordFailure, val detail: String) : SampledTextureCaptureResult
-    }
-
-    internal fun captureSampledTextureContent(view: Long,
-        budget: Long = 64L * 1024L * 1024L): SampledTextureCaptureResult {
-        RenderSystem.assertOnRenderThread()
-        check(phase == Phase.RECORDING && !drawBound)
-        return encoder.recordCommands { context ->
-            Arena.ofConfined().use { arena ->
-                val output = arena.allocate(MCDRLayout.OIT_EXECUTION_TEXTURE_V1)
-                val result = MCDR_ABI.D3D12OitCaptureExecutionTextureV1(context, handle, view, budget, output)
-                if (result != 1) {
-                    val failure = when (result) {
-                        -1 -> OitRecordFailure.INVALID_CONTRACT
-                        -2 -> OitRecordFailure.UNSUPPORTED
-                        -3 -> OitRecordFailure.OVER_BUDGET
-                        -4 -> OitRecordFailure.BUSY
-                        -5 -> OitRecordFailure.STALE
-                        -6 -> OitRecordFailure.UNKNOWN_SUBMISSION
-                        -8 -> OitRecordFailure.RECORDING_FAILED
-                        else -> OitRecordFailure.NATIVE_CONTRACT
-                    }
-                    val detail = "Native status $result: ${MCDR_ABI.D3D12LastError()}"
-                    if (failure == OitRecordFailure.UNSUPPORTED || failure == OitRecordFailure.OVER_BUDGET)
-                        return@use SampledTextureCaptureResult.Unavailable(failure, detail)
-                    throw OitRecordException(failure, "capture execution texture", inputs.frame.identity, detail)
-                }
-                val content = SampledTextureCapture(
-                    output.get(MCDRLayout.I64, TextureCaptureOffsets.captureId),
-                    output.get(MCDRLayout.PTR, TextureCaptureOffsets.texture).address(),
-                    output.get(MCDRLayout.I64, TextureCaptureOffsets.ownerIdentity),
-                    output.get(MCDRLayout.I64, TextureCaptureOffsets.ownerGeneration),
-                    output.get(MCDRLayout.I64, TextureCaptureOffsets.contentVersion),
-                    output.get(MCDRLayout.I32, TextureCaptureOffsets.firstSubresource),
-                    output.get(MCDRLayout.I32, TextureCaptureOffsets.subresourceCount),
-                    output.get(MCDRLayout.I64, TextureCaptureOffsets.resourceVersion),
-                )
-                if (output.get(MCDRLayout.I32, TextureCaptureOffsets.schemaVersion) != 1 ||
-                    output.get(MCDRLayout.I32, TextureCaptureOffsets.structSize).toLong() != TextureCaptureOffsets.size ||
-                    content.captureId == 0L || content.texture == 0L || content.ownerIdentity == 0L ||
-                    content.ownerGeneration == 0L || content.contentVersion == 0L || content.firstSubresource < 0 ||
-                    content.subresourceCount <= 0 || content.resourceVersion != inputs.frame.identity.resourceVersion) {
-                    throw OitRecordException(OitRecordFailure.NATIVE_CONTRACT, "capture execution texture",
-                        inputs.frame.identity, "Native texture capture has an invalid header, identity, or range")
-                }
-                SampledTextureCaptureResult.Captured(content)
-            }
-        }
-    }
     internal enum class Phase { RECORDING, SEALED, RESOLVED, ABORTED }
 
     internal sealed interface MetadataPublication
@@ -153,41 +60,8 @@ internal class OitRecordFrames private constructor(
 
     private var phase = Phase.RECORDING
     private var drawBound = false
-    private val executionStream = OitNativeExecutionStream(inputs.frame.identity, inputs.frame.historyGeneration,
-        recordingSerial, programGeneration, handle)
-    val nativeExecutionResult: OitNativeExecutionResult? get() = executionStream.result
     val frame get() = inputs.frame
     fun isRecording(): Boolean = phase == Phase.RECORDING
-
-    fun <Result> recordExecutionOperation(facts: OitNativeOperationReceipts.OperationFacts,
-        action: () -> Result): Pair<Result, OitNativeOperationReceiptQuery> {
-        RenderSystem.assertOnRenderThread()
-        check(phase == Phase.RECORDING && facts.identity == inputs.frame.identity &&
-            facts.frameSerial == recordingSerial && facts.programGeneration == programGeneration)
-        return encoder.recordCommands { context -> OitNativeOperationReceipts.record(context, handle, facts, action) }
-    }
-
-    fun recordTerrainStage(invocation: OitTerrainStageInvocation, prepared: D3D12TerrainWorkGraph.Prepared,
-        action: () -> Unit): OitNativeTerrainStageReceiptResult {
-        RenderSystem.assertOnRenderThread()
-        check(phase == Phase.RECORDING && invocation.frame.identity == inputs.frame.identity)
-        return encoder.recordCommands { context ->
-            OitNativeStageReceipts.recordDraw(OitTerrainNativeRecording(context, handle, recordingSerial, programGeneration),
-                invocation, prepared, action)
-        }
-    }
-
-    fun queryNativeDrawReceipts(afterSequence: Long): OitNativeReceiptQuery {
-        RenderSystem.assertOnRenderThread()
-        check(phase == Phase.RECORDING)
-        return encoder.recordCommands { context -> executionStream.queryDrawReceipts(context, afterSequence) }
-    }
-
-    fun queryNativeDrawFrontier(): OitNativeReceiptFrontier {
-        RenderSystem.assertOnRenderThread()
-        check(phase == Phase.RECORDING)
-        return encoder.recordCommands { context -> executionStream.queryDrawFrontier(context) }
-    }
 
     fun publishMetadata(rows: OitRecordMetadata): MetadataPublication {
         RenderSystem.assertOnRenderThread()
@@ -325,132 +199,14 @@ internal class OitRecordFrames private constructor(
         }
     }
 
-    fun seal(compositeInput: OitCompositeInputCapture): OitNativeExecutionResult {
+    fun seal() {
         RenderSystem.assertOnRenderThread()
         check(phase == Phase.RECORDING && !drawBound)
-        val result = encoder.recordCommands { context ->
-            val executionRecording = OitProducerCapture.executionResult(recordingSerial)
-            val execution = executionStream.seal(context, executionRecording, compositeInput)
-            OitTerrainRecords.attachSealedEvents(
-                executionRecording,
-                compositeInput,
-            )
+        encoder.recordCommands { context ->
             requireSuccess(MCDR_ABI.D3D12OitSealFrameV1(context, handle), "seal frame")
-            execution
         }
         phase = Phase.SEALED
-        return result
     }
-
-    fun executeTiles(stream: OitNativeExecutionResult.Sealed, coefficientCount: Int,
-        binning: D3D12OitTileBinningHandles, corrected: Long): Boolean {
-        RenderSystem.assertOnRenderThread()
-        check(phase == Phase.SEALED && executionStream.result === stream && corrected != 0L)
-        val identity = frame.identity
-        val grid = OitTerrainTileGrid(identity.width, identity.height)
-        val groupSize = minOf(grid.tileCount, D3D12OitTileContract.MAX_RESIDENT_TILES)
-        val tailSize = grid.tileCount % groupSize
-        val tailStart = grid.tileCount - tailSize
-        val stages = D3D12OitReplayStage.entries.map { stage ->
-            val formats = when (stage) {
-                D3D12OitReplayStage.DEPTH_BOUNDS -> listOf(GpuFormat.RGBA32_FLOAT)
-                D3D12OitReplayStage.TRANSMITTANCE -> List(coefficientCount) { GpuFormat.RGBA16_FLOAT }
-                D3D12OitReplayStage.ACCUMULATE -> listOf(GpuFormat.RGBA16_FLOAT)
-            }
-            OitTerrainTileStageDescription(stage, 0L, 0L, formats)
-        }
-        val heads = OitTerrainTileBinningHandles(binning.workGraph, binning.initialize, binning.prefix, binning.scatter)
-        fun allocateTileResources(firstTile: Int, residentTileCount: Int) =
-            OitTerrainTileResourceOwner.create(recordingSerial, identity.worldEpoch, programGeneration,
-                identity.resourceVersion, grid, firstTile, residentTileCount,
-                D3D12OitTileBinning.program.maximumChunkPrimitives, stages, heads)
-        val completed = allocateTileResources(0, groupSize).use { full ->
-            val tail = if (tailSize > 0) allocateTileResources(tailStart, tailSize) else null
-            tail.use {
-                encoder.recordCommands { context ->
-                    val scratch = tileBatchScratch.get()
-                    val bytes = OitTerrainTileBatch.laneBatchBytes
-                    val alignment = OitTerrainTileBatch.laneBatchAlignment
-                    scratch.withScope(bytes, alignment) { temporary ->
-                        // Native consumes the lane payloads before returning from each downcall.
-                        val rows = scratch.allocate(0, bytes, alignment, temporary)
-                        var batch = full.batch
-                        batch.writeLanePayloads(rows)
-                        var firstTile = 0
-                        while (firstTile < grid.tileCount) {
-                            if (tail != null && firstTile == tailStart) {
-                                batch = tail.batch
-                                batch.writeLanePayloads(rows)
-                            }
-                            batch.writeLaneRegions(rows, firstTile)
-                            val nextTile = firstTile + batch.residentTileCount
-                            val target = if (nextTile == grid.tileCount) corrected else 0L
-                            val result = MCDR_ABI.D3D12OitExecuteTileStreamV2(context, stream.handle, rows, target)
-                            if (result == -3 || (firstTile == 0 && result == -2)) return@withScope false
-                            requireSuccess(result, "execute tile stream V2")
-                            firstTile = nextTile
-                        }
-                        true
-                    }
-                }
-            }
-        }
-        if (completed) phase = Phase.RESOLVED
-        return completed
-    }
-
-    fun prepareTerrainTiles(batch: OitTerrainTileBatch): OitTerrainTilePreparation {
-        RenderSystem.assertOnRenderThread()
-        check(phase == Phase.SEALED)
-        if (batch.frameSerial != recordingSerial ||
-            batch.worldEpoch != inputs.frame.identity.worldEpoch ||
-            batch.resourceVersion != inputs.frame.identity.resourceVersion ||
-            batch.programGeneration != programGeneration) {
-            return OitTerrainTilePreparation.Unavailable(OitTerrainTilePreparation.Reason.STALE_FRAME)
-        }
-        return encoder.recordCommands { context ->
-            Arena.ofConfined().use { arena ->
-                val result = MCDR_ABI.D3D12OitPrepareTerrainTilesV2(context, handle, batch.write(arena))
-                readTerrainTilePreparation(result, batch)
-            }
-        }
-    }
-
-    fun prepareTerrainTilesV3(batch: OitTerrainTileBatch, packetOrdinal: Int,
-        packetCount: Int): OitTerrainTilePreparation {
-        RenderSystem.assertOnRenderThread()
-        check(phase == Phase.SEALED)
-        require(packetCount > 0 && packetOrdinal in 0 until packetCount)
-        if (batch.frameSerial != recordingSerial ||
-            batch.worldEpoch != inputs.frame.identity.worldEpoch ||
-            batch.resourceVersion != inputs.frame.identity.resourceVersion ||
-            batch.programGeneration != programGeneration) {
-            return OitTerrainTilePreparation.Unavailable(OitTerrainTilePreparation.Reason.STALE_FRAME)
-        }
-        return encoder.recordCommands { context ->
-            Arena.ofConfined().use { arena ->
-                val result = MCDR_ABI.D3D12OitPrepareTerrainTilesV3(
-                    context, handle, batch.writeV3(arena, packetOrdinal, packetCount),
-                )
-                readTerrainTilePreparation(result, batch)
-            }
-        }
-    }
-
-    private fun readTerrainTilePreparation(result: Int, batch: OitTerrainTileBatch): OitTerrainTilePreparation =
-        when (result) {
-            0 -> OitTerrainTilePreparation.Unavailable(OitTerrainTilePreparation.Reason.UNSUPPORTED_ROUTE)
-            1 -> OitTerrainTilePreparation.Unavailable(OitTerrainTilePreparation.Reason.UNSUPPORTED_CONTENT)
-            2 -> OitTerrainTilePreparation.Unavailable(OitTerrainTilePreparation.Reason.STALE_FRAME)
-            3 -> OitTerrainTilePreparation.Unavailable(OitTerrainTilePreparation.Reason.INVALID_RESOURCES)
-            4 -> OitTerrainTilePreparation.Unavailable(OitTerrainTilePreparation.Reason.FRAME_NOT_SEALED)
-            5 -> OitTerrainTilePreparation.Consumed(listOf(batch))
-            6 -> OitTerrainTilePreparation.Rejected(result,
-                "Terrain tile GPU recording failed; command submission is invalid")
-            Int.MIN_VALUE -> OitTerrainTilePreparation.Unavailable(
-                OitTerrainTilePreparation.Reason.NATIVE_ENTRY_UNAVAILABLE)
-            else -> OitTerrainTilePreparation.Rejected(result, MCDR_ABI.D3D12LastError())
-        }
 
     fun resolveRecords(currentTransparency: PreparedBinding, unrecordedCoverage: OitUnrecordedCoverage,
         targets: OitContributionResolveTargets): Boolean {
@@ -487,7 +243,6 @@ internal class OitRecordFrames private constructor(
         RenderSystem.assertOnRenderThread()
         if (phase == Phase.ABORTED) return
         encoder.contextControl { context -> requireSuccess(MCDR_ABI.D3D12OitAbortFrameV1(context, handle), "retire frame") }
-        executionStream.retireWithFrame()
         phase = Phase.ABORTED
         drawBound = false
     }
@@ -507,22 +262,6 @@ internal class OitRecordFrames private constructor(
     }
 
     companion object {
-        private val tileBatchScratch = ThreadLocal.withInitial { FfmScratch() }
-
-        private object TextureCaptureOffsets {
-            private val layout = MCDRLayout.OIT_EXECUTION_TEXTURE_V1
-            val size = layout.byteSize()
-            val schemaVersion = layout.byteOffset(groupElement("schemaVersion"))
-            val structSize = layout.byteOffset(groupElement("structSize"))
-            val captureId = layout.byteOffset(groupElement("captureId"))
-            val texture = layout.byteOffset(groupElement("texture"))
-            val ownerIdentity = layout.byteOffset(groupElement("ownerIdentity"))
-            val ownerGeneration = layout.byteOffset(groupElement("ownerGeneration"))
-            val contentVersion = layout.byteOffset(groupElement("contentVersion"))
-            val firstSubresource = layout.byteOffset(groupElement("firstSubresource"))
-            val subresourceCount = layout.byteOffset(groupElement("subresourceCount"))
-            val resourceVersion = layout.byteOffset(groupElement("resourceVersion"))
-        }
 
         private object SourceOffsets {
             private val layout = MCDRLayout.OIT_SOURCE
@@ -647,3 +386,4 @@ internal class OitRecordFrames private constructor(
         }
     }
 }
+
