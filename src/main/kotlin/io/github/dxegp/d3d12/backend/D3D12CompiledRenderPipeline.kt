@@ -412,7 +412,7 @@ class D3D12CompiledRenderPipeline(
 
     /**
      * 线管线的 **TRIANGLES 拓扑变体** PSO：同一套着色器/顶点/索引，只换 `PrimitiveTopologyType`。
-     * D3D12 没有宽线（`LINELIST` 恒 1px），线宽只靠 vsh 把端点横移，必须摊成两个三角形才是一条带子。
+     * D3D12 没有宽线（`LINELIST` 恒 1px），线宽必须摊成两个三角形才是一条带子。
      */
     private var lineQuadPso: Long = 0L
 
@@ -428,7 +428,6 @@ class D3D12CompiledRenderPipeline(
 
     fun lineQuadPipeline(): Long = this.lineQuadPso
 
-
     fun info(): RenderPipeline {
         return this.info
     }
@@ -439,7 +438,7 @@ class D3D12CompiledRenderPipeline(
 
     fun buildBindings(): List<D3D12BindGroupEntry> = bindingLayout.entries
 
-    /** 26.3 的 `CompiledRenderPipeline` 只剩 [isClosed]/[close]；这是本实现自己的有效性判据。 */
+    /** 本实现自己的有效性判据（26.3 的基类只剩 [isClosed]/[close]）。 */
     fun isValid(): Boolean {
         return this.handle != 0L
     }

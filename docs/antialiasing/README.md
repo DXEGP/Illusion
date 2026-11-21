@@ -65,7 +65,7 @@ TAA 私有参数、历史双纹理、resolve/copyback 和资源寿命由 native 
 
 普通实体、第三人称普通持物和已知 opaque particle 可从真实生命周期、模型/拓扑以及 previous 顶点生成 motion guide。额外 MRT 保持原 shader 的覆盖、discard、深度与插值；只有与最终深度相容的有效来源参与显示 guide。AABB 平移近似继续服务其原有重建用途，不能据此把 FG 标记为完整运动。
 
-来源缺少 previous、有效逐像素运动或 post 映射时跳过本帧 FG，普通帧保持绘制。当前天空/天体、实际像素贡献、透明与 custom 的支持边界集中见 [实施记录](../rendering/work-graph-implementation.md#abi10-运动来源与像素贡献)。
+来源缺少 previous、有效逐像素运动或 post 映射时跳过本帧 FG，普通帧保持绘制。天空/天体、实际像素贡献、透明与 custom 各有独立支持边界。
 
 ## 4. 世界、手部和 GUI
 
@@ -75,7 +75,7 @@ UiDisplay 始终使用显示尺寸。世界分支显式清成 `(0,0,0,0)`，预�
 
 显示帧已接入 GUI 前 Prepare、GUI 后 Submit：前者冻结场景输入并提前提交 guides，后者只补 UI/backdrop、等待准确 guide fence 并回读同帧有效性，通过后才接受 SDK，具体契约见 [FFM ABI](../misc/ffm-abi.md)。当帧 provider 已接受且 UI 注册成功时才允许 scene-only 呈现，其余使用完整 composite。blur 导致 GUI 已经包含场景背景时跳过 FG，避免重复合成。普通 F2 和 Tracy 读取完成后的完整显示目标。
 
-目标创建/更新、UI 注册清除、world/no-world 切换和关闭失败都保留相应 owner 并传播错误。世界尺寸由配置候选发布，不在 GUI 失败路径临时强制比例、直接破坏性 resize。配套构建、运行覆盖和 resize 后退出确认集中见 [实施记录](../rendering/work-graph-implementation.md#当前构建与运行)。
+目标创建/更新、UI 注册清除、world/no-world 切换和关闭失败都保留相应 owner 并传播错误。世界尺寸由配置候选发布，不在 GUI 失败路径临时强制比例、直接破坏性 resize。
 
 ## 5. 后处理锐化
 
@@ -87,7 +87,7 @@ TAA 锐化在 native resolve 的回填阶段执行；历史保存未锐化颜色
 
 ## 6. 验证范围
 
-构建、产物一致性与本次客户端覆盖集中记录在 [实施记录：当前构建与运行](../rendering/work-graph-implementation.md#当前构建与运行)。FG 同帧 validity 等待/回读暂保留，其性能没有实测；拖影、闪烁和运动稳定性由用户实际观察。
+FG 同帧 validity 等待/回读暂保留，其性能没有实测；拖影、闪烁和运动稳定性由用户实际观察。
 
 ## 7. 文件导航
 

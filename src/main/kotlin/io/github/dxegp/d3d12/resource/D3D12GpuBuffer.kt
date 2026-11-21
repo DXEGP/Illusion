@@ -29,9 +29,6 @@ class D3D12GpuBuffer(private val usageFlags: Int, private val bufferSize: Long, 
         if (usageFlags and GpuBuffer.USAGE_MAP_WRITE != 0) uploadRoot = D3D12UploadAllocation(this, 0L, bufferSize)
     }
 
-
-    // 必须继承 BaseGpuBuffer：FrontendRenderPass.validateDraw 会把 vertex/index buffer 强转成它。
-
     /** Native handle ({@code Dx12Object*} as long). */
     fun handle(): Long {
         return this.handle
@@ -52,7 +49,6 @@ class D3D12GpuBuffer(private val usageFlags: Int, private val bufferSize: Long, 
         require(length <= Int.MAX_VALUE) { "Mapping buffer slice larger than 2GB is not supported" }
         val data: ByteBuffer = MCDR_ABI.D3D12MapBuffer(this.handle, offset, length, read, write)
             ?: throw IllegalStateException(mapFailureMessage(offset, length, read, write))
-        // 必须强制 LITTLE_ENDIAN：direct ByteBuffer 默认 BIG_ENDIAN，UBO 会按大端写入、矩阵全垃圾。
         data.order(ByteOrder.LITTLE_ENDIAN)
         val writes = if (write && usageFlags and GpuBuffer.USAGE_MAP_WRITE != 0) {
             val root = checkNotNull(uploadRoot)
@@ -196,7 +192,6 @@ class D3D12GpuBuffer(private val usageFlags: Int, private val bufferSize: Long, 
         if (!isDeviceLost(native)) {
             return base
         }
-        // 设备已移除：把「这个 buffer 没问题、整条 GPU 停了」写进异常本身，并且只报一次。
         reportDeviceLostOnce(base)
         return base + " — this is NOT a problem with this buffer: the D3D12 device has been " +
             "REMOVED (DXGI_ERROR_DEVICE_REMOVED / 0x887A0005), so every GPU call fails from here " +

@@ -18,13 +18,13 @@ JSON/manifest 归 shader 业务适配层所有，FFM 只传输数据。必需资
 
 导出数量随实现变化，不以历史计数作为 ABI 一致性的证据。校验对象是当前头文件、JVM 绑定与运行中 DLL 的版本和布局。
 
-当前源码 ABI 为 31。`mcdr_dx12CreateOitLaneOperationPipelineV1` 创建通过源码认证的原版 depth copy、bounds copy 和 bounds cull PSO。调用同步读取 pipeline descriptor、操作类型、程序代际和 cull 的实际 Projection binding index。PSO 保存认证结果。CPU 结构布局保持原样。
+当前源码 ABI 为 31。`mcdr_dx12CreateOitLaneOperationPipelineV1` 创建通过源码认证的原版 depth copy、bounds copy 和 bounds cull PSO。调用同步读取 pipeline descriptor、操作类型、程序代际和 cull 的实际 Projection binding index。PSO 保存认证结果。CPU 结构布局保持原样。该导出仍存在，但正常帧没有调用方，属于待删的残留面。
 
 `mcdr_dx12BindTerrainTileEnvelopeV1` 在注册地形 stage 前，使用同一路由的根签名创建 envelope compute PSO。DXIL 在该调用内同步消费，JVM 用 confined Arena 按实际字节数分配。route 持有 PSO，录制租约保留 route 到提交 fence。
 
-`mcdr_dx12VanillaRegisterWorldDepthV1` 在世界帧开始后、首个世界深度 clear 前同步登记实际 D32 纹理。`mcdr_dx12VanillaArmWorldDepthSeedV1` 接收同一 context、事件上限和共享预算。`mcdr_dx12VanillaSealWorldDepthSeedV1` 在 `executeOit` 入口封口。封口返回 1 表示 journal 可读，0 表示未开启，负值报告具名失败。
+`mcdr_dx12VanillaRegisterWorldDepthV1` 在世界帧开始后、首个世界深度 clear 前同步登记实际 D32 纹理。`mcdr_dx12VanillaArmWorldDepthSeedV1` 接收同一 context、事件上限和共享预算。`mcdr_dx12VanillaSealWorldDepthSeedV1` 在 `executeOit` 入口封口。封口返回 1 表示 journal 可读，0 表示未开启，负值报告具名失败。这两个 depth seed 导出仍存在，但 JVM 已不再 arm 或 seal，正常帧恒为「未开启」。
 
-normalization 认证随主 Composite PSO 创建保存，认证描述为 136 B，terminal normalization V2 为 224 B。Composite 为 lane scratch 执行传入 `OBJECT_ONLY`，Frame 同时支持带版本租约的 `captureId` 输入。Resolve V3 和世界输出 schema 3 保持原布局。ABI24 增加 graphics command packet 与 OIT operation receipt，begin 为 144 B，receipt 为 192 B，pipeline、shader generation 和 command family 来自实际 native draw。ABI25 增加将真实 operation packet 交给 V2 执行流的入口。ABI26 增加 40 B 的 `mcdr_terrain_tile_stage_v2` 与 terrain stage registration 导出，普通 source、capture source 与 tile PSO 共用版本化合约和 route 租约。`copyNative` 通过 `-PmcdrNativeRoot=<MCDR 工程目录>` 选择编译产物，通过 `-PmcdrDependencyRoot=<SDK 依赖目录>` 选择运行库和许可证来源。打包时核对内嵌 DLL 与所选 Release 输出的 SHA256。构建和实际启用范围见 [实施记录](../rendering/work-graph-implementation.md#当前构建与运行)。
+OIT records 的 CPU 描述只有 capture 与 resolve 两条：Resolve 使用 schema 3，terrain Begin/metadata/draw 使用 schema 2。执行流（V1/V2）、operation receipt、terrain stage receipt/read set、lane 管线与 normalization 的导出与布局镜像已在当前源码中删除，`OitResolveRecordsV4` 也一并移除。Resolve V3 和世界输出 schema 3 保持原布局。`copyNative` 通过 `-PmcdrNativeRoot=<MCDR 工程目录>` 选择编译产物，通过 `-PmcdrDependencyRoot=<SDK 依赖目录>` 选择运行库和许可证来源。打包时核对内嵌 DLL 与所选 Release 输出的 SHA256。
 
 FFM 不读取业务配置。JVM 计时开关由诊断域的 `RenderProfiling.enabled` 读取，命令和批次路径保留动态配置读取；配置到 native 的发布仍由 `D3D12Settings.pushToNative()` 显式执行。
 
@@ -59,11 +59,9 @@ shader ABI 5 保持 144 B 私有 record 与 8 B pixel 状态，新增 terrain se
 
 terrain 经 `OitPublishTerrainMetadataV2 → OitBindTerrainDrawV2 → ExecuteIndirect → OitUnbindDrawV1` 接入现有 Work Graph。CPU 只提交有界 section 表与真实 VBO 租约；同代静态顶点使用冻结的 previous camera/origin 生成 previous clip，几何替换撤销 geometry/material previous，纹理或材质变化只撤销 material previous。GPU section、capture 常量与描述符布局由 native shader 契约独占；Naga 原 VS 返回结构保持原样，MS 输出通过独立结构逐字段复制。纹理上传和复制通过三个 Checked 导出返回实际结果，JVM 确认成功后才记录 texture generation，失败沿 FFM 错误出口抛出。
 
-三阶段 terrain draw 的 V2 token 在真实 draw 前开启，成功执行后取得 receipt。`mcdr_dx12OitRegisterTerrainReplayReadSetV2` 在 active token 上登记本次 prepared batch 的 geometry/meshlet 范围，`mcdr_dx12OitCancelTerrainReplayReadSetV2` 仅在 draw 消费前撤销登记；Abort 同时清理未确认登记。FFM 数组只在同步调用内有效，native 复制并保留对象与 batch 租约，JVM allocator pin 按原 context fence 退休。范围、命令对应关系与内容冻结边界统一见 [tile 读取范围注册](../rendering/transmittance-tile-execution.md#同-recording-的读取范围注册)。这组附加入口保留旧 receipt/frontier 语义，注册成功的 contentState 仍为 Unsupported。
+terrain 只保留 `OitPublishTerrainMetadataV2 → OitBindTerrainDrawV2 → ExecuteIndirect → OitUnbindDrawV1` 这条 records 路径：native 用有界 section 表与真实 VBO 租约记录 chunk 混合前材质，不再需要 stage token、receipt、read set 或回放计划，这些入口已删除。恢复 tile 执行时必须重新引入它们，契约见 [tile 读取范围注册](../rendering/transmittance-tile-execution.md#同-recording-的读取范围注册)。
 
-完整事件流使用 V2 begin/append/query/terrain-receipt-query/seal/abort，保留旧 V1 history receipt/frontier。FFM mirror 与唯一 downcall 由 `MCDRLayout` / `MCDR_ABI` 拥有，实际字段由 `mcdrABILayout` 核对。V2 query 返回原 draw 的实际 shader/program/resource generation，scope/pass 和 draw/receipt 分开计数。缺项时 seal 返回原因，完整时返回可执行句柄。ABI34 的 `mcdr_dx12OitExecuteTileStreamV2` 每次同步接收连续四份 `BatchV2`。前几组传空输出，最后一组传全幅 RGBA32_FLOAT 纹理。native 录制持有 GPU 资源直到 fence 完成，批次描述的 Arena 随 downcall 返回释放。见 [V2 事件流与 Composite 边界](../rendering/transmittance-tile-execution.md#完整-v2-事件流与-composite-边界)。
-
-`mcdr_dx12OitAppendExecutionOperationEventV1` 接收 V2 事件与原 operation receipt，native 回查所属 Frame 已完成的真实命令并保留 packet 租约。输入事件的 `receiptCount=0`、`receiptIds=NULL`，旧 V2 query/manifest 的 receipt 计数继续只覆盖 terrain；operation 的唯一消费与排序由执行流内部命令表管理。FFM 只在同步调用内持有编码内存，native 不保留 Arena 地址。实际事件归属、顺序和实现范围见 [实际命令契约](../rendering/transmittance-tile-execution.md#实际命令内容与-adapter-的实施契约)。
+正常帧没有 execution stream：JVM 只调用 `D3D12OitSealFrameV1` 封口 native recording，然后由 `D3D12OitResolveRecordsV3` 取得 corrected transparency。`MCDRLayout` / `MCDR_ABI` 只镜像实际存在的导出，缺符号会让加载阶段直接失败。重建 tile 执行流时按 [V2 事件流与 Composite 边界](../rendering/transmittance-tile-execution.md#完整-v2-事件流与-composite-边界) 重新定义导出，不要恢复已删除的名字。
 
 旁表已用容量不足时，native 在校验完整 metadata 后返回专用 `MCDR_OIT_RESULT_METADATA_CAPACITY_EXCEEDED`（-7），不改变旁表。JVM 将其转成 `MetadataCapacityExceeded`，该 draw 继续使用原颜色与未记录覆盖 PSO；受影响像素不读取透明历史。共享预算不足、资源分配失败（-3）、无效契约和绑定失败仍中止帧，禁止把分配失败当作容量拒绝，禁止重放已录制 draw。
 
@@ -88,7 +86,7 @@ ResolveRecords 执行 GPU 索引整理、完整性检查和逐 surface 的材质
 - **调用约定是 `__cdecl`**。`MCDR_CALL` 在 Windows 上展开成 `__cdecl`；`MCDR_API` 在 native 编译时是 `__declspec(dllexport)`，在消费方是 `dllimport`。x64 上只有一种调用约定，但这个宏让头文件在 32 位下也不会错。
 - **MSVC 的 `long` 是 32 位**。头文件为此专门写了一条注释：凡是写成 `int32_t` 的参数，Java 侧必须是 `JAVA_INT`；只有 `int64_t` / `size_t` / 指针才是 `JAVA_LONG` / `JAVA_ADDRESS`。这一条是 §5 里"类型不逐字匹配"坑的根源。
 
-原版帧、显示帧、PreparedFrame 和 provider mask schema 为 2，世界输出 schema 为 3；native 宏、运行时 `mcdrABIVersion()` 与 JVM 期望版本必须一致。必需的 `mcdr_dx12SetAdditionalColorTarget(context, target)` 用于真实 OIT producer 的附加颜色附件；其引入保持原结构体布局。mesh 描述符含 `rasterMotion` 与对齐字段 `_pad4`，x64 大小为 104 字节。世界开始提交完整冻结帧，WorldReady/GuiReady 仅提交身份；真实输入生产完成后发布一次 PreparedFrame，AA/SR 评价只提交身份、consumer、reset 请求和输出绑定。早期 opaque 路径从 `Recording → OpaqueReady → OpaquePost`，其后继续实际透明和晚期绘制，真正 WorldReady 后进入 WorldPost；完整世界路径仍在 WorldReady 后重建。`sourceStage` 只在世界输出描述声明，禁止借修改颜色绑定静默切换语义。显示帧在 GUI 前冻结场景和 guides 输入，GUI 后补齐 UI 并裁决 FG。native 同步复制宿主数据并保留实际资源租约。旧的独立 SR/DLSS/TAA 每帧参数、DLSS/FG 相机常量与早期 DLSS→FG 标签出口已删除，JVM 与 DLL 必须配套部署；构建及运行覆盖见[实施记录](../rendering/work-graph-implementation.md#当前构建与运行)。
+原版帧、显示帧、PreparedFrame 和 provider mask schema 为 2，世界输出 schema 为 3；native 宏、运行时 `mcdrABIVersion()` 与 JVM 期望版本必须一致。必需的 `mcdr_dx12SetAdditionalColorTarget(context, target)` 用于真实 OIT producer 的附加颜色附件；其引入保持原结构体布局。mesh 描述符含 `rasterMotion` 与对齐字段 `_pad4`，x64 大小为 104 字节。世界开始提交完整冻结帧，WorldReady/GuiReady 仅提交身份；真实输入生产完成后发布一次 PreparedFrame，AA/SR 评价只提交身份、consumer、reset 请求和输出绑定。早期 opaque 路径从 `Recording → OpaqueReady → OpaquePost`，其后继续实际透明和晚期绘制，真正 WorldReady 后进入 WorldPost；完整世界路径仍在 WorldReady 后重建。`sourceStage` 只在世界输出描述声明，禁止借修改颜色绑定静默切换语义。显示帧在 GUI 前冻结场景和 guides 输入，GUI 后补齐 UI 并裁决 FG。native 同步复制宿主数据并保留实际资源租约。旧的独立 SR/DLSS/TAA 每帧参数、DLSS/FG 相机常量与早期 DLSS→FG 标签出口已删除，JVM 与 DLL 必须配套部署。
 
 | C 结构 | x64 字节数 | 用途 |
 | --- | --- | --- |
@@ -113,7 +111,7 @@ ResolveRecords 执行 GPU 索引整理、完整性检查和逐 surface 的材质
 | `mcdr_oit_terrain_metadata_v2` | 80 | schema 2，来源、section 表与真实 VBO 范围 |
 | `mcdr_oit_terrain_draw_v2` | 16 | schema 2，本次 terrain producer scope serial |
 
-全部字段及内联矩阵/数组参与现有双向布局校验；C 编译同时检查实际大小。原版当前发布 mip0、单层、单采样纹理，绑定范围 first0/count1；无效 view、尺寸、格式、缺少必需输入、重复评价和意外别名在 SDK 调用前拒绝。NONE 仅要求真实颜色；TAA 要求颜色与真实运动；SR/DLSS 还要求深度、曝光及有效透视参数。DLSS/DLAA 不提交当前模型不支持的 current-color bias，原因见[撤销记录](../rendering/work-graph-implementation.md#abi12-dlaa-局部历史拒绝)。首次缺少可用前帧/运动时发布 NONE，由世界呈现路径显示。
+全部字段及内联矩阵/数组参与现有双向布局校验；C 编译同时检查实际大小。原版当前发布 mip0、单层、单采样纹理，绑定范围 first0/count1；无效 view、尺寸、格式、缺少必需输入、重复评价和意外别名在 SDK 调用前拒绝。NONE 仅要求真实颜色；TAA 要求颜色与真实运动；SR/DLSS 还要求深度、曝光及有效透视参数。DLSS/DLAA 不提交当前模型不支持的 current-color bias。首次缺少可用前帧/运动时发布 NONE，由世界呈现路径显示。
 
 mesh 描述符的 `rasterMotion` 只接受 `0` 或 `1`。设为 `1` 时要求真实深度、有效 PS 和两张颜色输出，末张必须是全通道写入的 `RGBA32_FLOAT` raw target。normal/raw PSO 共用原 mesh 根签名；raw 片段包装不新增 binding 或顶点插值量。录制时按实际 pass 的 motion 附件选择 PSO，native 继续校验附件数量和深度，禁止从普通双 MRT 布局推测 raw 语义。
 
@@ -276,13 +274,10 @@ MCDRPipelineDesc().apply { /* 填字段 */ }.pack(arena)   // 返回的段只在
 5. **`MCDR_ABI.kt` 加字段**：`private var MH_xxx: MethodHandle? = null`，命名统一小写。
 6. **`bindAll()` 的对应 `bindXxx()`** 里加一行：必需用 `skip`，功能级用 `skipOptional`，描述符用 `fd` / `fdv` 逐字写对每个参数宽度。
 7. **写公开封装**：按 §1.4 选一种失败语义；文档注释里写清返回值的哨兵含义。
-8. **跑 ABI 校验**：
-
-   ```
-   python _port\abi_check.py
-   ```
-
-   期望看到 `native exports` 与 `kotlin bindings` 同步 +1、`mismatched symbols: (none)`、`struct layout problems: (none)`。它**不需要 DLL、不需要 GPU、不用启动游戏**：符号表是正则解析头文件与 Kotlin 源码得到的，结构体布局是按 MSVC x64 的自然对齐规则静态模拟出来的。
+8. **跑 ABI 校验**：启动一次客户端。`MCDR_ABI.bindAll()` 会在设备创建前比对
+   `MCDR_ABI_VERSION` 与 `MCDR_Layout.EXPECTED_C_SIZES`，不匹配直接抛
+   `ABI version mismatch` 或结构体布局错误，不会走到首次绘制。**不需要 GPU 自检脚本**：
+   校验发生在加载期，失败信息里带两端版本号与不一致的字段。
 9. **编译两边**：`cd Illusion; .\gradlew.bat compileKotlin`，native 侧 `MSBuild MCDR\MCDR.vcxproj /p:Configuration=Release /p:Platform=x64`。
 
 ## 2 调用约定与内存
@@ -522,11 +517,11 @@ upcall 这条要单独说：`onFenceComplete` 在 native 线程上执行，异�
 | 路径 | 职责 |
 | --- | --- |
 | `MCDR\include\mcdr_abi.h` | 契约本体：导出声明、结构体、错误码、版本宏 |
-| `_port\abi_check.py` | 静态 ABI 校验：符号/签名宽度比对 + 结构体布局镜像比对 |
+| `MCDR_ABI.kt` 的 `bindAll()` | 加载期校验：版本号 + 每个结构体的 `EXPECTED_C_SIZES` |
 
 ## 7 文档维护
 
-- **本文的数字来自 `_port\abi_check.py` 的实际输出**。改了导出数量、结构体字段或版本号，先跑一遍脚本，再同步开头的表格与 §1.6 的步骤。
+- **本文的数字来自头文件与 `MCDR_Layout.kt` 的字段定义**。改了导出数量、结构体字段或版本号，先按 §1.6 的步骤核对两端镜像，再同步开头的表格。
 - **判定标准是"代码里能读到的"**。凡是头文件注释没写、Kotlin 侧也没实现的，写"代码中未明确"，不要补合理推测。
 - **不要在这里复制源码**。要引代码就引签名与一行关键逻辑，实现细节以源码注释为准 —— 两处都写必然会漂移，而漂移的注释比没有注释更贵。
 - **只写当下**。不写设计史与方案对比；必须遵守的写法写成祈使句，已经发现的缺陷单独列成警告清单。

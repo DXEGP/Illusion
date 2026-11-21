@@ -13,13 +13,9 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 
 /**
- * 首次加载必需管线失败时报告崩溃，重载失败保留上一代已发布管线。
- *
- * <p>资源重载只在全部必需管线成功后发布新缓存；加载错误继续交给原版重载流程处理。
- *
- * <p>必须包 `NEW` 而不是改方法签名：`apply` 的参数类型 `ShaderManager$PendingResults` 是私有内部
- * record，Java 侧写不出来（用 `Object` 会被 Mixin 判为 invalid signature）。
- * 见 docs/misc/mixins-and-earlywindow.md §3.7
+ * 首次加载必需管线失败时报告崩溃，重载失败保留上一代已发布管线（资源重载只在全部必需管线成功后发布新缓存）。
+ * 必须包 `NEW` 而不是改方法签名：`apply` 的参数类型 `ShaderManager$PendingResults` 是私有内部 record，
+ * Java 侧写不出来（用 `Object` 会被 Mixin 判为 invalid signature）。
  */
 @Mixin(ShaderManager.class)
 public class ShaderManagerRequiredFailureMixin {

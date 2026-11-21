@@ -4,7 +4,6 @@ import io.github.dxegp.d3d12.backend.D3D12BindGroupEntry
 import io.github.dxegp.d3d12.backend.D3D12BindingPacket
 import io.github.dxegp.d3d12.backend.D3D12CompiledRenderPipeline
 
-
 import com.mojang.renderpearl.api.pipeline.IndexType
 import com.mojang.renderpearl.api.buffers.GpuBuffer
 import com.mojang.renderpearl.api.buffers.GpuBufferSlice
@@ -32,8 +31,6 @@ import java.nio.IntBuffer
 import java.util.*
 import java.util.function.Supplier
 
-
-
 /**
  * D3D12 render pass 后端（镜像官方 VulkanRenderPass）：uniform/texture 暂存在本类 map，core 之前按需
  * 推入原生瞬时描述符堆（[pushDescriptors]）；顶点/索引缓冲与 draw 直接下发 native。
@@ -53,7 +50,6 @@ class D3D12RenderPassBackend internal constructor(
 ) : RenderPassBackend {
     private var pushedDebugGroups = 0
 
-
     /** 最近一次 slot0 顶点切片的字节偏移（MDI 每段的 `baseVertex` 相对它）。 */
     private var lastVertexSliceOffset = -1L
 
@@ -61,7 +57,7 @@ class D3D12RenderPassBackend internal constructor(
     private var lastVertexBuffer: GpuBuffer? = null
     private var lastVertexStride = 0
 
-    /** 早期显示会**先绑顶点缓冲、后设管线**：stride 只能从管线推导，故先挂起等 [setPipeline] 落实；抛异常会让加载屏整条 draw 被吞掉。 */
+    /** stride 只能从管线推导，故先绑顶点缓冲时必须挂起等 [setPipeline] 落实；抛异常会让加载屏整条 draw 被吞掉。 */
     private val pendingVertexBuffers = LinkedHashMap<Int, GpuBufferSlice>()
 
     private var pipeline: D3D12CompiledRenderPipeline? = null
@@ -154,15 +150,12 @@ class D3D12RenderPassBackend internal constructor(
         MCDR_ABI.D3D12WriteTimestamp(this.ctx,
             (pool as D3D12GpuQueryPool).nativeHandle(), index)
     }
-    // ---- pipeline + descriptors ----
     override fun setPipeline(pipeline: BackendRenderPipeline) {
         val device = this.device
             ?: throw IllegalStateException("No D3D12 device bound to this render pass")
         val base = pipeline as? D3D12CompiledRenderPipeline
             ?: throw IllegalStateException(
                 "Pipeline ${pipeline.javaClass.name} is not a D3D12 compiled pipeline")
-        // 前端缓存里可能是上一次资源重载**前**编译的对象（vanilla 重载会把它们 close、handle 归 0 ⇒
-        // isValid()==false）→ 会抛 "not valid" 且没有 COMPILE FAILED 日志。故 flipY 变体或失效对象都重新取。
         val compiled = if (this.flipY || !base.isValid()) {
             device.pipelines.getOrCompilePipeline(base.info(),
                 if (this.flipY) D3D12PipelineOrientation.FLIPPED_Y else D3D12PipelineOrientation.ORIGINAL)
@@ -180,20 +173,15 @@ class D3D12RenderPassBackend internal constructor(
         this.pipeline = compiled
         motionBindings = null
 
-        // vanilla 按「管线 uniform 列表下标」回调 setUniform(Int)，下标来自 `CreateInfo.uniforms`（≠
-        // flattenUniforms(bindGroupLayouts) 的顺序）。flipY 变体是另一个实例，把 base 的名单复制过去即可。
         if (compiled !== base) {
             compiled.setUniformNames(base.uniformNamesSnapshot())
         }
         this.uniformNames = compiled.uniformNamesSnapshot()
         if (this.uniformNames.isEmpty()) {
-            // 兜底：没有 CreateInfo 的旁路编译对象名单为空，用 layouts 展平顺序顶上。
             this.uniformNames = BindGroupLayout.flattenUniforms(compiled.info().bindGroupLayouts)
                 .map { it.name() }
         }
         this.anyDescriptorDirty = true
-        // useDepth 必须看**管线**有没有 DepthStencilState，不能只看 pass 有没有深度附件：GUI 管线没有
-        // depthStencilState，套上 withDepth PSO 会让 GREATER_EQUAL 丢掉所有 fragment → 黑屏。
         val pipelineHasDepth = compiled.info().depthStencilState != null
         val useDepth = this.hasDepth && pipelineHasDepth
         route = policy.selectPipeline(compiled)
@@ -205,7 +193,6 @@ class D3D12RenderPassBackend internal constructor(
             throw IllegalStateException("dx12SetPipeline failed for ${base.info().location}")
         }
         policy.setVertexInput(lastVertexBuffer, lastVertexSliceOffset)
-        // 落实 setPipeline 之前挂起的顶点缓冲（早期显示是"先绑 buffer、后设管线"）。
         if (this.pendingVertexBuffers.isNotEmpty()) {
             val formatBindings = compiled.info().vertexFormatBindings
             val pending = this.pendingVertexBuffers.entries.map { it.key to it.value }
@@ -527,12 +514,8 @@ class D3D12RenderPassBackend internal constructor(
         if (buffer.isClosed) throw IllegalStateException("Uniform '${name}' buffer is closed")
         return value
     }
-    // ---- scissor ----
 
     override fun enableScissor(x: Int, y: Int, width: Int, height: Int) {
-        // GL 约定（左下原点）× RSSetScissorRects（左上原点），是否互为镜像取决于本 pass 有没有做几何 Y 翻转：
-        //  * flipY=false（主窗口）：几何不翻 → 必须换算 outputHeight - y - height，否则列表项被上移裁剪。
-        //  * flipY=true（GUI 图集 / PIP）：顶点着色器已取反 gl_Position.y → 原样直通，再换算会让物品整块空白。
         val scissorY = if (this.flipY) y else this.outputHeight - y - height
         if (!MCDR_ABI.D3D12SetScissor(this.ctx, x, scissorY, width, height)) {
             LOGGER.error("dx12SetScissor failed ({} {} {} {})", x, scissorY, width, height)
@@ -544,8 +527,6 @@ class D3D12RenderPassBackend internal constructor(
         if (area != null) this.enableScissor(area.x(), area.y(), area.width(), area.height())
         else this.enableScissor(0, 0, this.outputWidth, this.outputHeight)
     }
-
-    // ---- vertex / index buffers + draws ----
 
     override fun setVertexBuffer(slot: Int, vertexBuffer: GpuBufferSlice?) {
         if (vertexBuffer == null) {
@@ -577,7 +558,6 @@ class D3D12RenderPassBackend internal constructor(
             }
         }
         if (stride == 0) {
-            // 管线还没设（早期显示先绑 buffer 后设管线）或该槽位没声明顶点布局 → 挂起；抛异常会让加载屏整条 draw 失败。
             this.pendingVertexBuffers[slot] = vertexBuffer
             if (slot == 0) policy.setVertexInput(buffer, vertexBuffer.offset())
             return
@@ -593,7 +573,6 @@ class D3D12RenderPassBackend internal constructor(
             throw IllegalStateException("dx12SetVertexBufferRangeV1 failed")
         }
         if (slot == 0) {
-            // MDI 批次里每个段的 `baseVertex` 都相对这块切片，Stage 2 建段表要用。
             this.lastVertexSliceOffset = offset
             policy.setVertexInput(buffer, offset)
             this.lastVertexBuffer = buffer
@@ -611,7 +590,6 @@ class D3D12RenderPassBackend internal constructor(
         this.currentIndexBuffer = indexBuffer
     }
 
-    // ---- 绘制热路径插桩：PROF=1 时由 D3D12CommandEncoderBackend 每 300 帧汇总打印并清零 ----
     companion object {
         private val LOGGER: Logger = LoggerFactory.getLogger("dxrmc")
 
@@ -882,7 +860,6 @@ class D3D12RenderPassBackend internal constructor(
             }
         }
     }
-
 
     override fun draw(vertexCount: Int, instanceCount: Int, firstVertex: Int, firstInstance: Int) {
         withRasterMotion({ policy.prepareMotionBindings(firstVertex, instanceCount) }) {

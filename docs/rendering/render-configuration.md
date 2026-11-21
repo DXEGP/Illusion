@@ -61,6 +61,6 @@ FG Prepare 同样返回 int32 状态和独立候选 token：Ready=1、NotReady=0
 - FSR 在有 OIT 两个来源时还使用 `composition`；它描述透明/合成贡献，不能当作 reactive 的别名。
 - XeSS 使用 `responsive`；它是 XeSS 的响应区域语义，不能把其他 mask 的数值直接复用。
 - mask 是 native frameprep 在真实世界输出阶段生成的纹理，不再做旧式 CPU 均值读回或固定的生产 mask。
-- 天空/天体与透明像素贡献的来源覆盖集中见[实施记录](work-graph-implementation.md#abi10-运动来源与像素贡献)；来源不完整或 post 映射未知时 FG 跳过，普通世界绘制继续。
+- 天空/天体与透明像素贡献的来源覆盖不完整时，FG 跳过，普通世界绘制继续；post 映射未知同样跳过。
 
-同帧 FG validity 汇总已接入 `beforeGui` 提交、`afterGui` 等准确 guide fence 后同帧读取的两阶段路径，协议见 [FFM ABI](../misc/ffm-abi.md)。配套构建、实际运行、性能与 resize 后退出确认集中见[实施记录](work-graph-implementation.md#当前构建与运行)。
+同帧 FG validity 汇总已接入 `beforeGui` 提交、`afterGui` 等准确 guide fence 后同帧读取的两阶段路径，协议见 [FFM ABI](../misc/ffm-abi.md)。

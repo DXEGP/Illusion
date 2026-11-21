@@ -7,12 +7,10 @@ import java.lang.foreign.ValueLayout
 import java.nio.charset.StandardCharsets
 
 /**
- * Builder for `mcdr_pipeline_desc` — fill the lists with the fluent `with*` helpers, then [pack] it
- * into an arena that outlives the downcall. Mirror layout: [MCDRLayout.PIPELINE_DESC]
- * (docs/misc/ffm-abi.md §1.5).
- *
- * 互操作：`ColorTarget` / `InputElement` / `Binding` 是**嵌套类**（Kotlin 默认即 Java 的 static
- * nested，不能写成 `inner class`），`MAX_*` 用 `const val` 以便 Java 侧静态读取。
+ * Builder for `mcdr_pipeline_desc` — fill the lists with the fluent `with*` helpers, then [pack] it into an arena that
+ * outlives the downcall. Mirror layout: [MCDRLayout.PIPELINE_DESC].
+ * 互操作：`ColorTarget` / `InputElement` / `Binding` 是**嵌套类**（Kotlin 默认即 Java 的 static nested，不能写成
+ * `inner class`），`MAX_*` 用 `const val` 以便 Java 侧静态读取。
  */
 class MCDRPipelineDesc {
 
@@ -22,8 +20,6 @@ class MCDRPipelineDesc {
         const val MAX_INPUT_ELEMENTS = 64
         const val MAX_BINDINGS = 64
         const val MAX_SEMANTIC_NAME_BYTES = 64
-
-        // Field offsets, resolved once from the shared layout; never literals.
 
         private val OFF_VS_DATA: Long = off(MCDRLayout.PIPELINE_DESC, "vsData")
         private val OFF_VS_LEN: Long = off(MCDRLayout.PIPELINE_DESC, "vsLen")
@@ -146,8 +142,6 @@ class MCDRPipelineDesc {
     val colorTargets: MutableList<ColorTarget> = ArrayList()
     val inputElements: MutableList<InputElement> = ArrayList()
     val bindings: MutableList<Binding> = ArrayList()
-
-    // Fluent builders.
 
     fun shaders(vertexHlslUtf8: ByteArray?, fragmentHlslUtf8: ByteArray?): MCDRPipelineDesc {
         this.vsBytes = vertexHlslUtf8

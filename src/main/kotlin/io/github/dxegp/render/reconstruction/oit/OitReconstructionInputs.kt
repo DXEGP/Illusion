@@ -381,7 +381,6 @@ internal object OitReconstructionInputs : AutoCloseable {
     private fun reconstructionRequired(inputs: VanillaFrameInputs): Boolean =
         inputs.settings.reconstructionBackend != MCDR_ABI.SR_BACKEND_NONE || inputs.settings.antiAliasing == 2
 
-
     fun retireRecords() {
         pendingContributionResolve = null
         compositeDisplay = null

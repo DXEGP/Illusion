@@ -13,10 +13,8 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * 往 F3 的 "system specs" 块追加本模组的行（分辨率 + VRAM、后端标识）。
- *
- * <p>非 D3D12 时 `D3D12AdapterInfo.current` 为 null，返回空列表，其它后端自己的 F3 输出保持原样。
- * 见 docs/misc/mixins-and-earlywindow.md §3.8
+ * 往 F3 的 "system specs" 块追加本模组的行（分辨率 + VRAM、后端标识）。非 D3D12 时
+ * `D3D12AdapterInfo.current` 为 null，返回空列表，其它后端自己的 F3 输出保持原样。
  */
 @Mixin(DebugEntrySystemSpecs.class)
 public abstract class DebugEntrySystemSpecsMixin {

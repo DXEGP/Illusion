@@ -1,6 +1,6 @@
 # Redstone Plan：FSR Redstone 调查与接入计划
 
-本页是接入设计，RR/RC 尚未在当前源码中实现。核对基线为 AMD FSR SDK `v2.4.0`（2026-10-28）：Upscaling 4.1.2、Frame Generation 4.0.2、FG Swapchain 4.0.0、Ray Regeneration 1.2.1、Radiance Caching 0.9.0 Technical Preview。
+本页是接入设计，RR/RC 尚未在当前源码中实现。核对基线为 AMD FSR SDK `v2.4.0`：Upscaling 4.1.2、Frame Generation 4.0.2、FG Swapchain 4.0.0、Ray Regeneration 1.2.1、Radiance Caching 0.9.0 Technical Preview。
 当前 native FSR SR/FG 使用 FidelityFX 2.3 系列接口；不能把已接超分等同于已接 Redstone 全套。
 
 ## 1. 业务位置与组合
@@ -157,5 +157,5 @@ RC 与 NRC 同属高优先级输运工作。先定义全部接口，再按依赖
 | ML FG 与呈现 | 真实帧标识、输入租约、UI 合成、swapchain/pacing adapter | 一个呈现 owner；交换链切换和退出前结算所有消费；生成帧不推进模拟历史 |
 | 性能与质量诊断 | 每 effect 的 GPU 时间/显存，训练查询计数，分项信号和缓存禁用诊断 | 所有计时明确 CPU 录制、提交完成与 GPU 完成区别；异步采样不得为取结果串行化每帧 |
 
-原版 D3D12 的架构与基础缺口另见 [原版路径架构审查](../misc/vanilla-d3d12-architecture.md)。
+原版 D3D12 的架构与基础缺口另见 [原版路径架构审查](../docs/misc/vanilla-d3d12-architecture.md)。
 共享的命令提交、资源状态和租约基础先满足这些契约，Redstone adapter 不再复制各自的提交/等待/呈现状态机。

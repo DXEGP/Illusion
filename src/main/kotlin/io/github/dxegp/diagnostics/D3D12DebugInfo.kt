@@ -12,7 +12,6 @@ import net.minecraft.resources.Identifier
 /**
  * vanilla `system_specs` 组里只补 DXRMC 独有的行（分辨率/显存/后端），由
  * `DebugEntrySystemSpecsMixin` 追加到同一组。VRS 行不在这里（见 [D3D12VrsDebugEntry]）。
- * 行的含义见 docs/misc/debug-and-crash.md §6。
  */
 object D3D12DebugInfo {
     @JvmField val SYSTEM_GROUP = Identifier.withDefaultNamespace("system")
@@ -23,8 +22,6 @@ object D3D12DebugInfo {
         val info = D3D12AdapterInfo.current ?: return emptyList<String>()
         val luid = if (info.luid.isEmpty()) "unknown" else info.luid
         val lines = mutableListOf<String>()
-        // rendered = 实际着色的像素数（不含超采样），output = 最终呈现的像素数。
-        // 附件确实比窗口小 → 附件尺寸是真值；否则用缩放换算（GUI 拆分时主目标仍是窗口尺寸）。
         val attachment = mainTargetSize()
         val scaledWidth = D3D12RenderScale.scaled(windowWidth)
         val scaledHeight = D3D12RenderScale.scaled(windowHeight)
@@ -35,7 +32,6 @@ object D3D12DebugInfo {
         lines.add("Resolution: output ${windowWidth}x${windowHeight}, rendered ${renderedWidth}x${renderedHeight}")
         lines.add("VRAM: ${info.vramMiB()} MiB dedicated / ${info.sharedMiB()} MiB shared")
         lines.add("Illusion: ${info.backendName()} (MCDR ABI v${MCDR_ABI.MCDR_ABI_VERSION}) - LUID: $luid")
-        // VRS 行已搬到 [D3D12VrsDebugEntry]，别再加回这里。
         return lines
     }
 

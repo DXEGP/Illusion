@@ -13,7 +13,6 @@ import org.slf4j.LoggerFactory
  * 本 mod 的日志级别，同时管三处：本 mod 的 log4j logger（[IllusionLogger.OWN_LOGGERS]）、
  * [IllusionLogger.debugMessage] / `debugFormat` 的诊断打印、以及推给 native 的 `gLogLevel`。
  * `D3D12_LOG_VERBOSE=1` 是开发逃生口，优先级高于配置文件。
- * 见 docs/misc/debug-and-crash.md §4.2。
  */
 enum class IllusionLogLevel(val nativeLevel: Int) : TranslatableEnum {
     ERROR(0),
@@ -25,7 +24,6 @@ enum class IllusionLogLevel(val nativeLevel: Int) : TranslatableEnum {
     /**
      * 配置界面里的显示名：不实现 `TranslatableEnum` 就只显示 `ERROR` / `WARN` 这类常量名。
      * 键名见 `assets/dxr_mc/lang` 下的 `en_us.json` / `zh_cn.json`。
-     * 别在注释里写带斜杠加星号的通配路径：Kotlin 块注释可嵌套，会吞掉后面整个文件。
      */
     override fun getTranslatedName(): Component =
         Component.translatable("$i18n_LOG_KEY.logLevel.${this.name}")
@@ -40,7 +38,7 @@ enum class IllusionLogLevel(val nativeLevel: Int) : TranslatableEnum {
 }
 
 /**
- * JVM 侧唯一日志出口（见 docs/misc/debug-and-crash.md §4.1）。
+ * JVM 侧唯一日志出口。
  * 状态用 `@Volatile` 字段 + getter，不能改成 `val`：类在配置读取前就会被触碰，
  * 类初始化时抓下的 `val` 会永远停在启动默认值。
  */
@@ -86,15 +84,13 @@ object IllusionLogger {
         if (debugEnabled()) LOGGER.debug(message)
     }
 
-    /** [debugMessage] 的 [String.format] 版。 */
     @JvmStatic
     fun debugFormat(format: String, vararg args: Any?) {
         if (debugEnabled()) LOGGER.debug(format.format(*args))
     }
 
     /**
-     * 一次性状态报告（"把哪组值应用给了 native"）：不刷屏，默认级别下也可见 ——
-     * 这类信息落在 [debugMessage] 里等于没有。
+     * 一次性状态报告（"把哪组值应用给了 native"）：默认级别下也可见，不该落在 [debugMessage] 里。
      */
     @JvmStatic
     fun infoMessage(message: String) {
@@ -107,7 +103,6 @@ object IllusionLogger {
         LOGGER.warn(message)
     }
 
-    /** [warnMessage] 的 [String.format] 版。 */
     @JvmStatic
     fun warnFormat(format: String, vararg args: Any?) {
         LOGGER.warn(format.format(*args))
@@ -119,9 +114,7 @@ object IllusionLogger {
             IllusionConfig.SHUTDOWN_TRACE.get(), IllusionConfig.NATIVE_LOG_FILE.get())
     }
 
-    /**
-     * 立刻应用内置默认值：本类在配置读到之前就会被触碰，这段窗口里的输出也得已被过滤。
-     */
+    /** 立刻应用内置默认值：本类在配置读到之前就会被触碰，这段窗口里的输出也得已被过滤。 */
     fun applyDefaults() {
         applyOpt(if (ENV_VERBOSE) IllusionLogLevel.DEBUG else IllusionLogLevel.ERROR, false)
     }
@@ -137,7 +130,6 @@ object IllusionLogger {
         shutdownTrace: Boolean = true,
         nativeLogFile: String = "",
     ) {
-        // 环境变量压过配置文件：开发者不碰 toml 也能拿到一次 verbose 运行。
         val effective = if (ENV_VERBOSE) IllusionLogLevel.DEBUG else level
         configured = effective
         this.nativeVerbose = nativeVerbose
@@ -146,7 +138,6 @@ object IllusionLogger {
         }
         val nativeLevel = if (ENV_VERBOSE || nativeVerbose) NATIVE_DEBUG else effective.nativeLevel
         pushNative(nativeLevel, shutdownTrace, nativeLogFile)
-        // 打 INFO：默认运行保持安静，verbose 运行才看得出级别来自配置还是残留环境变量。
         val source = if (ENV_VERBOSE) "D3D12_LOG_VERBOSE" else "config/dxr_mc-client.toml"
         val banner = "log level = $effective (native $nativeLevel, source: $source)"
         if (banner != lastBanner) {
@@ -157,12 +148,9 @@ object IllusionLogger {
 
     private fun pushNative(level: Int, shutdownTrace: Boolean, nativeLogFile: String) {
         try {
-            // 首次调用在这里 LoadLibrary 是安全的：isAvailable() 报缺失而不抛，且 native 要在建设备前拿到级别。
             if (MCDR_ABI.isAvailable()) {
                 MCDR_ABI.D3D12SetLogLevel(level)
-                // 旧 DLL 没有这个导出时，静默保持它内置的"恒定输出"行为。
                 MCDR_ABI.D3D12SetShutdownTraceAlways(shutdownTrace)
-                // 旧 DLL 没有这个导出时返回 false，只走 stderr。
                 if (nativeLogFile.isNotBlank() && MCDR_ABI.D3D12SetLogFile(nativeLogFile)) {
                     LOGGER.info("native log mirrored to {}", nativeLogFile)
                 }

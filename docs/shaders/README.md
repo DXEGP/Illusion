@@ -41,7 +41,7 @@ MCDR 的 DXC/Agility 运行库继续按既有资源清单打包。先构建相�
 `ShaderDefines` 放在 `#version` 之后；全局注入 `RENDERPEARL_DEPTH_IS_ZERO_TO_ONE`，让原版 reversed-Z/0..1 深度分支成立。
 `gl_VertexID` 等方言处理归转换器所有。
 
-`#include <namespace:path>` 由宿主展开，资源重载优先使用当前事务的 `ShaderSource` 快照；不从尚未切换的旧 resource manager 拼入 include。原版 `ShadercIncludeResult` 仅用于 include 缓存互操作，其 UTF-8 缓冲按 `content_length` 解码，不假设零结尾，也不调用其编译器。normal/flipY 与地形 WG 的版本化预热、frontend/device 租约和 frameprep 程序发布见 [实施记录](../rendering/work-graph-implementation.md)。
+`#include <namespace:path>` 由宿主展开，资源重载优先使用当前事务的 `ShaderSource` 快照；不从尚未切换的旧 resource manager 拼入 include。原版 `ShadercIncludeResult` 仅用于 include 缓存互操作，其 UTF-8 缓冲按 `content_length` 解码，不假设零结尾，也不调用其编译器。normal/flipY 与地形 WG 的版本化预热、frontend/device 租约和 frameprep 程序发布按 §7 的缓存与重载契约执行。
 展开最多 16 层、累计源码预算 8 MiB；未找到 include 或越界均报告编译错误。
 宿主文本展开不分析条件宏，原版 include 使用自己的防重守卫。社区包的 VFS/条件 include 运行时尚未实现，不把此原版适配当作整包解析器。
 
@@ -90,7 +90,7 @@ VS/PS 和生成的 MS/AS 均由 DXC 产生 SM6.9 DXIL，具体地形执行约束
 
 ## 7. 缓存与错误
 
-`VanillaFrameCoordinator` 是帧资源版本的唯一 owner。`prepareResourceReload()` 在帧间计算下一版本并保留本次候选；`VanillaPipelineCompiler.publishPipelineReload` 安装可恢复的 frontend、成功提交同代 native programs 后，由候选发布 `resourceVersion`。即使主颜色、深度附件和尺寸不变，下一真实帧也采用新版本；失败或撤销的重载保持旧版本，下一帧按版本比较撤销旧 motion、VRS 和重建历史兼容。完整发布与旧资源清理契约见 [实施记录](../rendering/work-graph-implementation.md#g-重载与预热边界)。
+`VanillaFrameCoordinator` 是帧资源版本的唯一 owner。`prepareResourceReload()` 在帧间计算下一版本并保留本次候选；`VanillaPipelineCompiler.publishPipelineReload` 安装可恢复的 frontend、成功提交同代 native programs 后，由候选发布 `resourceVersion`。即使主颜色、深度附件和尺寸不变，下一真实帧也采用新版本；失败或撤销的重载保持旧版本，下一帧按版本比较撤销旧 motion、VRS 和重建历史兼容。
 
 `VanillaPipelineCompiler` 的 source cache 按真实 source identity、generation、id/stage/defines 保存模块，pipeline cache 保存普通与 flipY 变体。重载 token 校验所属 compiler，新代际撤销旧 pending；缓存与 frontend 各持独立租约，成功发布才更换活动缓存。设备只通过中立 compiler 接口转交 SPI 调用。
 库不保存跨调用 IR；每次转换独立持有数据，原模块不会因另一条管线重绑定而被修改。

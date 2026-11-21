@@ -73,7 +73,7 @@ internal sealed interface DisplayFrameSettlement {
 }
 
 /**
- * Java FFM binding for MCDR; see docs/misc/ffm-abi.md (contract, arena rules, failure modes).
+ * Java FFM binding for MCDR.
  * Handles are plain `long`, 0 = missing; every handle is linked once and must be invoked with a
  * descriptor that matches its native prototype exactly (see [MethodHandle.invokeExact]).
  */
@@ -89,8 +89,6 @@ object MCDR_ABI {
     private val LINKER: Linker = Linker.nativeLinker()
     private var LIB: SymbolLookup? = null
     private var LOAD_FAILURE: Throwable? = null
-    // Method handles are nullable so a failed load leaves them null instead of throwing
-    // ExceptionInInitializerError — requireLoaded() turns that into a readable message.
     private var MH_abiversion: MethodHandle? = null
     private var MH_abilayout: MethodHandle? = null
     private var MH_lasterror: MethodHandle? = null
@@ -129,7 +127,6 @@ object MCDR_ABI {
     private var MH_fgstatus: MethodHandle? = null
     private var MH_fgstate: MethodHandle? = null
     private var MH_fgsetuitexture: MethodHandle? = null
-    // hudless present: the world layer carries no UI, the SDK composites it.
     private var MH_fgsetuicomposition: MethodHandle? = null
     private var MH_fguicompositionready: MethodHandle? = null
     /** Scope shading rate (see [D3D12SetShadingRateNow]). */
@@ -214,11 +211,9 @@ object MCDR_ABI {
     private var MH_asyncrenderwaitrecordingready: MethodHandle? = null
     private var MH_asyncsendcommandsready: MethodHandle? = null
     private var MH_clearasyncrenderctx: MethodHandle? = null
-    // World-layer in-place SMAA (three passes + copy back).
     private var MH_applysmaatotexture: MethodHandle? = null
     private var MH_blittexturetotexture: MethodHandle? = null
     private var MH_sharpentexturetotexture: MethodHandle? = null
-    // TAA resolve, held entirely by native.
     private var MH_creategraphicspipeline: MethodHandle? = null
     private var MH_creategraphicsconstants: MethodHandle? = null
     private var MH_createoitnormalizationpipelinev1: MethodHandle? = null
@@ -251,29 +246,9 @@ object MCDR_ABI {
     private var MH_oitresolve: MethodHandle? = null
     private var MH_oitresolvev4: MethodHandle? = null
     private var MH_oitabort: MethodHandle? = null
-    private var MH_oitexecutionbegin: MethodHandle? = null
-    private var MH_oitexecutionquery: MethodHandle? = null
     private var MH_oitreceiptquery: MethodHandle? = null
     private var MH_oitreceiptfrontier: MethodHandle? = null
-    private var MH_oitexecutionappend: MethodHandle? = null
-    private var MH_oitexecutionseal: MethodHandle? = null
-    private var MH_oitexecutionbeginv2: MethodHandle? = null
-    private var MH_oitexecutiontexturev1: MethodHandle? = null
-    private var MH_oitexecutionappendv2: MethodHandle? = null
-    private var MH_oitexecutionoperationappendv1: MethodHandle? = null
-    private var MH_oitexecutionqueryv2: MethodHandle? = null
-    private var MH_oitexecutionterrainreceiptv2: MethodHandle? = null
-    private var MH_oitexecutionsealv2: MethodHandle? = null
-    private var MH_oitexecutionabortv2: MethodHandle? = null
-    private var MH_oitoperationbeginv1: MethodHandle? = null
-    private var MH_oitoperationfinishv1: MethodHandle? = null
-    private var MH_oitoperationcancelv1: MethodHandle? = null
-    private var MH_oitoperationreceiptv1: MethodHandle? = null
     private var MH_oitsampledcontentv1: MethodHandle? = null
-    private var MH_oitterrainstagebeginv2: MethodHandle? = null
-    private var MH_oitterrainstagefinishv2: MethodHandle? = null
-    private var MH_oitterrainstageabortv2: MethodHandle? = null
-    private var MH_oitterrainstagereceiptv2: MethodHandle? = null
     private var MH_oitterrainreadsetregisterv2: MethodHandle? = null
     private var MH_oitterrainreadsetcancelv2: MethodHandle? = null
     private var MH_pushgraphicsconstants: MethodHandle? = null
@@ -282,7 +257,6 @@ object MCDR_ABI {
     private var MH_createmeshrootconstants: MethodHandle? = null
     private var MH_meshrootsigconstants: MethodHandle? = null
     private var MH_destroypipeline: MethodHandle? = null
-    // Mesh shaders: DXC compile + AS/MS pipeline + DispatchMesh.
     private var MH_compileshaderdxc: MethodHandle? = null
     private var MH_createworkgraph: MethodHandle? = null
     private var MH_vanillabegin: MethodHandle? = null
@@ -336,7 +310,6 @@ object MCDR_ABI {
     private var MH_dispatchmesh: MethodHandle? = null
     private var MH_meshdrawmeshlets: MethodHandle? = null
 
-    // Compute minimum path (prerequisite for the shading-rate image / NRC).
     private var MH_createcomputepipeline: MethodHandle? = null
     private var MH_createterrantilebinningpipeline: MethodHandle? = null
     private var MH_dispatchcompute: MethodHandle? = null
@@ -422,7 +395,6 @@ object MCDR_ABI {
             }
         }
     }
-    // ---- Loading ----
     private fun safeABIVersion(): Int {
         return try {
             MH_abiversion!!.invokeExact() as Int
@@ -457,8 +429,6 @@ object MCDR_ABI {
             null
         }
     }
-    // MSVC `long` is 32-bit: C `long` -> JAVA_INT / MCDRLayout.I32, never I64, and every
-    // invokeExact argument must sit at exactly the static type its descriptor declares.
     private fun fd(ret: MemoryLayout, vararg args: MemoryLayout): FunctionDescriptor {
         return FunctionDescriptor.of(ret, *args)
     }
@@ -502,8 +472,7 @@ object MCDR_ABI {
         return if (seg == null) 0L else seg.address()
     }
     /**
-     * `MCDR_ABI_VERSION` from `mcdr_abi.h`; 2->3 added the SR tables, 3->4 the FG tables, and
-     * 14->15 added transactional frame-program publication (all append-only).
+     * `MCDR_ABI_VERSION` from `mcdr_abi.h`.
      * This constant, the Kotlin mirrors and the native `layoutTable()` must agree — [verifyABI]
      * aborts before device creation otherwise.
      */
@@ -591,7 +560,6 @@ object MCDR_ABI {
             dispatch(encoded, count)
         }
     }
-    // ---- Meta ----
     /** Last error this thread recorded; "" when none. */
     fun D3D12LastError(): String {
         requireLoaded()
@@ -613,7 +581,6 @@ object MCDR_ABI {
         try {
             MH_setlogverbose!!.invokeExact(if (enabled) 1 else 0)
         } catch (ignored: Throwable) {
-        // logging configuration must never fail engine start-up
         }
     }
     /** 0=error 1=warning 2=info 3=debug; a DLL predating `mcdrSetLogLevel` falls back to [D3D12SetLogVerbose]. Must run before the device is created. */
@@ -630,10 +597,9 @@ object MCDR_ABI {
                 D3D12SetLogVerbose(clamped >= 2)
             }
         } catch (ignored: Throwable) {
-        // logging configuration must never fail engine start-up
         }
     }
-    /** Push/clear one env var — only for native `getenv()` read points that already exist, never as a new switch (see AGENTS.md). */
+    /** Push/clear one env var — only for native `getenv()` read points that already exist, never as a new switch. */
     fun D3D12SetEnvironment(name: String, value: String?) {
         if (LOAD_FAILURE != null) {
             return
@@ -647,7 +613,6 @@ object MCDR_ABI {
                 Unit
             }
         } catch (ignored: Throwable) {
-        // configuration propagation must never fail start-up
         }
     }
     /**
@@ -662,7 +627,6 @@ object MCDR_ABI {
         try {
             handle.invokeExact(if (always) 1 else 0)
         } catch (ignored: Throwable) {
-        // logging configuration must never fail engine start-up
         }
     }
 
@@ -903,7 +867,7 @@ object MCDR_ABI {
     /** 1 = Streamline reports DLSS loaded; 0 also covers "SL up but the NGX runtime is too old" — grey the UI out. */
     fun D3D12DlssAvailable(): Int {
         if (LOAD_FAILURE != null) return 0
-        val handle = MH_dlssavailable ?: return 1  // 旧 DLL 没有这个导出时按“未知=可用”处理
+        val handle = MH_dlssavailable ?: return 1
         return try {
             handle.invokeExact() as Int
         } catch (t: Throwable) {
@@ -1033,7 +997,6 @@ object MCDR_ABI {
             Int.MIN_VALUE
         }
     }
-    // ---- SR (super resolution) contract layer: not on any per-frame path, so a confined arena is fine ----
 
     /**
      * One `mcdr_sr_caps` row, field for field. [note] is native's fixed `char[28]` reason, not a
@@ -1513,7 +1476,6 @@ object MCDR_ABI {
                 + (if (detail.isEmpty()) "" else ": $detail"))
         }
     }
-    // ---- Device + resources ----
     /** Create the device and return its adapter/feature summary, or "ERROR: ...". */
     fun ID3D12CreateDevice(): String {
         requireLoaded()
@@ -1677,7 +1639,6 @@ object MCDR_ABI {
             throw unexpected(t)
         }
     }
-    // ---- Command layer ----
     /** GPU timestamp ticks per second; 0 if unknown. */
     fun D3D12GetTimestampFrequency(): Long {
         requireLoaded()
@@ -1943,7 +1904,7 @@ object MCDR_ABI {
             throw unexpected(t)
         }
     }
-    /** Rect clear in render-target pixels (per-slot atlas clears wiped already-baked icons). */
+    /** Rect clear in render-target pixels. */
     fun D3D12ClearColorTextureRegion(ctx: Long, texture: Long,
                                      r: Float, g: Float,
                                      b: Float, a: Float,
@@ -2008,7 +1969,7 @@ object MCDR_ABI {
             try {
                 MH_beginrenderpass!!.invokeExact(ptr(ctx), views, colorCount, mips, flags, colors,
                     ptr(depthTexture), depthMip, depthClearFlag.toInt(), depthClearValue, x, y, w, h)
-                Unit // Keep the signature-polymorphic call in statement position.
+                Unit
             } catch (t: Throwable) {
                 throw unexpected(t)
             }
@@ -2086,7 +2047,6 @@ object MCDR_ABI {
             }
         }
     }
-    // ---- Async: dedicated render thread ----
     /** Start the render thread; **must precede [D3D12CreateCommandEncoder]**. */
     fun D3D12InitAsyncRenderer(workerCount: Int) {
         requireLoaded()
@@ -2140,7 +2100,7 @@ object MCDR_ABI {
             throw unexpected(t)
         }
     }
-    /** Blocking "recording ready"; replaces the old sleep(1) poll on the critical path. */
+    /** Blocking: wait until the render thread reports "recording ready". */
     fun D3D12AsyncRenderWaitRecordingReady(ctx: Long, timeoutMs: Long): Boolean {
         requireLoaded()
         try {
@@ -2167,7 +2127,6 @@ object MCDR_ABI {
             throw unexpected(t)
         }
     }
-    // ---- Pipeline ----
     /** Compile the HLSL pair and build the pipeline; 0 on failure (see [D3D12LastError]). */
     fun D3D12CreateGraphicsPipeline(desc: MCDRPipelineDesc, pushConstantBytes: Int = 0): Long {
         requireLoaded()
@@ -2175,31 +2134,6 @@ object MCDR_ABI {
         Arena.ofConfined().use { arena ->
             val packed = desc.pack(arena)
             return addr(MH_creategraphicsconstants!!.invokeExact(packed, pushConstantBytes) as MemorySegment)
-        }
-    }
-
-    internal fun D3D12CreateOitNormalizationPipelineV1(desc: MCDRPipelineDesc,
-        certificationVersion: Int, targetCount: Int, programGeneration: Long,
-        fragmentSourceHash: ByteArray, vertexSourceHash: ByteArray, contractHash: ByteArray): Long {
-        requireLoaded()
-        require(certificationVersion == 1 && targetCount in setOf(1, 2, 4) && programGeneration > 0L)
-        require(fragmentSourceHash.size == 32 && vertexSourceHash.size == 32 && contractHash.size == 32)
-        return Arena.ofConfined().use { arena ->
-            val packed = desc.pack(arena)
-            val layout = MCDRLayout.OIT_NORMALIZATION_PIPELINE_V1
-            val certification = arena.allocate(layout)
-            certification.set(MCDRLayout.I32, layout.byteOffset(MemoryLayout.PathElement.groupElement("schemaVersion")), 1)
-            certification.set(MCDRLayout.I32, layout.byteOffset(MemoryLayout.PathElement.groupElement("structSize")), layout.byteSize().toInt())
-            certification.set(MCDRLayout.I32, layout.byteOffset(MemoryLayout.PathElement.groupElement("certificationVersion")), certificationVersion)
-            certification.set(MCDRLayout.I32, layout.byteOffset(MemoryLayout.PathElement.groupElement("targetCount")), targetCount)
-            certification.set(MCDRLayout.I64, layout.byteOffset(MemoryLayout.PathElement.groupElement("programGeneration")), programGeneration)
-            MemorySegment.copy(fragmentSourceHash, 0, certification, MCDRLayout.I8,
-                layout.byteOffset(MemoryLayout.PathElement.groupElement("fragmentSourceHash")), 32)
-            MemorySegment.copy(vertexSourceHash, 0, certification, MCDRLayout.I8,
-                layout.byteOffset(MemoryLayout.PathElement.groupElement("vertexSourceHash")), 32)
-            MemorySegment.copy(contractHash, 0, certification, MCDRLayout.I8,
-                layout.byteOffset(MemoryLayout.PathElement.groupElement("contractHash")), 32)
-            addr(checkNotNull(MH_createoitnormalizationpipelinev1).invokeExact(packed, certification) as MemorySegment)
         }
     }
 
@@ -2440,29 +2374,14 @@ object MCDR_ABI {
         return MH_oitterrainbind!!.invokeExact(ptr(ctx), ptr(frame), ptr(metadata), input) as Int
     }
 
-    internal fun D3D12OitPrepareTerrainTilesV2(ctx: Long, frame: Long, batch: MemorySegment): Int {
-        if (LOAD_FAILURE != null) return Int.MIN_VALUE
-        val handle = MH_oitterrainpreparetiles ?: return Int.MIN_VALUE
-        return try {
-            handle.invokeExact(ptr(ctx), ptr(frame), batch) as Int
-        } catch (_: Throwable) {
-            Int.MIN_VALUE
-        }
-    }
-
-    internal fun D3D12OitPrepareTerrainTilesV3(ctx: Long, frame: Long, batch: MemorySegment): Int {
-        if (LOAD_FAILURE != null) return Int.MIN_VALUE
-        val handle = MH_oitterrainpreparetilesv3 ?: return Int.MIN_VALUE
-        return try {
-            handle.invokeExact(ptr(ctx), ptr(frame), batch) as Int
-        } catch (_: Throwable) {
-            Int.MIN_VALUE
-        }
-    }
-
     internal fun D3D12OitUnbindDrawV1(ctx: Long, frame: Long): Int {
         requireLoaded()
         return MH_oitunbind!!.invokeExact(ptr(ctx), ptr(frame)) as Int
+    }
+
+    internal fun D3D12OitAbortFrameV1(ctx: Long, frame: Long): Int {
+        requireLoaded()
+        return MH_oitabort!!.invokeExact(ptr(ctx), ptr(frame)) as Int
     }
 
     internal fun D3D12OitSealFrameV1(ctx: Long, frame: Long): Int {
@@ -2473,127 +2392,7 @@ object MCDR_ABI {
     internal fun D3D12OitResolveRecordsV3(ctx: Long, input: MemorySegment): Int =
         vanillaFrameCall(MH_oitresolve, ctx, input)
 
-    internal fun D3D12OitResolveRecordsV4(ctx: Long, input: MemorySegment): Int =
-        vanillaFrameCall(MH_oitresolvev4, ctx, input)
-
-    internal fun D3D12OitAbortFrameV1(ctx: Long, frame: Long): Int {
-        requireLoaded()
-        return MH_oitabort!!.invokeExact(ptr(ctx), ptr(frame)) as Int
-    }
-
-    internal fun hasOitExecutionStreamV1(): Boolean = LOAD_FAILURE == null &&
-        MH_oitexecutionbegin != null && MH_oitexecutionquery != null && MH_oitreceiptquery != null &&
-        MH_oitreceiptfrontier != null && MH_oitexecutionappend != null && MH_oitexecutionseal != null
-
-    internal fun D3D12OitBeginExecutionStreamV1(ctx: Long, frame: Long, input: MemorySegment, output: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitexecutionbegin).invokeExact(ptr(ctx), ptr(frame), input, output) as Int
-    }
-
-    internal fun D3D12OitQueryExecutionStreamV1(ctx: Long, stream: Long, output: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitexecutionquery).invokeExact(ptr(ctx), ptr(stream), output) as Int
-    }
-
-    internal fun D3D12OitQueryTerrainDrawReceiptV1(ctx: Long, frame: Long, input: MemorySegment, output: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitreceiptquery).invokeExact(ptr(ctx), ptr(frame), input, output) as Int
-    }
-
-    internal fun D3D12OitQueryTerrainDrawFrontierV1(ctx: Long, frame: Long, output: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitreceiptfrontier).invokeExact(ptr(ctx), ptr(frame), output) as Int
-    }
-
-    internal fun D3D12OitAppendExecutionEventV1(ctx: Long, stream: Long, input: MemorySegment, output: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitexecutionappend).invokeExact(ptr(ctx), ptr(stream), input, output) as Int
-    }
-
-    internal fun hasOitTerrainStageReceiptsV2(): Boolean = LOAD_FAILURE == null &&
-        MH_oitterrainstagebeginv2 != null && MH_oitterrainstagefinishv2 != null &&
-        MH_oitterrainstageabortv2 != null && MH_oitterrainstagereceiptv2 != null
-
-    internal fun hasOitExecutionStreamV2(): Boolean = LOAD_FAILURE == null &&
-        MH_oitexecutiontexturev1 != null &&
-        MH_oitexecutionbeginv2 != null && MH_oitexecutionappendv2 != null && MH_oitexecutionqueryv2 != null &&
-        MH_oitexecutionoperationappendv1 != null &&
-        MH_oitexecutionterrainreceiptv2 != null &&
-        MH_oitexecutionsealv2 != null && MH_oitexecutionabortv2 != null
-
-    internal fun D3D12OitCaptureExecutionTextureV1(ctx: Long, frame: Long, view: Long, budget: Long,
-        output: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitexecutiontexturev1).invokeExact(ptr(ctx), ptr(frame), ptr(view), budget, output) as Int
-    }
-
-    internal fun D3D12OitBeginExecutionOperationV1(context: Long, frame: Long,
-        input: MemorySegment, operationOut: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitoperationbeginv1).invokeExact(ptr(context), ptr(frame), input, operationOut) as Int
-    }
-
-    internal fun D3D12OitFinishExecutionOperationV1(context: Long, frame: Long,
-        operation: Long, receiptCountOut: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitoperationfinishv1).invokeExact(ptr(context), ptr(frame), ptr(operation), receiptCountOut) as Int
-    }
-
-    internal fun D3D12OitCancelExecutionOperationV1(context: Long, frame: Long, operation: Long): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitoperationcancelv1).invokeExact(ptr(context), ptr(frame), ptr(operation)) as Int
-    }
-
-    internal fun D3D12OitQueryExecutionOperationReceiptV1(context: Long, frame: Long,
-        operation: Long, afterSequence: Long, output: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitoperationreceiptv1).invokeExact(ptr(context), ptr(frame), ptr(operation), afterSequence, output) as Int
-    }
-
-    internal fun D3D12OitBeginExecutionStreamV2(ctx: Long, frame: Long, input: MemorySegment, output: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitexecutionbeginv2).invokeExact(ptr(ctx), ptr(frame), input, output) as Int
-    }
-
-    internal fun D3D12OitAppendExecutionEventV2(ctx: Long, stream: Long, input: MemorySegment, output: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitexecutionappendv2).invokeExact(ptr(ctx), ptr(stream), input, output) as Int
-    }
-
-    internal fun D3D12OitAppendExecutionOperationEventV1(ctx: Long, stream: Long, input: MemorySegment,
-        receipt: MemorySegment, output: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitexecutionoperationappendv1).invokeExact(ptr(ctx), ptr(stream), input, receipt, output) as Int
-    }
-
-    internal fun D3D12OitQueryExecutionStreamV2(ctx: Long, stream: Long, output: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitexecutionqueryv2).invokeExact(ptr(ctx), ptr(stream), output) as Int
-    }
-
-    internal fun D3D12OitQueryExecutionTerrainReceiptV2(ctx: Long, stream: Long, receiptId: Long, output: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitexecutionterrainreceiptv2).invokeExact(ptr(ctx), ptr(stream), receiptId, output) as Int
-    }
-
-    internal fun D3D12OitSealExecutionStreamV2(ctx: Long, stream: Long, manifest: MemorySegment,
-        output: MemorySegment, result: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitexecutionsealv2).invokeExact(ptr(ctx), ptr(stream), manifest, output, result) as Int
-    }
-
     private var MH_oitexecutetilestreamv2: MethodHandle? = null
-
-    internal fun D3D12OitExecuteTileStreamV2(ctx: Long, stream: Long, batch: MemorySegment, corrected: Long): Int {
-        requireLoaded()
-        require(batch.byteSize() == 4 * MCDRLayout.TERRAIN_TILE_BATCH_V2.byteSize())
-        return checkNotNull(MH_oitexecutetilestreamv2).invokeExact(ptr(ctx), ptr(stream), batch, ptr(corrected)) as Int
-    }
-
-    internal fun D3D12OitAbortExecutionStreamV2(ctx: Long, stream: Long): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitexecutionabortv2).invokeExact(ptr(ctx), ptr(stream)) as Int
-    }
 
     internal fun captureSampledTextureContentV1(ctx: Long, view: Long, budget: Long,
         ownerIdentity: MemorySegment, ownerGeneration: MemorySegment, contentVersion: MemorySegment,
@@ -2603,46 +2402,8 @@ object MCDR_ABI {
             ownerIdentity, ownerGeneration, contentVersion, firstMip, mipCount, firstLayer, layerCount) as Int
     }
 
-    internal fun D3D12OitBeginTerrainStageDrawV2(ctx: Long, frame: Long, input: MemorySegment, output: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitterrainstagebeginv2).invokeExact(ptr(ctx), ptr(frame), input, output) as Int
-    }
-
-    internal fun D3D12OitFinishTerrainStageDrawV2(ctx: Long, frame: Long, token: Long, output: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitterrainstagefinishv2).invokeExact(ptr(ctx), ptr(frame), ptr(token), output) as Int
-    }
-
-    internal fun D3D12OitAbortTerrainStageDrawV2(ctx: Long, frame: Long, token: Long): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitterrainstageabortv2).invokeExact(ptr(ctx), ptr(frame), ptr(token)) as Int
-    }
-
-    internal fun D3D12OitQueryTerrainStageReceiptV2(ctx: Long, frame: Long, receiptId: Long, output: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitterrainstagereceiptv2).invokeExact(ptr(ctx), ptr(frame), receiptId, output) as Int
-    }
-
     internal fun hasOitTerrainReplayReadSetV2(): Boolean = LOAD_FAILURE == null &&
         MH_oitterrainreadsetregisterv2 != null && MH_oitterrainreadsetcancelv2 != null
-
-    internal fun D3D12OitRegisterTerrainReplayReadSetV2(ctx: Long, frame: Long, token: Long,
-        batch: Long, vertex: Long, vertexOffset: Long, input: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitterrainreadsetregisterv2)
-            .invokeExact(ptr(ctx), ptr(frame), ptr(token), ptr(batch), ptr(vertex), vertexOffset, input) as Int
-    }
-
-    internal fun D3D12OitCancelTerrainReplayReadSetV2(ctx: Long, frame: Long, token: Long): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitterrainreadsetcancelv2).invokeExact(ptr(ctx), ptr(frame), ptr(token)) as Int
-    }
-
-    internal fun D3D12OitSealExecutionStreamV1(ctx: Long, stream: Long, manifest: MemorySegment,
-        output: MemorySegment, result: MemorySegment): Int {
-        requireLoaded()
-        return checkNotNull(MH_oitexecutionseal).invokeExact(ptr(ctx), ptr(stream), manifest, output, result) as Int
-    }
 
     fun D3D12PushGraphicsConstants(ctx: Long, data: ByteBuffer): Boolean {
         requireLoaded()
@@ -2670,8 +2431,6 @@ object MCDR_ABI {
             throw unexpected(t)
         }
     }
-    // ---- Mesh shaders: only DXC can emit AS/MS (D3DCompile stops at SM 5.1), and the pipeline state
-    // stream has no equivalent in the packed graphics descriptor — so native compiles too. ----
     /** Compile one entry point to DXIL; [entry] "" means "main"; null on failure. */
     fun D3D12CompileShaderDxc(source: String, entry: String, profile: String): ByteArray? {
         requireLoaded()
@@ -2681,7 +2440,6 @@ object MCDR_ABI {
             MemorySegment.copy(utf8, 0, src, ValueLayout.JAVA_BYTE, 0, utf8.size)
             val entrySeg = cstringUtf8(arena, entry)
             val profileSeg = cstringUtf8(arena, profile)
-            // First call probes the required size (null output buffer).
             val size = MH_compileshaderdxc!!.invokeExact(
                 src, utf8.size, entrySeg, profileSeg, MemorySegment.NULL, 0) as Int
             if (size <= 0) {
@@ -3176,8 +2934,6 @@ object MCDR_ABI {
             throw unexpected(t)
         }
     }
-    // ---- Compute: fixed root signature [0] root UAV u0, [1] root constants b0 (8 dwords), matching
-    // [D3D12DispatchCompute]; Dispatch() on a DIRECT list is legal, no compute queue needed. ----
     /** Build the compute PSO from `cs_6_x` DXIL; 0 on failure. */
     fun D3D12CreateComputePipeline(dxil: ByteArray): Long {
         requireLoaded()
@@ -3289,7 +3045,6 @@ object MCDR_ABI {
         seg.set(ValueLayout.JAVA_BYTE, bytes.size.toLong(), 0.toByte())
         return seg
     }
-    // ---- Surface (DXGI swapchain) ----
     /** DXGI swapchain for a native HWND; 0 on failure. */
     fun D3D12CreateSurface(hwnd: Long): Long {
         requireLoaded()
@@ -3440,7 +3195,6 @@ object MCDR_ABI {
             throw unexpected(t)
         }
     }
-    // ---- Draw commands ----
     internal fun D3D12SetRasterMotionTarget(ctx: Long, color: Long, depth: Long, motion: Long) {
         requireLoaded()
         val result = MH_setrastermotiontarget!!.invokeExact(ptr(ctx), ptr(color), ptr(depth), ptr(motion)) as Int
@@ -3505,7 +3259,6 @@ object MCDR_ABI {
         requireLoaded()
         val count = if (types == null) 0 else types.size
         if (count == 0) {
-            // A pipeline with no bindings is a no-op, not a failure.
             return true
         }
         val stride = MCDRLayout.BINDING_SLOT.byteSize()
@@ -3667,7 +3420,6 @@ object MCDR_ABI {
             throw unexpected(t)
         }
     }
-    // ---- Fence manager (SetEventOnCompletion + monitor thread, no polling) ----
     /** ID3D12Fence + monitor thread; 0 on failure. */
     fun D3D12AsyncFenceCreate(): Long {
         requireLoaded()
@@ -3745,7 +3497,7 @@ object MCDR_ABI {
             val handle = userHandle.toInt()
             val entry = CALLBACKS.get(handle) ?: return
             if (completed != 0 && !entry.fired.compareAndSet(false, true)) {
-                return  // already fired for this registration
+                return
             }
             if (completed != 0) {
                 CALLBACKS.remove(handle)
@@ -3755,16 +3507,13 @@ object MCDR_ABI {
             IllusionLogger.warnMessage("fence callback failed: ${t}")
         }
     }
-    // ---- FFM linker bootstrap ----
     private fun bindAll() {
         bindFenceStub()
         bindMetaAndDevice()
         bindCommand()
         bindPipelineSurfaceDraw()
         bindAsync()
-        // The JVM owns the verbose switch and must push it — native no longer reads the environment.
         D3D12SetLogVerbose(LOG_VERBOSE)
-        // Start from the built-in default; IllusionLogger.applyFromConfig() pushes the configured value later.
         D3D12SetShutdownTraceAlways(true)
     }
     private fun bindMetaAndDevice() {
@@ -3772,39 +3521,27 @@ object MCDR_ABI {
         MH_abilayout = skip("mcdrABILayout", fdv(MCDRLayout.PTR, MCDRLayout.PTR))
         MH_lasterror = skip("mcdrLastError", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32))
         MH_setlogverbose = skip("mcdrSetLogVerbose", fdv(MCDRLayout.I32))
-        // 0=error 1=warning 2=info 3=debug; a DLL without it falls back to the boolean mcdrSetLogVerbose.
-        // mcdr_dx12SetEnvironment only serves native's existing getenv() read points — never a new feature.
         MH_setenvironment = skipOptional("mcdr_dx12SetEnvironment", fdv(MCDRLayout.PTR, MCDRLayout.PTR))
         MH_setloglevel = skipOptional("mcdrSetLogLevel", fdv(MCDRLayout.I32))
-        // Config [logging] shutdownTrace; a DLL without it keeps the built-in always-on behaviour.
         MH_setshutdowntrace = skipOptional("mcdrSetShutdownTraceAlways", fdv(MCDRLayout.I32))
-        // Config [logging] nativeLogFile — launchers do not persist the child's stdout/stderr.
         MH_setlogfile = skipOptional("mcdrSetLogFile", fd(MCDRLayout.I32, MCDRLayout.PTR))
-        // **Must run before the first D3D12 device exists** — the layer hooks D3D12 when it loads.
         MH_setpixcapture = skipOptional("mcdrSetPixCapture", fd(MCDRLayout.I32, MCDRLayout.I32))
-        // Config [debug] pixDirectory: the DLL itself or its directory; before mcdrSetPixCapture.
         MH_setpixdirectory = skipOptional(
             "mcdrSetPixDirectory",
             fd(MCDRLayout.I32, MCDRLayout.PTR),
         )
-        // PIXBeginCapture from the process itself — the only way to get a file at a chosen path.
         MH_startpixtiming = skipOptional(
             "mcdrStartPixTimingCapture",
             fd(MCDRLayout.I32, MCDRLayout.PTR),
         )
         MH_stoppixtiming = skipOptional("mcdrStopPixTimingCapture", fd(MCDRLayout.I32))
-        // Raw D3D12_SHADING_RATE, -1 = off; capability is judged natively (tier 0 / AdditionalShadingRates).
         MH_setshadingrate = skipOptional("mcdrSetShadingRate", fd(MCDRLayout.I32, MCDRLayout.I32))
-        // 0=OFF 1=SMAA 2=TAA 3=DLAA (same numbering as the video option); DLAA is accepted but degrades to OFF.
         MH_setantialiasing = skipOptional("mcdrSetAntiAliasing", fd(MCDRLayout.I32, MCDRLayout.I32))
-        // Scope shading rate (ctx + rate); no export => MIN_VALUE and the JVM stays non-scoped.
         MH_setshadingratenow =
             skipOptional("mcdr_dx12SetShadingRateNow", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32))
         MH_setshadingratecombiners =
             skipOptional("mcdr_dx12SetShadingRateCombiners", fd(MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32))
-        // Create and Evaluate hit the same native implementation; bind Evaluate only when evaluating per frame.
         MH_querydlss = skipOptional("mcdr_dx12QueryDlss", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32))
-        // The 8 SR entry points; no export => MIN_VALUE, callers degrade silently.
         MH_srpick = skipOptional("mcdr_dx12SrPick", fd(MCDRLayout.I32, MCDRLayout.I32))
         MH_fgprepare = skipOptional("mcdr_dx12FgPrepare", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_fgabort = skipOptional("mcdr_dx12FgAbort", fd(MCDRLayout.I32, MCDRLayout.I64))
@@ -3829,7 +3566,6 @@ object MCDR_ABI {
                 fd(MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32),
             )
         MH_srquery = skipOptional("mcdr_dx12SrQuery", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32))
-        // FG entry points. Still skipOptional: an ABI-version mismatch throws first, so a half-upgraded pair degrades.
         MH_fgpick = skipOptional("mcdr_dx12FgPick", fd(MCDRLayout.I32, MCDRLayout.I32))
         MH_fgquerycaps = skipOptional(
             "mcdr_dx12FgQueryCaps",
@@ -3840,19 +3576,14 @@ object MCDR_ABI {
         MH_fgstatus = skipOptional("mcdr_dx12FgStatus", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32))
         MH_fgstate = skipOptional("mcdr_dx12FgState", fd(MCDRLayout.I32))
         MH_fgsetuitexture = skipOptional("mcdr_dx12FgSetUiTexture", fdv(MCDRLayout.PTR))
-        // hudless present + who composites the UI; old DLL => MIN_VALUE, FrameGeneration keeps compositing itself.
         MH_fgsetuicomposition = skipOptional("mcdr_dx12FgSetUiComposition", fdv(MCDRLayout.I32))
         MH_fguicompositionready = skipOptional("mcdr_dx12FgUiCompositionReady", fd(MCDRLayout.I32))
-        // DLSS switch decoupled from the AA mode; no export => MIN_VALUE, the legacy bridge falls back to aaMode == 4.
         MH_setdlssenabled = skipOptional("mcdr_dx12SetDlssEnabled", fd(MCDRLayout.I32, MCDRLayout.I32))
-        // **Before** vanilla clearDepthTexture: afterwards the depth is 0.0 (reverse-Z far) and the depth term becomes a constant.
         MH_snapshotdlssdepth = skipOptional("mcdr_dx12SnapshotDlssDepth",
             fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
-        // 0=Performance 1=Balanced 2=Quality; no export => MIN_VALUE, native still picks by ratio.
         MH_setdlssquality = skipOptional("mcdr_dx12SetDlssQuality", fd(MCDRLayout.I32, MCDRLayout.I32))
         MH_setdlssrenderpreset =
             skipOptional("mcdr_dx12SetDlssRenderPreset", fd(MCDRLayout.I32, MCDRLayout.I32))
-        // JVM-created DLSS output texture as a Dx12Object* handle; no export => MIN_VALUE keeps the private UAV path.
         MH_reflexframebegin = skipOptional("mcdr_dx12ReflexFrameBegin", fdv())
         MH_reflexmarker = skipOptional("mcdr_dx12ReflexMarker", fdv(MCDRLayout.I32))
         MH_meshsupport = skipOptional("mcdr_dx12QueryMeshSupport", fd(
@@ -3864,13 +3595,10 @@ object MCDR_ABI {
         MH_setdlssgmode = skipOptional("mcdr_dx12SetDlssgMode", fdv(MCDRLayout.I32, MCDRLayout.I32))
     MH_getdlssgpresented = skipOptional("mcdr_dx12GetDlssgPresented", fd(MCDRLayout.I32))
         MH_setreflexframelimit = skipOptional("mcdr_dx12SetReflexFrameLimit", fdv(MCDRLayout.I32))
-        // **Before** device/swapchain creation; pushed while the config is read.
         MH_sethdrmode = skipOptional("mcdr_dx12SetHdrMode", fdv(MCDRLayout.I32))
         MH_setraytracingmode = skipOptional("mcdr_dx12SetRaytracingMode", fdv(MCDRLayout.I32))
-        // State only; native picks the G-Buffer / RT branch once device + surface are ready.
         MH_setswapchainoptions =
             skipOptional("mcdr_dx12SetSwapchainOptions", fdv(MCDRLayout.I32, MCDRLayout.I32))
-        // Applies at the next swapchain build.
         MH_gethdrappliedmode = skipOptional("mcdr_dx12GetHdrAppliedMode", fd(MCDRLayout.I32))
         MH_reflexavailable = skipOptional("mcdr_dx12ReflexAvailable", fd(MCDRLayout.I32))
         MH_dlssavailable = skipOptional("mcdr_dx12DlssAvailable", fd(MCDRLayout.I32))
@@ -3932,7 +3660,6 @@ object MCDR_ABI {
         MH_destroyhiddenwindow = skip("mcdr_dx12DestroyHiddenWindow", fdv(MCDRLayout.I64))
     }
     private fun bindCommand() {
-        // Native renamed these two exports (the other 123 are unchanged).
         MH_gettimestampfrequency = skip("MCDR_D3D12_get_timestamp_frequency", fd(MCDRLayout.I64))
         MH_createcommandencoder = skip("MCDR_D3D12_create_command_encoder", fd(MCDRLayout.PTR))
         MH_destroycommandencoder = skip("mcdr_dx12DestroyCommandEncoder", fdv(MCDRLayout.PTR))
@@ -4093,16 +3820,12 @@ object MCDR_ABI {
         ))
         MH_asyncsendcommandsready = skip("mcdr_dx12AsyncSendCommandsReady", fd(MCDRLayout.I32, MCDRLayout.PTR))
         MH_clearasyncrenderctx = skip("mcdr_dx12ClearAsyncRenderCtx", fdv())
-        // skipOptional throughout: a missing export disables one pass, never the whole bind.
         MH_applysmaatotexture = skipOptional("mcdr_dx12ApplySmaaToTexture",
             fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
-        // In-place SMAA on the world layer; false => no export or SMAA off (rendering continues).
         MH_blittexturetotexture = skipOptional("mcdr_dx12BlitTextureToTexture",
             fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        // The GUI target takes over by blitting the scaled world target; no export => GUI shares the main target.
         MH_sharpentexturetotexture = skipOptional("mcdr_dx12SharpenTextureToTexture",
             fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.F32))
-        // 5-tap sharpen (TAA/DLAA/DLSS); no export => degrade to blit.
     }
     private fun bindPipelineSurfaceDraw() {
         MH_multiDrawIndexedPacked = skip("mcdr_dx12MultiDrawIndexedPacked", fd(MCDRLayout.I32,
@@ -4162,8 +3885,6 @@ object MCDR_ABI {
             MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.I32))
         MH_prepareframeprograms = skip("mcdr_dx12PrepareFramePrograms", fd(MCDRLayout.I32,
             MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.I32, MCDRLayout.PTR))
-        MH_prepareframeprogramsv2 = skip("mcdr_dx12PrepareFrameProgramsV2", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.PTR))
         MH_commitframeprograms = skip("mcdr_dx12CommitFramePrograms", fd(MCDRLayout.I32,
             MCDRLayout.PTR, MCDRLayout.PTR))
         MH_abortframeprograms = skip("mcdr_dx12AbortFramePrograms", fdv(MCDRLayout.PTR))
@@ -4194,8 +3915,6 @@ object MCDR_ABI {
             MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
         MH_creategraphicspipeline = skip("mcdr_dx12CreateGraphicsPipeline", fd(MCDRLayout.PTR, MCDRLayout.PTR))
         MH_creategraphicsconstants = skip("mcdr_dx12CreateGraphicsPipelineWithConstants", fd(MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
-        MH_createoitnormalizationpipelinev1 = skip("mcdr_dx12CreateOitNormalizationPipelineV1", fd(MCDRLayout.PTR,
-            MCDRLayout.PTR, MCDRLayout.PTR))
         MH_createoitlaneoperationpipelinev1 = skip("mcdr_dx12CreateOitLaneOperationPipelineV1", fd(MCDRLayout.PTR,
             MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.I64, MCDRLayout.I32))
         MH_createopaqueseedpipelinev1 = skip("mcdr_dx12CreateOpaqueSeedPipelineV1", fd(MCDRLayout.PTR,
@@ -4241,76 +3960,20 @@ object MCDR_ABI {
             MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_oitterrainbind = skip("mcdr_dx12OitBindTerrainDrawV2", fd(MCDRLayout.I32,
             MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitterrainpreparetiles = skip("mcdr_dx12OitPrepareTerrainTilesV2", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitterrainpreparetilesv3 = skip("mcdr_dx12OitPrepareTerrainTilesV3", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_oitunbind = skip("mcdr_dx12OitUnbindDrawV1", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_oitseal = skip("mcdr_dx12OitSealFrameV1", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_oitresolve = skip("mcdr_dx12OitResolveRecordsV3", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitresolvev4 = skip("mcdr_dx12OitResolveRecordsV4", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_oitabort = skip("mcdr_dx12OitAbortFrameV1", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitexecutionbegin = skipOptional("mcdr_dx12OitBeginExecutionStreamV1", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitexecutionquery = skipOptional("mcdr_dx12OitQueryExecutionStreamV1", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitreceiptquery = skipOptional("mcdr_dx12OitQueryTerrainDrawReceiptV1", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitreceiptfrontier = skipOptional("mcdr_dx12OitQueryTerrainDrawFrontierV1", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitexecutionappend = skipOptional("mcdr_dx12OitAppendExecutionEventV1", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitexecutionseal = skipOptional("mcdr_dx12OitSealExecutionStreamV1", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitexecutionbeginv2 = skipOptional("mcdr_dx12OitBeginExecutionStreamV2", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitoperationbeginv1 = skip("mcdr_dx12OitBeginExecutionOperationV1", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitoperationfinishv1 = skip("mcdr_dx12OitFinishExecutionOperationV1", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitoperationcancelv1 = skip("mcdr_dx12OitCancelExecutionOperationV1", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitoperationreceiptv1 = skip("mcdr_dx12OitQueryExecutionOperationReceiptV1", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.PTR))
-        MH_oitexecutiontexturev1 = skipOptional("mcdr_dx12OitCaptureExecutionTextureV1", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.PTR))
-        MH_oitexecutionappendv2 = skipOptional("mcdr_dx12OitAppendExecutionEventV2", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitexecutionoperationappendv1 = skip("mcdr_dx12OitAppendExecutionOperationEventV1", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitexecutionqueryv2 = skipOptional("mcdr_dx12OitQueryExecutionStreamV2", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitexecutionterrainreceiptv2 = skipOptional("mcdr_dx12OitQueryExecutionTerrainReceiptV2", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.PTR))
-        MH_oitexecutionsealv2 = skipOptional("mcdr_dx12OitSealExecutionStreamV2", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitexecutionabortv2 = skipOptional("mcdr_dx12OitAbortExecutionStreamV2", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitexecutetilestreamv2 = skip("mcdr_dx12OitExecuteTileStreamV2", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_oitsampledcontentv1 = skipOptional("mcdr_dx12CaptureSampledTextureContentV1", fd(MCDRLayout.I32,
             MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I64,
             MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR,
             MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitterrainstagebeginv2 = skipOptional("mcdr_dx12OitBeginTerrainStageDrawV2", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitterrainstagefinishv2 = skipOptional("mcdr_dx12OitFinishTerrainStageDrawV2", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitterrainstageabortv2 = skipOptional("mcdr_dx12OitAbortTerrainStageDrawV2", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
-        MH_oitterrainstagereceiptv2 = skipOptional("mcdr_dx12OitQueryTerrainStageReceiptV2", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.PTR))
-        MH_oitterrainreadsetregisterv2 = skipOptional("mcdr_dx12OitRegisterTerrainReplayReadSetV2", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.PTR))
-        MH_oitterrainreadsetcancelv2 = skipOptional("mcdr_dx12OitCancelTerrainReplayReadSetV2", fd(MCDRLayout.I32,
-            MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.PTR))
         MH_meshrootsigconstants = skip("mcdr_dx12CreateMeshRootSignatureWithConstants", fd(MCDRLayout.I64, MCDRLayout.PTR, MCDRLayout.I32, MCDRLayout.I32, MCDRLayout.I32))
         MH_pushgraphicsconstants = skip("mcdr_dx12PushGraphicsConstants", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
         MH_ensuregraphicsstate = skip("mcdr_dx12EnsureGraphicsState", fd(MCDRLayout.I32, MCDRLayout.PTR))
         MH_createmeshconstants = skip("mcdr_dx12CreateMeshPipelineWithConstants", fd(MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
         MH_createmeshrootconstants = skip("mcdr_dx12CreateMeshPipelineWithRootConstants", fd(MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I64, MCDRLayout.I32))
         MH_destroypipeline = skip("mcdr_dx12DestroyPipeline", fdv(MCDRLayout.PTR))
-        // TAA resolve; no export => TAA disables itself with a logged reason.
         MH_compileshaderdxc = skip("mcdr_dx12CompileShaderDxc", fd(
             MCDRLayout.I32,
             MCDRLayout.PTR,
@@ -4333,7 +3996,6 @@ object MCDR_ABI {
             MCDRLayout.I32,
             MCDRLayout.I32
         ))
-        // meshlet terrain dispatch (vertex pool / section table / meshlet table + b8).
         MH_meshdrawmeshlets = skip("mcdr_dx12MeshDrawMeshlets", fd(
             MCDRLayout.I32,
             MCDRLayout.PTR,
@@ -4349,7 +4011,6 @@ object MCDR_ABI {
             MCDRLayout.I64,
             MCDRLayout.I32
         ))
-        // compute minimum path: root UAV u0 + 8 root constants b0.
         MH_createcomputepipeline = skip("mcdr_dx12CreateComputePipeline", fd(MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
         MH_createterrantilebinningpipeline = skip("mcdr_dx12CreateTerrainTileBinningPipeline",
             fd(MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
@@ -4364,7 +4025,6 @@ object MCDR_ABI {
             MCDRLayout.I32,
             MCDRLayout.I32
         ))
-        // shading-rate image: 2xSRV + 1xUAV compute PSO, R8_UINT image, SRI binding.
         MH_createcomputepipelineshadingrate = skip("mcdr_dx12CreateComputePipelineShadingRate",
             fd(MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
         MH_createshadingrateimage = skip("mcdr_dx12CreateShadingRateImage",
@@ -4377,7 +4037,6 @@ object MCDR_ABI {
         ))
         MH_setshadingrateimage = skip("mcdr_dx12SetShadingRateImage",
             fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.PTR))
-        // generic compute texture pass, same root signature as the SRI one.
         MH_createtexture3 = skip("mcdr_dx12CreateComputePipelineTexture3",
             fd(MCDRLayout.PTR, MCDRLayout.PTR, MCDRLayout.I32))
         MH_dispatchtexture3 = skip("mcdr_dx12DispatchComputeTexture3", fd(
@@ -4410,7 +4069,6 @@ object MCDR_ABI {
             MCDRLayout.PTR,
             MCDRLayout.PTR
         ))
-        // Append-only; no export => black-frame sampling falls back to the old path.
         MH_readbacktexturepixelsin = skipOptional("mcdr_dx12ReadbackTexturePixelsIn", fd(
             MCDRLayout.I32,
             MCDRLayout.PTR,
@@ -4432,7 +4090,6 @@ object MCDR_ABI {
             MCDRLayout.I32,
             MCDRLayout.I32
         ))
-        // SetViewport / ClearStencilTexture, kept next to MH_setscissor.
         MH_setviewport = skip("mcdr_dx12SetViewport", fd(
             MCDRLayout.I32,
             MCDRLayout.PTR,
@@ -4511,8 +4168,6 @@ object MCDR_ABI {
     }
     /** Binds the native fence manager and its completion callback. */
     private fun bindAsync() {
-        // Fence manager. FENCE_STUB is the only upcall; timeoutMs == 0 means infinite, which is why
-        // the descriptor carries the timeout rather than the callee.
         MH_asyncfencecreate = skip("mcdr_dx12AsyncFenceCreate", fd(MCDRLayout.PTR))
         MH_asyncfencedestroy = skip("mcdr_dx12AsyncFenceDestroy", fdv(MCDRLayout.PTR))
         MH_asyncfencesignal = skip("mcdr_dx12AsyncFenceSignal", fd(MCDRLayout.I32, MCDRLayout.PTR, MCDRLayout.I64))

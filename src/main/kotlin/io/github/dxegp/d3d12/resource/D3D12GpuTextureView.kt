@@ -38,7 +38,6 @@ class D3D12GpuTextureView(private val tex: GpuTexture, private val baseMip: Int,
             return
         }
         this.closed = true
-        // 顺序要求：先移除 texture 上的引用，再销毁 native 描述符（进入延迟删除，等 GPU 空闲）。
         (this.texture() as D3D12GpuTexture).removeViews()
         MCDR_ABI.ID3D12DestroyResource(this.handle)
         this.handle = 0L

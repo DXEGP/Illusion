@@ -17,8 +17,7 @@ import net.neoforged.neoforge.common.NeoForge
 
 /**
  * VRS 着色粒度：只有 OFF / AUTO 两档，作为普通视频设置挂在原版视频设置界面，值存 `options.txt`
- * （键 [OPTIONS_KEY]，改动经 [push] 即时推给 native）。能力判据全在 native 侧且分两拍。
- * 见 docs/mesh&vrs/README.md §3.1。
+ * （键 [OPTIONS_KEY]，改动经 [push] 即时推给 native）。
  */
 object D3D12VariableShadingRate {
     /** 循环按钮取值顺序 = 枚举声明顺序（OFF 在最前）。 */
@@ -64,7 +63,7 @@ object D3D12VariableShadingRate {
 
     /**
      * 取值 → native：AUTO 推 [MAX_TERRAIN_RATE] 只为让 native 做一次能力预检（tier 0 / 不支持返回 0），
-     * 失败记入 [nativeRefused]。速率只是地形粗粒度的上限，真正下发由 [scope] 逐批次完成（§3.1）。
+     * 失败记入 [nativeRefused]。
      */
     private fun push(settings: D3D12VRSSettings) {
         val rate = if (settings == D3D12VRSSettings.AUTO) MAX_TERRAIN_RATE else -1
@@ -103,7 +102,6 @@ object D3D12VariableShadingRate {
         }
     }
 
-    /** 速率值 → `RATE_2X2` 这样的名字，只用于日志。 */
     private fun rateName(rate: Int): String = when (rate) {
         0x0 -> "1X1"
         0x1 -> "1X2"
@@ -120,7 +118,7 @@ object D3D12VariableShadingRate {
 
     /**
      * 本帧地形允许的粗粒度上限：超分在跑时压到 1X2（58% 尺度下 2X2 只剩 1/4 样本，超分抖动会放大成
-     * 整屏跳动），100% 尺度仍允许 2X2。见 docs/mesh&vrs/README.md §3.2。
+     * 整屏跳动），100% 尺度仍允许 2X2。
      */
     @JvmStatic
     fun terrainRateCap(): Int = if (SuperResolution.isEnabled()) RATE_1X2 else RATE_2X2
@@ -170,7 +168,7 @@ object D3D12VariableShadingRate {
 
     /**
      * 这条地形批次允许的着色率，`-1` = 一个调用都不发（保持 1X1）。白名单：只有 `solid_terrain`
-     * （不含 shadow）能变粗；cutout / translucent / oit 一律 1X1，否则叶子边缘会破洞（§3.2）。
+     * （不含 shadow）能变粗；cutout / translucent / oit 一律 1X1，否则叶子边缘会破洞。
      */
     @JvmStatic
     fun terrainRateFor(location: String): Int {
@@ -195,9 +193,6 @@ object D3D12VariableShadingRate {
             body()
             return
         }
-        // 组合器按"图像是否在场"切换：图像在场时 stage0 用 PASSTHROUGH（否则远处那圈基率会压在
-        // 图像之上，实测表现为地平线闪烁），stage1 用 MIN 让图像只能保住更细的 tile、不能反向变粗；
-        // 图像不在场则回到 MIN / PASSTHROUGH。
         val imageBound = D3D12ShadingRateImage.isReady() && D3D12ShadingRateImage.bind(ctx)
         setCombiners(
             if (imageBound) COMBINER_PASSTHROUGH else COMBINER_MIN,
@@ -224,7 +219,7 @@ object D3D12VariableShadingRate {
 
     /**
      * 把两个组合器推给 native（幂等）。stage0 取 `MIN`，mesh shader 逐图元写的 `SV_ShadingRate` 才能
-     * "近处更细"生效（`PASSTHROUGH` 会忽略它、`OVERRIDE` 会被最远档盖掉）；逐图元速率缺省 1X1，故失败即回到"VRS 未生效"（§3.4）。
+     * "近处更细"生效（`PASSTHROUGH` 会忽略它、`OVERRIDE` 会被最远档盖掉）。
      */
     @JvmStatic
     /** 只改 native 存储值、下次 `SetShadingRateNow` 生效 —— 所以本调用**必须**排在它之前。 */
@@ -260,7 +255,7 @@ object D3D12VariableShadingRate {
 
     /**
      * `b8` 的 `gVrsBand` = (近带外沿, 中带外沿, 远带速率, 启用位)，单位方块、相机相对；外沿每批次现读
-     * `[vrs]` 配置，改 TOML 下一帧生效。近带 1X1 / 中带 1X2 / 远带取 [terrainRateCap]（§3.2）。
+     * `[vrs]` 配置，改 TOML 下一帧生效。近带 1X1 / 中带 1X2 / 远带取 [terrainRateCap]。
      */
     @JvmStatic
     fun msBand(): FloatArray {
@@ -276,31 +271,26 @@ object D3D12VariableShadingRate {
         return value.get().toFloat()
     }
 
-    /** 近带外沿兜底值（方块）。 */
     private const val MS_NEAR_END: Float = 32.0f
 
-    /** 中带外沿兜底值（方块）。 */
     private const val MS_FAR_START: Float = 96.0f
 
-    /** `D3D12_SHADING_RATE_1X1`：全质量，也是 `scope()` 结束恢复的那一档。 */
+    /** `D3D12_SHADING_RATE_1X1` = 0x0：全质量，也是 `scope()` 结束恢复的那一档。 */
     private const val RATE_1X1: Int = 0x0
 
-    /** `D3D12_SHADING_RATE_1X2`：竖直方向减半。 */
+    /** `D3D12_SHADING_RATE_1X2` = 0x1：竖直方向减半。 */
     private const val RATE_1X2: Int = 0x1
 
-    /** `D3D12_SHADING_RATE_2X2`：四分之一的着色像素。 */
     private const val RATE_2X2: Int = 0x5
 
     /** `D3D12_SHADING_RATE_COMBINER_PASSTHROUGH`（取值与 `d3d12.h` 一致）。 */
     private const val COMBINER_PASSTHROUGH: Int = 0
 
-    /** `D3D12_SHADING_RATE_COMBINER_MIN`。 */
     private const val COMBINER_MIN: Int = 2
 
     /** F3 上的 VRS 行：档位开着但 `batches` 恒 0 ⇒ 作用域没走到，或 native 导出缺失。 */
     @JvmStatic
     fun debugLine(): String {
-        // 一行给出能力（tier/tile/extra）、判决者（图像 or 距离带）与计数，便于分辨"设了没效果"。
         val info = D3D12AdapterInfo.current
         val caps = "tier=${info?.shadingRateTier ?: 0} tile=${info?.shadingRateTileSize ?: 0}" +
             " extra=${if (info?.additionalShadingRates == true) 1 else 0}"
@@ -310,7 +300,6 @@ object D3D12VariableShadingRate {
         if (nativeRefused) {
             return "VRS: AUTO unsupported by this device (staying 1X1) | $caps"
         }
-        // cap 单列一段：它决定"允许粗到哪一档"，与"谁是判决者（图像 / 距离带）"是两件事。
         val cap = "cap=${rateName(terrainRateCap())}${if (SuperResolution.isEnabled()) "(sr)" else ""}"
         val judge = if (D3D12ShadingRateImage.isReady()) {
             "sri ${D3D12ShadingRateImage.tileSize()} imgs=$scopedImages" +
@@ -345,7 +334,6 @@ object D3D12VariableShadingRate {
             Illusion.LOGGER.warn("[${Illusion.MODID}] could not read $OPTIONS_KEY from $file", t)
             return
         }
-        // 文件里没有这一行（首跑 / 用户删过 / 刚从模组配置迁移过来）也要推一次，保持界面与 native 一致。
         push(OPTION.get())
         pushCombiners()
     }

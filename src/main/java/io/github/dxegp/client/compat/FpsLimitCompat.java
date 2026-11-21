@@ -9,11 +9,9 @@ import net.minecraft.client.InactivityFpsLimit;
 import net.minecraft.util.StringRepresentable;
 
 /**
- * 运行期往 {@code InactivityFpsLimit} 里补一个 NEVER 常量。
- *
- * <p>构造器描述符必须写满四参 {@code (String,int,String,String)} —— name / ordinal 由 javac 隐式加入。
- * 写字段用普通反射而非 VarHandle。这个类必须在 mixin 包之外：被注入的代码不能引用
- * {@code io.github.dxegp.mixin.*}（{@code IllegalClassLoadError}）。见 docs/misc/mixins-and-earlywindow.md §3.9</p>
+ * 运行期往 {@code InactivityFpsLimit} 里补一个 NEVER 常量。构造器描述符必须写满四参
+ * {@code (String,int,String,String)} —— name / ordinal 由 javac 隐式加入。这个类必须在 mixin 包之外：
+ * 被注入的代码不能引用 {@code io.github.dxegp.mixin.*}（{@code IllegalClassLoadError}）。
  */
 public final class FpsLimitCompat {
     private static volatile InactivityFpsLimit never;
@@ -37,7 +35,6 @@ public final class FpsLimitCompat {
         try {
             MethodHandles.Lookup lookup = MethodHandles.privateLookupIn(
                 InactivityFpsLimit.class, MethodHandles.lookup());
-            // 描述符是 (String,int,String,String)：少写就 NoSuchMethodException。
             MethodHandle ctor = lookup.findConstructor(InactivityFpsLimit.class, MethodType.methodType(
                 void.class, String.class, int.class, String.class, String.class));
 

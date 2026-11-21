@@ -21,8 +21,8 @@ enum class DlssFrameGeneration {
 }
 
 /**
- * `[sr] backend` — which super-resolution backend the abstraction layer drives; `id` is the number
- * handed to native, so do not renumber.
+ * `[sr] backend` — which super-resolution backend the abstraction layer drives; `id` is handed to
+ * native, so do not renumber.
  */
 enum class SrBackend(val id: Int) {
     NONE(0),
@@ -58,13 +58,11 @@ enum class RtMode {
 }
 
 /**
- * Every switch the player can change, in `config/dxr_mc-client.toml`; `D3D12Settings` resolves them
- * into one immutable snapshot.
- *
- * <p>**Changing a default means changing three places**: the `define*` default here, the `Snapshot`
- * fallback, and the `config(fallback)` argument in `build()`. `.gameRestart()` follows one rule:
- * read at the moment of use = hot-switchable, read before the device or swapchain exists = restart.
- * See docs/misc/settingscreen/README.md §2.4 / §5.1.
+ * Every switch the player can change, in `config/dxr_mc-client.toml`; `D3D12Settings` resolves them into one
+ * immutable snapshot.
+ * <p>**Changing a default means changing three places**: the `define*` default here, the `Snapshot` fallback, and the
+ * `config(fallback)` argument in `build()`. `.gameRestart()` only for values read before the device or swapchain
+ * exists; values read at the moment of use are hot-switchable.
  */
 object IllusionConfig {
     private val BUILDER = ModConfigSpec.Builder()
@@ -120,7 +118,7 @@ object IllusionConfig {
 
     /**
      * `[debug] pixCapture` — load PIX's GPU capture layer at startup. It hooks D3D12 from inside
-     * its own DLL, so it can only attach to devices created after it is loaded.
+     * its own DLL, so it only attaches to devices created after it is loaded.
      */
     val PIX_CAPTURE: ModConfigSpec.BooleanValue
 
@@ -129,7 +127,7 @@ object IllusionConfig {
     /** `[debug] pixCaptureFrames` — frames recorded by one key-press capture. */
     val PIX_CAPTURE_FRAMES: ModConfigSpec.IntValue
 
-    /** `[debug] pixDirectory` — empty means the default install locations; no env var (docs §5.3). */
+    /** `[debug] pixDirectory` — empty means the default install locations; never an env var. */
     val PIX_DIRECTORY: ModConfigSpec.ConfigValue<String>
 
     val DEBUG_LAYER: ModConfigSpec.BooleanValue
@@ -152,7 +150,7 @@ object IllusionConfig {
 
     val DUMP_HLSL: ModConfigSpec.BooleanValue
 
-    /** `[mesh] terrain` — the only terrain rasterization path (the IMR fallback was removed). */
+    /** `[mesh] terrain` — the only terrain rasterization path. */
     val MESH_TERRAIN: ModConfigSpec.BooleanValue
 
     /** `[mesh] terrainCull` — cull terrain meshlets in the amplification shader. */
@@ -639,6 +637,4 @@ object IllusionConfig {
 
     val SPEC: ModConfigSpec = BUILDER.build()
 }
-
-
 

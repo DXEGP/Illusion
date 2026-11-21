@@ -8,11 +8,9 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * D3D12 后端下吞掉多余的 GL SwapBuffers。
- *
- * <p>父窗口上只要有一条真的 SwapBuffers 过的 GL 交换链（哪怕只有第 0 帧一次），RTSS 就把 OSD 绑到那条
- * 链上、画进被 D3D12 子窗口整块盖住的内容里 —— OSD 一直在画，用户永远看不到。开关是
- * `[debug] skipGlSwap`（默认 false）。见 docs/misc/mixins-and-earlywindow.md §3.2
+ * D3D12 后端下吞掉多余的 GL SwapBuffers。父窗口上只要有一条真的 SwapBuffers 过的 GL 交换链（哪怕只有第 0 帧
+ * 一次），RTSS 就把 OSD 绑到那条链上、画进被 D3D12 子窗口整块盖住的内容里 —— OSD 一直在画，用户永远看不到。
+ * 开关是 `[debug] skipGlSwap`（默认 false）。
  */
 @Mixin(GlSurface.class)
 public class GlSurfacePresentMixin {

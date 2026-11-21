@@ -1,16 +1,14 @@
 package io.github.dxegp.diagnostics
 
-
 import io.github.dxegp.d3d12.shader.D3D12StackSampler
 import java.lang.management.ManagementFactory
 import java.util.Locale
 
 /**
  * 渲染线程分段计时：mixin 在目标方法 HEAD/RETURN 调 begin/end，每 [INTERVAL] 帧输出一次均值。
- *
- * 互操作硬约束：本类是 Java mixin 的埋点目标，它们以 `D3D12RenderProf.begin(x)` /
- * `D3D12RenderProf.RENDER_GROUP` 这种**静态**形式访问，所以方法必须 `@JvmStatic`、
- * 阶段常量必须 `const val`（普通 `val` 不会生成寄宿类静态字段，编译期就找不到）。
+ * 互操作硬约束：本类是 Java mixin 的埋点目标，它们以 `D3D12RenderProf.begin(x)` / `D3D12RenderProf.RENDER_GROUP`
+ * 这种**静态**形式访问，所以方法必须 `@JvmStatic`、阶段常量必须 `const val`（普通 `val` 不会生成寄宿类静态字段，
+ * 编译期就找不到）。
  */
 object D3D12RenderProf {
 
@@ -19,13 +17,6 @@ object D3D12RenderProf {
 
     private const val INTERVAL = 300
 
-    // 阶段编号约定（mixin 埋点目标）：0 FRAME=Minecraft.renderFrame 1 EXTRACT=GameRenderer.extract
-    // 2 RENDER=GameRenderer.render 3 WORLD=renderLevel（RENDER 子集） 4 GUI=GuiRenderer.render
-    // 5 BLIT=D3D12GpuSurface.blitFromTexture 6 PRESENT=present 7 SUBMIT_FEATURES=submitFeatures
-    // 8 PREPARE_CHUNKS=prepareChunkRenders 9 COMPILE_SECTIONS=compileSections 10 UPLOAD_TERRAIN
-    // 11 RENDER_GROUP=renderGroup（含 multidraw） 12 OCCLUSION=SectionOcclusionGraph.update
-    // 13 PREPARE_FEATURES=FeatureRenderDispatcher.prepareFrame 14 EXECUTE_FRAMEGRAPH
-    // 15 EXEC_FEATURES=PreparedFrame.executeSolid
     const val FRAME = 0
 
     const val EXTRACT = 1
@@ -72,7 +63,6 @@ object D3D12RenderProf {
     private var multiDrawCount = 0L
     private var multiDrawNanos = 0L
 
-    // 本区间内 GC 次数/耗时增量 + 当前堆占用，用于判断是否有分配风暴。
     private var gcCountBase = -1L
     private var gcTimeBase = -1L
 

@@ -22,12 +22,8 @@ import java.nio.file.Path
 import java.util.Locale
 
 /**
- * 按键驱动的 PIX timing capture（`[debug] pixTimingCapture`，默认 F9）：PIX 自己的计时捕获只写
- * `%TEMP%` 且文件名由它决定，要落到游戏目录、用玩家选的名字与长度，只能进程内起
- * PIXBeginCapture/PIXEndCapture（native 在自己的线程上调）。
- *
- * 每次按下开新文件，再按一次提前结束；帧预算在按下那一刻读配置，改配置不用重启。开关关闭时功能休眠。
- * 见 docs/misc/backend-and-device.md。
+ * 按键驱动的 PIX timing capture（`[debug] pixTimingCapture`，默认 F9）：每次按下开新文件，再按一次提前结束；
+ * 帧预算在按下那一刻读配置，改配置不用重启。开关关闭时功能休眠。
  */
 internal object D3D12PixCaptureController {
     private val LOGGER = LoggerFactory.getLogger("dxrmc")
@@ -181,8 +177,7 @@ internal object D3D12PixCaptureController {
     }
 
     /**
-     * 只有 `[DXEGP/PIX Capture]` 这个标签是紫色，后面的句子不是：样式会被子节点继承，
-     * 所以标签必须是消息的**兄弟**而不是父节点（见 [line]）。
+     * 只有 `[DXEGP/PIX Capture]` 这个标签是紫色：样式会被子节点继承，标签必须是消息的**兄弟**而不是父节点（见 [line]）。
      */
     private fun tag(): MutableComponent =
         Component.translatable(TRANSLATION_PREFIX).withStyle(ChatFormatting.LIGHT_PURPLE)
@@ -247,9 +242,8 @@ internal object D3D12PixCaptureController {
     }
 
     /**
-     * `run/pix/dxrmc-capture-<n>.wpix`，序号取自目录**已有什么**，不能用本会话的计数器：只有目录知道
-     * 之前几次启动写了什么，重用序号会覆盖还想要的 capture。`dxrmc-capture-*` 全部计入，不只 `.wpix`
-     * —— PIX 没写完的 capture 会留下 `-wal`/`-shm` 伴生文件，它们同样占用那个序号。
+     * `run/pix/dxrmc-capture-<n>.wpix`，序号取自目录**已有什么**（只有目录知道之前几次启动写了什么，重用会覆盖）：
+     * `dxrmc-capture-*` 全部计入，不只 `.wpix` —— 没写完的 capture 留下 `-wal`/`-shm` 伴生文件同样占用序号。
      */
     private fun nextCapturePath(): Path? {
         return try {

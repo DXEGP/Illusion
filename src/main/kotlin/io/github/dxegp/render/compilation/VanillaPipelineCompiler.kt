@@ -54,7 +54,7 @@ internal class VanillaPipelineCompiler(
     private var pipelineCache: MutableMap<RenderPipeline, D3D12CompiledRenderPipeline> = IdentityHashMap()
     /**
      * flipY 变体管线缓存（GUI 离屏 pass 专用）。键是值语义的 [FlipYKey]、每次调用新建实例，必须用
-     * HashMap 按 equals/hashCode 查；误用 IdentityHashMap 会永远 miss → 每帧重编译，帧率崩。
+     * HashMap 按 equals/hashCode 查；误用 IdentityHashMap 会永远 miss → 每帧重编译。
      */
     private var pipelineCacheFlipY: MutableMap<FlipYKey, D3D12CompiledRenderPipeline> = HashMap()
     private var pipelineSources = IdentityHashMap<RenderPipeline, ShaderSource?>()
@@ -365,8 +365,8 @@ internal class VanillaPipelineCompiler(
     }
 
     /**
-     * Resolve the published source for lazy variants without consulting registrations from a
-     * reload that is still being prepared. Dynamic frontend sources remain pipeline-specific.
+     * Resolve the published source for lazy variants without consulting registrations from a reload that is
+     * still being prepared. Dynamic frontend sources remain pipeline-specific.
      */
     private fun resolveShaderSource(pipeline: RenderPipeline): ShaderSource? {
         if (pipelineSources.containsKey(pipeline)) return pipelineSources[pipeline]
@@ -395,10 +395,7 @@ internal class VanillaPipelineCompiler(
     override fun compilePipeline(info: BackendRenderPipeline.CreateInfo, pipeline: RenderPipeline,
         source: ShaderSource?): BackendRenderPipeline.Pending {
         check(!closed) { "Pipeline compiler is closed" }
-        // setUniform(index) 的 index 就是 CreateInfo.uniforms 的下标（≠ flattenUniforms(bindGroupLayouts) 的顺序），
-        // 必须原样存下来，setPipeline 时按下标翻回名字。
         val uniformNames = info.uniforms().map { it.name() }
-        // 地形 uniform 名单/类型诊断：`[logging] logLevel` 调到 DEBUG 才出声。
         if (info.name().contains("terrain")) {
             val detail = info.uniforms().joinToString(", ") { "${it.name()}:${it.type()}" }
             IllusionLogger.debugMessage("uniforms ${info.name()}: [$detail]")
@@ -590,8 +587,6 @@ internal class VanillaPipelineCompiler(
 
     private fun compileShader(key: ShaderCompilationKey,
         shaderSource: ShaderSource?): D3D12IntermediaryShaderModule {
-        // 主源是 ShaderManager 的 compilationCache，首次 apply() 之前恒返回 null → 回退到 preloadUiShader 捕获的
-        // vanilla 包源，否则 LoadingOverlay 首帧画 mojang_logo 会因 INVALID 管线终结 JVM。
         val source = (if (shaderSource != null) {
             shaderSource.getShader(key.id, key.type)
         } else {
@@ -603,8 +598,6 @@ internal class VanillaPipelineCompiler(
             return D3D12IntermediaryShaderModule.INVALID
         }
         val sourceWithDefines = injectShaderDefines(source, key.defines)
-        // 26.3 的 `#include <minecraft:xxx.glsl>` 由官方 GlslCompiler 的 shaderc 回调解析；本自建链没有回调，
-        // 所以在这里文本展开（见 readShaderInclude）。
         val includeResolver: ((Identifier) -> String?)? = if (shaderSource != null) {
             { id -> readShaderInclude(shaderSource, id) ?: if (publishedShaderSource == null && pipelineReload == null)
                 D3D12FallbackShaderSource.getInclude(id) else null }
@@ -621,8 +614,7 @@ internal class VanillaPipelineCompiler(
     }
 
     /**
-     * 读一条 `#include`（`shaders/include/` 下）。资源重载的 ShaderSource 是当前事务的快照，必须
-     * 优先使用它；Minecraft.resourceManager 在准备阶段仍指向上一代资源，直接读取会混入旧源码。
+     * 读一条 `#include`（`shaders/include/` 下）。资源重载的 ShaderSource 是当前事务的快照，必须优先使用它；
      * 快照缺失时返回 null，让本次编译明确失败，而不是拼入旧资源。
      */
     private fun readShaderInclude(shaderSource: ShaderSource, id: Identifier): String? {
@@ -662,7 +654,6 @@ internal class VanillaPipelineCompiler(
                 ))
             }
         }
-        // 地形 slot/stepRate 诊断：26.3 把 ChunkPosition/ChunkVisibility 挪成逐实例属性（slot 1, stepRate=1）。
         if (pipeline.location.toString().contains("terrain")) {
             val slots = bindings.indices.joinToString(", ") { i ->
                 val fmt = bindings[i]
@@ -676,7 +667,7 @@ internal class VanillaPipelineCompiler(
 
     /**
      * 构建 `mcdr_dx12CreateGraphicsPipeline` 的 desc。FFM 下用 [MCDRPipelineDesc] 与 native 的
-     * `mcdr_pipeline_desc` 共享字段定义，布局漂移会在边界处失败（不再手工打包 ByteBuffer）。
+     * `mcdr_pipeline_desc` 共享字段定义，布局漂移会在边界处失败。
      */
     private fun buildNativeDesc(compiled: D3D12CompiledShader,
                                 pipeline: RenderPipeline, flipY: Boolean): MCDRPipelineDesc {
@@ -690,21 +681,16 @@ internal class VanillaPipelineCompiler(
             .shaders(compiled.vertexHlsl, compiled.fragmentHlsl)
 
         for (i in 0 until colorCount) {
-            // ColorTargetState 数组长度是 MAX_COLOR_TARGETS，未用槽位为 null，跳过即可。
             val target = colorTargets[i] ?: continue
             desc.addColorTarget(toColorTarget(target))
         }
 
         val loc = pipeline.location.toString()
         if (hasDepth) {
-            // flipY + /item_cutout + NEVER_PASS 的换向分支：NEVER_PASS 在客户端源码里无人使用，属死代码，
-            // 保留仅为不改变行为。深度问题再现时从 DepthStencilState 的实际取值与深度清屏值查起。
             var dss = pipeline.depthStencilState!!
             if (flipY && loc.contains("/item_cutout") && dss.depthTest() == CompareOp.NEVER_PASS) {
                 dss = DepthStencilState(CompareOp.GREATER_THAN_OR_EQUAL, dss.writeDepth())
             }
-            // 准星走带深度测试的 GUI 管线，而 GUI 目标深度清成 0.0（反向 Z 下即最远）→ GREATER 比较会整条丢弃。
-            // 准星是 2D 贴图，关掉深度测试既符合本意，也不影响世界内任何管线。
             if (loc.contains("pipeline/crosshair")) {
                 dss = DepthStencilState(CompareOp.ALWAYS_PASS, false)
             }
@@ -712,15 +698,12 @@ internal class VanillaPipelineCompiler(
         }
 
         var cull = pipeline.isCull
-        // shader Y-flip 会反转绕序（CCW→CW）：flipY 的 pass 里每条管线都注入了翻转 ⇒ 必须整体关剔除；
-        // 只可能「多画」，不会少画（白名单漏掉的 entity_translucent 会被背面剔除吃掉）。
         if (loc.contains("animate_sprite") || flipY) {
             cull = false
         }
         desc.topology(pipeline.primitiveTopology.ordinal, cull,
             pipeline.polygonMode.ordinal)
 
-        // 顺序：location, binding, format, offset, stride, stepRate, HLSL 语义
         for (i in 0 until inputElements.size) {
             val element = inputElements[i]
             desc.addInputElement(
@@ -734,7 +717,6 @@ internal class VanillaPipelineCompiler(
                 "LOC${element[0]}"))
         }
 
-        // type：0=CBV 1=SRV+sampler 2=SRV(texel)；reg = 条目序号，与 HLSL shader register 一一对应
         for (i in 0 until entries.size) {
             val type = when (entries[i].type) {
                 D3D12BindGroupEntry.Type.UNIFORM_BUFFER -> 0

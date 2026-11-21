@@ -9,8 +9,6 @@ import java.util.*
  * [current] 属于当前活的 D3D12 设备；GL/Vulkan 渲染时为 null —— F3 mixin 正是靠它决定是否追加 DXRMC 行。
  */
 class D3D12AdapterInfo private constructor(
-    // 字符串域取值：featureLevel ∈ "12_2"|"12_1"|"12_0"|"11_1"|"11_0"|"unknown"，
-    // deviceType ∈ "integrated"|"discrete"|"virtual"|"cpu"|"other"；driverVersion 空 = 无 DXCore。
     val name: String,
     val vendor: String,
     val vendorId: Int,
@@ -28,7 +26,6 @@ class D3D12AdapterInfo private constructor(
     val isDetachable: Boolean,
     val d3dcore: Boolean,
 
-    // VRS：tier 0 = 不支持；tileSize 0 = 没有 tier 2（SRI）；additional = 支持 2X4/4X2/4X4。
     val shadingRateTier: Int = 0,
 
     val shadingRateTileSize: Int = 0,
@@ -124,7 +121,7 @@ class D3D12AdapterInfo private constructor(
 
         /**
          * 解析 `mcdr_dx12EnumerateAdapters` 返回的 JSON **数组**：按 DXGI 优先序，列出所有能建
-         * D3D12 12_0 设备的适配器。Illusion 在模组构造期（活设备尚不存在时）读它。
+         * D3D12 12_0 设备的适配器。模组构造期（活设备尚不存在时）读它。
          */
         fun parseList(json: String?): List<D3D12AdapterInfo> {
             if (json == null) {
@@ -141,8 +138,7 @@ class D3D12AdapterInfo private constructor(
         }
 
         /**
-         * 扁平 `{"key": value}` 读取：native 从不发嵌套结构，单趟扫描即可。自己写而不引 Gson，
-         * 是因为 `ktc.ps1` 独立编译检查的 ad-hoc classpath 里没有 Gson。
+         * 扁平 `{"key": value}` 读取：native 从不发嵌套结构，单趟扫描即可。
          */
         private fun parseFlatObject(json: String?): Map<String, String> {
             if (json == null) {

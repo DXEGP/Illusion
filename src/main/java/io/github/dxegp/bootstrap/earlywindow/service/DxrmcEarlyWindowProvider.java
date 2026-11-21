@@ -34,10 +34,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 建 Minecraft 随后接管的那个 SDL 窗口，并把加载屏画进去。
- *
- * <p>加载屏用 AWT 合成、经 surface → texture 上屏，不自带字体/图像编解码依赖。
- * 必须待在独立的 early-service jar 里。见 docs/misc/mixins-and-earlywindow.md §5</p>
+ * 建 Minecraft 随后接管的那个 SDL 窗口，并把加载屏画进去。加载屏用 AWT 合成、经 surface → texture 上屏，
+ * 不自带字体/图像编解码依赖。必须待在独立的 early-service jar 里。
  */
 public final class DxrmcEarlyWindowProvider implements ImmediateWindowProvider {
     private static final Logger LOGGER = LoggerFactory.getLogger("dxrmc/earlywindow");
@@ -50,7 +48,6 @@ public final class DxrmcEarlyWindowProvider implements ImmediateWindowProvider {
     private static final String MOJANGLES_RESOURCE = "/assets/dxrmc/mojangles_ascii.png";
     private static final String CAPTION = "Initializing DirectX 12 backend...";
 
-    /** 进度条填充色。 */
     private static final Color BAR_FILL = new Color(0xC4, 0x6B, 0xFF);
     private static final Color BAR_TRACK = new Color(0x2E, 0x32, 0x38);
     private static final Color BACKGROUND = new Color(0x00, 0x00, 0x00);
@@ -168,7 +165,6 @@ public final class DxrmcEarlyWindowProvider implements ImmediateWindowProvider {
             g.setColor(BAR_FILL);
             g.fillRoundRect(margin, barY, filled, barHeight, barHeight, barHeight);
 
-            // 说明文字用原版字形表而不是系统字体，观感才和游戏内一致。
             int captionScale = Math.max(2, Math.round(height * 0.036f) / 8);
             drawMojangles(g, CAPTION, width, barY + barHeight + Math.round(18 * captionScale / 2f), captionScale);
         } finally {
@@ -332,7 +328,6 @@ public final class DxrmcEarlyWindowProvider implements ImmediateWindowProvider {
         WindowState state = snapshot();
         handedOver = true;
         if (lease == null || !lease.isClaimed()) {
-            // 非 D3D12：原版自己建了窗口，我们这扇不能当第二个窗口留在屏幕上。
             LOGGER.info("graphics backend is not D3D12 - dropping the early window, vanilla creates its own");
             close();
             return state;
@@ -376,7 +371,6 @@ public final class DxrmcEarlyWindowProvider implements ImmediateWindowProvider {
 
     @Override
     public void updateProgress(String label) {
-        // 说明文字固定：它描述的是正在初始化的后端。
     }
 
     @Override

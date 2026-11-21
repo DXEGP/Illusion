@@ -13,16 +13,12 @@ import net.neoforged.neoforge.client.gui.ConfigurationScreen
 import net.neoforged.neoforge.client.gui.IConfigScreenFactory
 
 /**
- * Client-only half of the mod.
- *
- * Loading this class on a dedicated server is impossible: `@Mod(dist = CLIENT)`
- * makes FML skip it entirely, so the client-only classes it references are
- * never touched server-side.
+ * Client-only half of the mod. `@Mod(dist = CLIENT)` makes FML skip this class on a dedicated server, so the
+ * client-only classes it references are never touched server-side.
  */
 @Mod(value = MODID, dist = [Dist.CLIENT])
 class IllusionClient(container: ModContainer) {
     init {
-        // Apply log level in the init stage in order to correctly start the logger.
         IllusionLogger.applyDefaults()
         RenderConfiguration.initialize()
         container.registerExtensionPoint(
@@ -32,10 +28,6 @@ class IllusionClient(container: ModContainer) {
 
         Illusion.LOGGER.info("[$MODID] $MOD_NAME Client setup: D3D12 backend is registered via PreferredGraphicsApiMixin; creation is driven by the vanilla backend-selection loop")
         D3D12ExitWatchdog.start()
-        // PIX timing capture on a key press: the binding has to be registered during mod loading,
-        // and the handler only runs on the client bus (this class never loads on a server).
-        // `eventBus` is null only for a mod that has no mod-bus events at all, which cannot happen
-        // here (the binding is one), but there is nothing to gain from crashing if it is.
         container.eventBus?.let {
             D3D12PixCaptureController.register(it)
         }

@@ -1,7 +1,7 @@
 package io.github.dxegp.render.terrain.mesh
 
 /**
- * 地形顶点解码代码生成（纯函数、不碰 GPU）：按 `VertexFormat` 把 28 B 顶点解成 mesh 入口字段。见 docs/mesh&vrs/README.md §2.4。
+ * 地形顶点解码代码生成（纯函数、不碰 GPU）：按 `VertexFormat` 把 28 B 顶点解成 mesh 入口字段。
  */
 object D3D12MeshVertexDecode {
 
@@ -39,8 +39,6 @@ object D3D12MeshVertexDecode {
     private fun parseGpuFormat(name: String): Triple<Int, Int, String> {
         val kind = name.substringAfterLast('_', "FLOAT")
         val head = name.substringBefore('_')
-        // 分量数 = max(字母个数, "R8G8B8A8" 的分组数) 压到 4；解成 4 分量的 float3 会生成
-        // `float3(t.x, t.y, t.z, t.w)` 而编译失败。不能按字符串长度或重复字母数算。
         val letters = head.count { it.isLetter() }
         val groups = Regex("[RGBA]\\d+").findAll(head).count()
         val count = maxOf(letters, groups, 1).coerceAtMost(4)

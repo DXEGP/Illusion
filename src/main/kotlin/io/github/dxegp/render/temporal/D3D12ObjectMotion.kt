@@ -9,21 +9,6 @@ import java.util.WeakHashMap
 import net.minecraft.client.renderer.entity.state.EntityRenderState
 import io.github.dxegp.render.frameprep.MotionGuideCoverage
 
-/**
- * Per-object motion vectors, CPU side: this frame's object snapshot collection.
- *
- * Per-object matrices are not available: the model matrix is baked into the vertices on the CPU and
- * `ModelViewMat` carries only the camera rotation, so the only usable delta is each object's own
- * world-space displacement.
- *
- * Rows hold world-space absolute positions. [D3D12Velocity] subtracts *this frame's* camera when it
- * builds the GPU buffer — subtracting any other frame's camera would inject the camera motion as
- * object velocity, while a static object under a static camera must stay at exactly zero.
- *
- * EntityRenderDispatcher extraction supplies final poses; only states in the level's actual render
- * list participate. Consecutive real render frames supply previous positions. The AABB association
- * remains approximate: this is not a per-pixel object/deformation motion guide.
- */
 object D3D12ObjectMotion {
     private val LOGGER = LoggerFactory.getLogger("dxrmc-objectmotion")
 
@@ -67,7 +52,8 @@ object D3D12ObjectMotion {
     )
 
     /**
-     * One object at world-space absolute position — the camera subtraction happens in [writeWorldRows].
+     * One object at world-space absolute position — the camera subtraction happens in [writeWorldRows],
+     * using this frame's camera only (any other frame's camera injects camera motion as object velocity).
      */
     private class Snapshot(
         val id: Int,
@@ -78,9 +64,7 @@ object D3D12ObjectMotion {
         val yaw: Float
     )
 
-    /**
-     * This frame's slots, deduplicated by [Entity.id] (a later write wins), so `size` == object count.
-     */
+    /** This frame's slots, deduplicated by `Entity.id` (a later write wins), so `size` == object count. */
     private val currentSnapshots: MutableMap<Int, Snapshot> = LinkedHashMap()
     private data class RenderPose(val entity: WeakReference<Entity>, val frame: Long,
         val x: Double, val y: Double, val z: Double)
@@ -154,8 +138,8 @@ object D3D12ObjectMotion {
     }
 
     /**
-     * Writes one row from the actual extracted position and the previous real frame's position.
-     * Half extents are floored at 0.01 so a zero-sized box still matches a pixel.
+     * Writes one row from the extracted position and the previous real frame's position. Half extents are
+     * floored at 0.01 so a zero-sized box still matches a pixel.
      */
     private fun harvest(entity: Entity, pose: ExtractedPose) {
         val id = entity.id
@@ -197,7 +181,6 @@ object D3D12ObjectMotion {
             halfX = halfWidth,
             halfY = halfHeight,
             halfZ = halfWidth,
-            // The render origin is the feet, while the shader wants the box centre.
             centerYOffset = halfHeight,
             yaw = 0.0f
         )
@@ -232,9 +215,8 @@ object D3D12ObjectMotion {
 
     /**
      * Writes this frame's rows into [target] (rows = `target.size / ROW_FLOATS`) and returns the count
-     * actually written. [cameraX]/[cameraY]/[cameraZ] must be this frame's camera.
-     * [currentSnapshots] rolls into [writeSnapshots] only once per frame — otherwise the second
-     * serialization of the frame would read empty slots and report 0 rows.
+     * written. [cameraX]/[cameraY]/[cameraZ] must be this frame's camera; the snapshot rolls only once per
+     * frame, otherwise the second serialization reads empty slots and reports 0 rows.
      */
     @Synchronized
     fun writeWorldRows(target: FloatArray, cameraX: Double, cameraY: Double, cameraZ: Double): Int {
@@ -256,7 +238,6 @@ object D3D12ObjectMotion {
             val offset = written * ROW_FLOATS
             target[offset + FIELD_ID] = snapshot.id.toFloat()
             target[offset + FIELD_CUR_X] = (snapshot.currX - cameraX).toFloat()
-            // Lift to the box centre: the shader treats this Y as the centre, not the feet.
             target[offset + FIELD_CUR_Y] = (snapshot.currY - cameraY + snapshot.centerYOffset).toFloat()
             target[offset + FIELD_CUR_Z] = (snapshot.currZ - cameraZ).toFloat()
             target[offset + FIELD_PREV_X] = (snapshot.prevX - cameraX).toFloat()

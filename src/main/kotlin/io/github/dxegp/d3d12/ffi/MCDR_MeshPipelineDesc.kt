@@ -6,12 +6,10 @@ import java.lang.foreign.MemorySegment
 import java.lang.foreign.ValueLayout
 
 /**
- * Structured mirror of `mcdr_mesh_pipeline_desc` (see docs/misc/ffm-abi.md §1.5).
- *
- * <p>The three blobs are **DXIL bytecode**, not HLSL: D3DCompile stops at SM 5.1, so the native side
- * compiles through DXC. No input layout and no topology — a mesh pipeline has no input assembler,
- * `PrimitiveTopologyType` is fixed to TRIANGLE. Colour-target and binding lists reuse
- * [MCDRPipelineDesc.ColorTarget] / [MCDRPipelineDesc.Binding] unchanged.
+ * Structured mirror of `mcdr_mesh_pipeline_desc`.
+ * <p>The three blobs are **DXIL bytecode**, not HLSL: the native side compiles through DXC. No input layout and no
+ * topology — a mesh pipeline has no input assembler, `PrimitiveTopologyType` is fixed to TRIANGLE. Colour-target and
+ * binding lists reuse [MCDRPipelineDesc.ColorTarget] / [MCDRPipelineDesc.Binding] unchanged.
  */
 class MCDRMeshPipelineDesc {
 
@@ -19,8 +17,6 @@ class MCDRMeshPipelineDesc {
         /** Upper bounds mirrored from the native validator. */
         const val MAX_COLOR_TARGETS = 8
         const val MAX_BINDINGS = 64
-
-        // Field offsets, resolved once from the shared layout; never literals.
 
         private val OFF_AS_DATA: Long = offMesh("asData")
         private val OFF_AS_LEN: Long = offMesh("asLen")
@@ -71,9 +67,6 @@ class MCDRMeshPipelineDesc {
         private fun offBinding(name: String): Long = offIn(MCDRLayout.PIPELINE_BINDING, name)
     }
 
-    // Shader bytecode: `msDxil` is required; empty `asDxil` = no amplification stage,
-    // empty `psDxil` = no pixel shader (nothing is written to the colour targets).
-
     var asDxil: ByteArray? = null
     var msDxil: ByteArray? = null
     var psDxil: ByteArray? = null
@@ -89,8 +82,6 @@ class MCDRMeshPipelineDesc {
 
     val colorTargets: MutableList<MCDRPipelineDesc.ColorTarget> = ArrayList()
     val bindings: MutableList<MCDRPipelineDesc.Binding> = ArrayList()
-
-    // Fluent builders.
 
     fun shaders(meshDxil: ByteArray?, amplificationDxil: ByteArray?, pixelDxil: ByteArray?): MCDRMeshPipelineDesc {
         this.msDxil = meshDxil

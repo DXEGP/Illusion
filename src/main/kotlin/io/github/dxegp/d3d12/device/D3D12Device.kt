@@ -42,7 +42,6 @@ import java.util.function.Supplier
 /**
  * vanilla [GpuDeviceBackend] 的 D3D12 实现：创建资源，并委托管线编译与命令录制。
  * 一个设备只有一个共享 [D3D12CommandEncoderBackend]；失败即崩、不回退。
- * 见 docs/misc/backend-and-device.md §3.1。
  */
 class D3D12Device internal constructor(
     private val commandRecordingFactory: D3D12CommandRecordingFactory,
@@ -51,10 +50,7 @@ class D3D12Device internal constructor(
 ) : GpuDeviceBackend {
     private val deviceInfo: DeviceInfo
 
-    // 共享 CommandEncoder：createCommandEncoder() 每次返回同一实例（blit 与 submit 同 encoder、
-    // 整帧一次提交）。每次 new 独立 ctx 会让 submit 提交空列表 → backbuffer 呈现未初始化垃圾。
     private var sharedCommandEncoder: D3D12CommandEncoderBackend? = null
-    // 同一实例登记到伴生对象，供帧中后处理（世界层 SMAA）取用。
 
     init {
         val probe = MCDR_ABI.ID3D12CreateDevice()
@@ -63,7 +59,6 @@ class D3D12Device internal constructor(
         if (frequency == 0L) {
             LOGGER.warn("GetTimestampFrequency returned 0; timestampPeriod=1.0")
         }
-        // 适配器信息取自 DXGI/DXCore（F3 与系统信息行读 D3D12AdapterInfo.current）；查询失败保持 null。
         val nativeInfo = D3D12AdapterInfo.parse(MCDR_ABI.ID3D12GetAdapterInfo())
         if (nativeInfo !== D3D12AdapterInfo.UNKNOWN) {
             D3D12AdapterInfo.current = nativeInfo
@@ -83,7 +78,6 @@ class D3D12Device internal constructor(
         return D3D12GpuSampler(addressModeU, addressModeV, minFilter, magFilter, maxAnisotropy, maxLod)
     }
 
-    // 26.3 的 backend SPI 只保留 String 版 createTexture 与带 mip 范围的 createTextureView，其余是内部重载。
     fun createTexture(label: Supplier<String>?, usage: @GpuTexture.Usage Int,
         format: GpuFormat, width: Int, height: Int, depthOrLayers: Int, mipLevels: Int): GpuTexture {
         val name = label?.get() ?: ""
@@ -111,14 +105,12 @@ class D3D12Device internal constructor(
     }
 
     override fun createBuffer(label: Supplier<String>?, usage: @GpuBuffer.Usage Int, size: Long): GpuBuffer {
-        // 保留 label：UBO 身份识别用（见 D3D12GpuBuffer.label）。
         val name = label?.get() ?: ""
         return D3D12GpuBuffer(usage, size, name)
     }
 
     override fun createBuffer(label: Supplier<String>?, usage: @GpuBuffer.Usage Int,
         data: ByteBuffer): GpuBuffer {
-        // 镜像官方 VulkanDevice.createBuffer(data)：带 COPY_DST 分配后经命令编码器上传。
         val buffer = this.createBuffer(label, usage or GpuBuffer.USAGE_COPY_DST, data.remaining().toLong())
         val encoder = D3D12CommandEncoderBackend(null, commandRecordingFactory.create(D3D12CommandScope.UPLOAD))
         try {
@@ -132,7 +124,7 @@ class D3D12Device internal constructor(
 
     /**
      * SDL3 窗口句柄（`SDL_Window*`）→ HWND 由 `SDL_PROP_WINDOW_WIN32_HWND_POINTER` 取，跨 FFM 边界仍是一个
-     * `uint64_t`。`isIconified` 是 26.3 新参，建 surface 用不到（最小化由游戏自己判断）。
+     * `uint64_t`。`isIconified` 建 surface 用不到（最小化由游戏自己判断）。
      */
     override fun createSurface(windowHandle: Long, isIconified: BooleanSupplier): GpuSurfaceBackend {
         val hwnd = win32Hwnd(windowHandle)
@@ -152,7 +144,6 @@ class D3D12Device internal constructor(
     }
 
     override fun createCommandEncoder(): CommandEncoderBackend {
-        // 共享单例：全帧 blit/绘制/submit 落同一 CommandContext。
         var encoder = this.sharedCommandEncoder
         if (encoder == null) {
             encoder = D3D12CommandEncoderBackend(this, commandRecordingFactory.create(D3D12CommandScope.FRAME))
@@ -188,8 +179,6 @@ class D3D12Device internal constructor(
     }
     @Synchronized
     override fun close() {
-        // 先销毁共享 encoder 再清管线缓存。encoder.close() 对共享 encoder **不**调
-        // dx12DestroyCommandEncoder（避免 CubeMap.render() 内部 close 顺手销毁 ctx），所以这里显式销毁。
         val closeStarted = System.nanoTime()
         IllusionLogger.debugMessage("device.close: enter")
         val encoder = this.sharedCommandEncoder
@@ -199,7 +188,7 @@ class D3D12Device internal constructor(
             this.sharedCommandEncoder = null
         }
         IllusionLogger.debugMessage("device.close: encoder done")
-        sharedEncoderForFrame = null  // 帧中后处理不能再摸到已销毁的 ctx
+        sharedEncoderForFrame = null
         commandRecordingFactory.close()
         pipelines.close()
         IllusionLogger.debugMessage("device.close: cache+compiler done")
@@ -207,11 +196,8 @@ class D3D12Device internal constructor(
         check(MCDR_ABI.D3D12DestroyAsyncRenderer()) { "Async renderer still owns GPU work" }
         IllusionLogger.debugMessage("device.close: async renderer done")
         val asyncMs = (System.nanoTime() - asyncStarted) / 1_000_000
-        // 必须趁 DXGI/D3D12 仍存活时显式释放设备：留给 DLL_PROCESS_DETACH 会让 ComPtr::Release()
-        // 在 dxgi.dll 已 detach 后执行 → 原生异常，退出码变成 2170。
         check(MCDR_ABI.D3D12DestroyDevice()) { "Device still owns pending work: ${MCDR_ABI.D3D12LastError()}" }
         initialized = false
-        // 清掉适配器信息：F3 与系统信息行按它非空决定是否显示 DX12 行。
         D3D12AdapterInfo.current = null
         IllusionLogger.debugMessage(
             "D3D12Device.close took ${(System.nanoTime() - closeStarted) / 1_000_000} ms" +
@@ -222,7 +208,6 @@ class D3D12Device internal constructor(
     companion object {
         private val LOGGER: Logger = LoggerFactory.getLogger("dxrmc")
 
-        /** 标记 DX12 后端是否已成功初始化。 */
         @Volatile
         private var initialized: Boolean = false
 
@@ -232,8 +217,7 @@ class D3D12Device internal constructor(
         }
 
         /**
-         * 整帧共享的 CommandEncoder（[createCommandEncoder] 里登记、close() 里清空）。官方 GpuDevice 不暴露
-         * backend、`CommandEncoder.backend()` 是 protected，Java 侧要靠这个出口在帧中间追加后处理。
+         * 整帧共享的 CommandEncoder（[createCommandEncoder] 里登记、close() 里清空）；Java 侧靠这个出口在帧中间追加后处理。
          * null = 设备未起或已销毁，调用方直接跳过。
          */
         @Volatile
@@ -265,7 +249,7 @@ class D3D12Device internal constructor(
                 name,
                 if (haveNative) nativeInfo.vendorName() else "D3D12 Unknown",
                 if (haveNative) nativeInfo.driverInfo() else "MCDR D3D12 Driver",
-                true,                                       // D3D12 NDC depth is 0..1
+                true,
                 if (haveNative) nativeInfo.backendName() else "DirectX 12",
                 timestampPeriod,
                 DeviceLimits(16, 256, 16384, Long.MAX_VALUE, 4096, 8, 65536),

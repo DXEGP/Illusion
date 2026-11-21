@@ -9,9 +9,7 @@ import io.github.dxegp.d3d12.resource.D3D12GpuTexture
 
 /**
  * TAA / DLAA / DLSS 共用的后置锐化：5-tap unsharp，native 一条全屏 pass。
- *
- * 绝不写回 TAA 历史（否则锐化逐帧递归叠加、振铃）；native 拒绝 `src == dst`，
- * 就地锐化必须走第二张同尺寸纹理。机制见 docs/antialiasing/README.md §7。
+ * 绝不写回 TAA 历史（否则锐化逐帧递归叠加、振铃）；native 拒绝 `src == dst`，就地锐化必须走第二张同尺寸纹理。
  */
 object D3D12PostSharpen {
     /** 独立 logger：`Illusion.LOGGER` 的 INFO 在这套 log4j 配置下不进日志。 */
@@ -23,7 +21,6 @@ object D3D12PostSharpen {
     /** TAA 默认强度：resolve 本身低通，比 DLAA 软，同一个 0.67 不够。 */
     const val TAA_AMOUNT: Float = 0.816f
 
-    /** DLAA / DLSS 强度，来自配置 `[renderer] sharpenAmount`。 */
     @JvmField
     val amount: Float = D3D12Settings.sharpenAmount
 
@@ -116,7 +113,6 @@ object D3D12PostSharpen {
 
     /**
      * 2 趟锐化的中间纹理，按需创建、尺寸变化重建。只在渲染线程调用。
-     *
      * 只有 DLAA / DLSS 用得到：输出直接落在目标上，而同资源不能就地锐化。
      */
     @JvmStatic

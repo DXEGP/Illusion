@@ -17,8 +17,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import java.util.function.Supplier;
 
 /**
- * 只把标题等于 {@code VIDEO} 的那个按钮换成自绘视频设置界面，其余原样返回。
- * 判据 {@link D3D12HdrPresentation#isAvailable()} 只在 D3D12 设备建起来后为真，回退到原版后端时仍走原版界面。
+ * 只把标题等于 {@code VIDEO} 的那个按钮换成自绘视频设置界面，其余原样返回。判据
+ * {@link D3D12HdrPresentation#isAvailable()} 只在 D3D12 设备建起来后为真，回退到原版后端时仍走原版界面。
  */
 @Mixin(OptionsScreen.class)
 public abstract class OptionsScreenVideoMixin {

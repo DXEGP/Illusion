@@ -201,7 +201,6 @@ internal object D3D12OitTileBinning {
         var prefixPipeline = 0L
         var scatterPipeline = 0L
         try {
-            // Allow one backing allocation for each of the three native command-list slots.
             val backingBudget = 3L * 8L * 1024L * 1024L
             graph = MCDR_ABI.D3D12CreateWorkGraph(node, "IllusionTileBinning", program.nodeEntry,
                 16, rootBindings, backingBudget)
@@ -382,7 +381,6 @@ internal object D3D12OitTileShader {
             it === RenderPipelines.OIT_CLOUDS || it === RenderPipelines.OIT_FLAT_CLOUDS
         } && pipeline.vertexFormatBindings.all { it == null } && shader.vertexInputs.isEmpty() &&
             shader.entries.count { it.type == D3D12BindGroupEntry.Type.TEXEL_BUFFER && it.name == "CloudFaces" } == 1
-        // 无 VB 的原版 cloud 保留原 draw 的 VertexID；其余 IA 仍会重定位顶点范围。
         if (Regex("\\b(?:SV_StartVertexLocation|SV_StartInstanceLocation)\\b",
                 RegexOption.IGNORE_CASE).containsMatchIn(shader.vertexHlsl) ||
             !cloudVertexPulling && Regex("\\bSV_VertexID\\b", RegexOption.IGNORE_CASE).containsMatchIn(shader.vertexHlsl))
@@ -414,7 +412,6 @@ internal object D3D12OitTileShader {
                 fragmentEntry.match.value.replaceFirst("(${fragmentEntry.match.groupValues[2]})",
                     "(${fragmentArguments.joinToString(", ")})") +
                     "\n    McdrTileSlot = McdrTileIaSlice;")
-            // IA 专用第 4 个常量选择实例路由；mesh/逐 tile 合同仍使用原始常量布局。
             val batchPrelude = "#define MCDR_TILE_IA_INSTANCE_BATCH_V1 1\nstatic uint McdrTileSlot = 0u;\n"
             directVertex = batchPrelude + directVertex.replace("uint McdrTileSlot;", "uint McdrTileRootSlot;")
                 .replace("McdrTileVisibleMeshlet", "McdrTileIaRouteFlags")
@@ -523,7 +520,6 @@ internal object D3D12OitTileShader {
     }
 
     fun routeTerrainMesh(source: String, fragment: String, laneRegisters: List<Int>): D3D12OitTileMeshCompilation {
-        // The generated mesh shader and envelope both reuse the source VS declarations.
         if (declaresLaneSrv(source, laneRegisters) || declaresLaneSrv(fragment, laneRegisters))
             return D3D12OitTileMeshCompilation.Unsupported(D3D12OitTileUnsupported.RESERVED_BINDING)
         val meshlet = "uint meshletId = gVisibleBase + gid.x + gid.y * 256u;"

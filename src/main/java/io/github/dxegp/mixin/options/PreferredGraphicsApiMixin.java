@@ -17,11 +17,8 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * 在原版图形后端枚举尾部（Vulkan 之后）追加 D3D12，使循环按钮变成四项。
- *
- * <p>常量必须用 {@code @Invoker("<init>")} 现造，造完必须重建 {@code CODEC} ——
- * {@code StringRepresentable.fromEnum} 快照的是当时那个数组。未选中 D3D12 时不改原版行为。
- * 见 docs/misc/mixins-and-earlywindow.md §3.7</p>
+ * 在原版图形后端枚举尾部（Vulkan 之后）追加 D3D12，使循环按钮变成四项；未选中 D3D12 时不改原版行为。常量必须用
+ * {@code @Invoker("<init>")} 现造，造完必须重建 {@code CODEC} —— {@code StringRepresentable.fromEnum} 快照的是当时那个数组。
  */
 @Mixin(PreferredGraphicsApi.class)
 public abstract class PreferredGraphicsApiMixin {

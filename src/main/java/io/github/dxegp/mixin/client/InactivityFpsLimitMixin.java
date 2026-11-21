@@ -9,9 +9,8 @@ import org.spongepowered.asm.mixin.Shadow;
 
 /**
  * 让 {@code InactivityFpsLimit.CODEC} 与 {@code $VALUES} 可写，供 {@code FpsLimitCompat} 插入 NEVER。
- *
- * <p>必须是 Java：{@code @Shadow} 的 static 字段在 Kotlin 里只能靠 {@code @JvmField}，带初始化器会被并进
- * 目标类的 {@code <clinit>} 把 CODEC 覆盖成 null。见 docs/misc/mixins-and-earlywindow.md §3.9</p>
+ * 必须是 Java：{@code @Shadow} 的 static 字段在 Kotlin 里只能靠 {@code @JvmField}，带初始化器会被并进
+ * 目标类的 {@code <clinit>} 把 CODEC 覆盖成 null。
  */
 @Mixin(InactivityFpsLimit.class)
 public class InactivityFpsLimitMixin {

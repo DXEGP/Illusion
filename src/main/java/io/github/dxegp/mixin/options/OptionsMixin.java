@@ -24,11 +24,9 @@ import org.spongepowered.asm.mixin.injection.ModifyArg;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * 给追加的 D3D12 后端条目补上和 Vulkan 同样的「实验性」tooltip。
- *
- * <p>必须挂七参 {@code OptionInstance} 构造（图形选项用的就是这个重载），且包装器要写成**原始类型**
- * {@code TooltipSupplier}：泛型 lambda 会对非图形选项 emit {@code checkcast}，一次 ClassCastException
- * 就够让游戏起不来。见 docs/misc/mixins-and-earlywindow.md §3.7</p>
+ * 给追加的 D3D12 后端条目补上和 Vulkan 同样的「实验性」tooltip。必须挂七参 {@code OptionInstance} 构造（图形
+ * 选项用的就是这个重载），且包装器要写成**原始类型** {@code TooltipSupplier}：泛型 lambda 会对非图形选项 emit
+ * {@code checkcast}，一次 ClassCastException 就够让游戏起不来。
  */
 @Mixin(Options.class)
 public abstract class OptionsMixin {
@@ -68,8 +66,6 @@ public abstract class OptionsMixin {
             return Tooltip.create(CommonComponents.joinLines(lines));
         };
     }
-
-
 
     @Unique
     private boolean dxrmc$fpsNeverInstalled;

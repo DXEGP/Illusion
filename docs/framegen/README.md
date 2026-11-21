@@ -139,7 +139,7 @@ GameRenderer.render
 
 provider/交换链在 display begin 准备，避免晚期重建使当帧资源失效。SDK 接受在 GUI 完成、冻结输入与同帧 validity 通过核对后发生；接受、最终提交、真实 Present 分别推进。guide 的中间提交保留同一 context 与 GuiReady，保存 fence 后换 ring 续录，不等待 guide 完成、不创建最终 Present ticket。最终异步 Present 携带不可变 `FgPresentTicket`，按 context、provider generation、frame identity 和 fence 配对，成功后提交历史。
 
-Minecraft.renderFrame HEAD 只记录帧开始时间，之后才 window configure；窗口目标和配置在 beginDisplayFrame 内依次更新。当前构建与运行覆盖见 [实施记录](../rendering/work-graph-implementation.md#当前构建与运行)。
+Minecraft.renderFrame HEAD 只记录帧开始时间，之后才 window configure；窗口目标和配置在 beginDisplayFrame 内依次更新。
 
 显示 Prepare/Submit 两阶段已接线，最终裁决仍有一次同帧 GPU→CPU 等待/回读；与 CPU GUI 录制重叠后的吞吐与延迟成本尚未测量。配置事务的 FG Prepare 与显示帧 Prepare 是两个入口：前者的 0 表示先前显示帧、录制、Present 或 provider 输入尚未退休，-3 表示 SDK 不支持或参数档位拒绝；显示帧 Prepare/Submit 的返回值、ABI11、coverage 编码和跳过条件见 [FFM ABI](../misc/ffm-abi.md)。
 

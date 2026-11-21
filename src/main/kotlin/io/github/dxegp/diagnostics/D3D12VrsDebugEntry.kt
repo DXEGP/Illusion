@@ -13,11 +13,9 @@ import net.neoforged.bus.api.IEventBus
 import net.neoforged.neoforge.client.event.RegisterDebugEntriesEvent
 
 /**
- * F3 的 VRS 诊断行，注册成一等的 debug entry（`dxr_mc:vrs`）：玩家在 F3+F6 的
- * DebugOptionsScreen 里自己开关，选择会存进 `run/debug-profile.json`。
- * 注册必须走 [RegisterDebugEntriesEvent]：`DebugScreenEntries.register` 是 private。
- * 不覆写 `isAllowed`：沿用接口默认，reduced debug info 会把这一行一起藏掉。
- * 见 docs/misc/debug-and-crash.md §6。
+ * F3 的 VRS 诊断行，注册成一等的 debug entry（`dxr_mc:vrs`）：玩家在 F3+F6 的 DebugOptionsScreen 里自己开关，
+ * 选择会存进 `run/debug-profile.json`。注册必须走 [RegisterDebugEntriesEvent]：`DebugScreenEntries.register` 是
+ * private。不覆写 `isAllowed`：沿用接口默认，reduced debug info 会把这一行一起藏掉。
  */
 object D3D12VrsDebugEntry : DebugScreenEntry {
     /** `dxr_mc:vrs`；debug-profile.json 里就用这个名字存状态。 */

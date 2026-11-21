@@ -79,7 +79,7 @@ native command context 持有命令列表、allocator、descriptor pages 与 rec
 
 ### 2.2 持有关系与释放责任
 
-当前 JVM 已移除无调用方的 `D3D12AsyncContext`、bundle/executor/prepass/分区描述符包装及相关录制配置。Native ABI7 的公开 bundle/allocator/executor 导出和实现仍为外部兼容保留；它们不代表当前原版绘制启用了 bundle worker。实际路径和验证边界见 [Work Graph 实施记录](../rendering/work-graph-implementation.md)。
+当前 JVM 已移除无调用方的 `D3D12AsyncContext`、bundle/executor/prepass/分区描述符包装及相关录制配置。Native ABI7 的公开 bundle/allocator/executor 导出和实现仍为外部兼容保留；它们不代表当前原版绘制启用了 bundle worker。
 
 | 对象 | 由谁创建 | 谁长期持有 | 谁负责销毁 | 实际释放时机 |
 | --- | --- | --- | --- | --- |

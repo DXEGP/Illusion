@@ -1,9 +1,9 @@
 # 原版路径的 D3D12 架构与改进
 
 本页描述 NeoForge 26.3 / RenderPearl backend SPI 的当前原版光栅架构、实际职责与剩余边界。
-当前实现、剩余边界与验证证据以 [Work Graph 实施记录](../rendering/work-graph-implementation.md) 为准。本页的源码描述不构成 CPU/GPU 性能测量。
+本页描述当前实现、剩余边界与验证证据；源码描述不构成 CPU/GPU 性能测量。
 
-目标架构与实施工作包见 [原版光栅 Work Graph 优化方案](../rendering/vanilla-work-graph-plan.md)。
+目标架构与实施工作包见 [原版光栅 Work Graph 优化方案](../../plan/vanilla-work-graph.md)。
 
 ## 1. 实际分层
 
@@ -93,13 +93,13 @@ naga 前端与最终 DXIL 都已有处理/缓存环节；native DXIL 磁盘缓�
 
 ## 5. 当前剩余边界
 
-当前源码为 ABI11、世界 schema2、显示 schema2，显示帧 672 字节布局保持不变；mesh 描述符为 104 字节，显式携带 raw MRT 标记。JVM 在世界渲染前冻结实际相机、投影、jitter、真实开始时间、尺寸和配置，native 同步复制完整帧；实际 depth/motion/exposure/mask 录制完成后只发布一次 PreparedFrame，在手部和晚期效果之前完成世界 AA/SR。SceneDisplay 继续承接手部/后处理，UiDisplay 单独绘制 GUI；显示输入按 GUI 前 Prepare、GUI 后 Submit 两阶段接线，具体冻结值、独立 coverage、fence 与返回值契约见 [FFM ABI](ffm-abi.md)。公开的独立每帧 SDK 参数入口已删除，配套构建和运行覆盖见[实施记录](../rendering/work-graph-implementation.md#当前构建与运行)。
+当前源码为 ABI11、世界 schema2、显示 schema2，显示帧 672 字节布局保持不变；mesh 描述符为 104 字节，显式携带 raw MRT 标记。JVM 在世界渲染前冻结实际相机、投影、jitter、真实开始时间、尺寸和配置，native 同步复制完整帧；实际 depth/motion/exposure/mask 录制完成后只发布一次 PreparedFrame，在手部和晚期效果之前完成世界 AA/SR。SceneDisplay 继续承接手部/后处理，UiDisplay 单独绘制 GUI；显示输入按 GUI 前 Prepare、GUI 后 Submit 两阶段接线，具体冻结值、独立 coverage、fence 与返回值契约见 [FFM ABI](ffm-abi.md)。公开的独立每帧 SDK 参数入口已删除。
 
 通用 device/encoder/pass 通过构造注入的 compiler、录制会话和 policy 接收业务策略。terrain 驻留归每个会话，随 command context 完成后释放；地形采样器由录制工厂在 encoder 完成后释放。提交模式由 Backend 读取配置后作为枚举传入设备。pipeline 分类、地形/motion/VRS 策略、源码缓存与重载事务都留在业务域。`checkD3D12Dependencies` 在编译前拒绝 device、command、编译产物/转换缓存和 FFM 核心文件对 render/config 的直接依赖，Backend 负责组合实际业务实现。
 
-当前已接入普通 direct / multiDraw / indirect 输入声明和紧凑资源调度，AA/SR/FG 共享冻结帧与已发布准备输入。世界与 viewmodel 分别拥有运动和 coverage；实体、持物、粒子、天空/天体及透明贡献的当前来源范围集中见[实施记录](../rendering/work-graph-implementation.md#abi10-运动来源与像素贡献)，完整 guides 仍有明确缺口。SDK 全面质量与性能结果尚未建立。
+当前已接入普通 direct / multiDraw / indirect 输入声明和紧凑资源调度，AA/SR/FG 共享冻结帧与已发布准备输入。世界与 viewmodel 分别拥有运动和 coverage；实体、持物、粒子、天空/天体及透明贡献各有来源范围，完整 guides 仍有明确缺口。SDK 全面质量与性能结果尚未建立。
 
-CPU 提交握手与 GPU fence 完成继续是不同生命周期事件。保留的 native bundle/executor ABI7 实现为外部兼容服务，当前 JVM 不创建其 owner；实际设备 AsyncRenderer 与 encoder 的提交/退休路径独立保留。当前实施及具体场景证据统一见 [Work Graph 实施记录](../rendering/work-graph-implementation.md)，后续设计和工作包见 [主计划](../rendering/vanilla-work-graph-plan.md)。
+CPU 提交握手与 GPU fence 完成继续是不同生命周期事件。保留的 native bundle/executor ABI7 实现为外部兼容服务，当前 JVM 不创建其 owner；实际设备 AsyncRenderer 与 encoder 的提交/退休路径独立保留。后续设计和工作包见 [主计划](../../plan/vanilla-work-graph.md)。
 
 ## 6. 当前源码职责导航
 
@@ -119,4 +119,4 @@ CPU 提交握手与 GPU fence 完成继续是不同生命周期事件。保留�
 | 相邻 MCDR `src/render/vanilla/vanilla_pass_scheduler.h` | 实际 subresource 访问 frontier 与资源依赖 |
 | 相邻 MCDR `src/backend/device/d3d12_device.cpp` | 实际资源/view 元数据、D3D12 状态/绑定/队列和 context 生命周期 |
 
-JVM 路径均相对 `src/main/kotlin/io/github/dxegp/`。表中列出职责入口，不使用会随实现变动而失效的旧审计行号。Redstone 业务边界另见 [redstone plan.md](<../rendering/redstone plan.md>)。
+JVM 路径均相对 `src/main/kotlin/io/github/dxegp/`。表中列出职责入口，不使用会随实现变动而失效的旧审计行号。Redstone 业务边界另见 [redstone.md](<../../plan/redstone.md>)。

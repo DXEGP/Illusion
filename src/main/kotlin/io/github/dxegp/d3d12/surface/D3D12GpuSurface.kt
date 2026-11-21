@@ -61,7 +61,6 @@ class D3D12GpuSurface(hwnd: Long) : GpuSurfaceBackend {
         this.acquireDeferred = false
         this.acquireDeferredFailed = false
         this.blitSkipped = false
-        // 不再用 DXGI 独占（SetFullscreenState）：链建好后再切会卡死 Present、锁住 Alt+Tab。交给 SDL 切显示模式。
         val ok = MCDR_ABI.D3D12ConfigureSurface(this.handle, config.width(), config.height(),
             config.presentMode().ordinal)
         IllusionLogger.debugMessage("configureSurface: ${config.width()}x${config.height()}"
@@ -72,14 +71,12 @@ class D3D12GpuSurface(hwnd: Long) : GpuSurfaceBackend {
         }
     }
 
-
     override fun isSuboptimal(): Boolean {
         return MCDR_ABI.D3D12IsSurfaceSuboptimal(this.handle)
     }
 
     @Throws(SurfaceException::class)
     override fun acquireNextTexture() {
-        // 补报上一帧推迟 acquire 的失败，让 MC 走 surfaceIsInvalid → reconfigure（在 blit 处抛会直接崩）。
         if (this.acquireDeferredFailed) {
             this.acquireDeferredFailed = false
             throw SurfaceException("Failed to acquire DX12 back buffer (deferred)")
@@ -88,8 +85,8 @@ class D3D12GpuSurface(hwnd: Long) : GpuSurfaceBackend {
     }
 
     /**
-     * 在真正需要 back buffer 之前（blit 时）才 acquire：此时本帧录制已完成、上一帧 Present 通常已结束，
-     * 等待为 0ms。返回 false = 本帧跳过 blit（画面停在上一帧，不崩）。
+     * 在真正需要 back buffer 之前（blit 时）才 acquire：此时本帧录制已完成、上一帧 Present 通常已结束，等待为 0ms。
+     * 返回 false = 本帧跳过 blit（画面停在上一帧，不崩）。
      */
     private fun ensureAcquired(): Boolean {
         if (!this.acquireDeferred) {
@@ -108,18 +105,13 @@ class D3D12GpuSurface(hwnd: Long) : GpuSurfaceBackend {
     override fun blitFromTexture(commandEncoder: CommandEncoderBackend, textureView: GpuTextureView) {
         D3D12RenderProf.begin(D3D12RenderProf.BLIT)
         if (!ensureAcquired()) {
-            // 没有可写 back buffer：present() 必须跟着跳过，否则会 flip 一张本帧从未写过的 back buffer。
             this.blitSkipped = true
             D3D12RenderProf.end(D3D12RenderProf.BLIT)
             return
         }
         val encoder = commandEncoder as D3D12CommandEncoderBackend
-        // 传 texture.handle()（纹理资源），不是 view.handle()（SRV view）：CopyTextureRegion 要纹理本身。
-        // 呈现源不一定是 vanilla 传入的主渲染目标：D3D12GUISplit 只在「拆分启用且本帧确实搬了世界层」时
-        // 换成 GUI 目标，hudless 模式换成不含 UI 的世界层，其余原样返回入参。
         val fallback = (textureView as D3D12GpuTextureView).texture() as D3D12GpuTexture
         val tex = D3D12GUISplit.presentSourceTexture(fallback)
-        // 速度（运动矢量）pass 必须在本帧渲染完成、主深度仍有效时录进同一条命令列表。
         encoder.recordVelocityPass()
         val version = VanillaFrameCoordinator.currentResourceVersion() ?: 1L
         VanillaFrameCoordinator.recordDeclaredPresentationPass(
@@ -148,8 +140,6 @@ class D3D12GpuSurface(hwnd: Long) : GpuSurfaceBackend {
     }
 
     private fun presentFrame() {
-        // 本帧跳过过 blit 就绝不 present：present 一张没写过的 back buffer 正是「上一帧叠在本帧上 / OSD 重影」；
-        // native presentSurface() 也有一道同样的守卫（surface->blittedThisFrame），这里是纵深防御。
         if (this.blitSkipped) {
             this.blitSkipped = false
             IllusionLogger.debugMessage("present skipped — no blit this frame")
@@ -168,7 +158,6 @@ class D3D12GpuSurface(hwnd: Long) : GpuSurfaceBackend {
         if (this.closed) {
             return
         }
-        // 关闭会等 pending present / deviceWaitIdle；慢在这里表现为「窗口先灰几秒才消失」。
         val started = System.nanoTime()
         IllusionLogger.debugMessage("destroySurface begin")
         VanillaFrameCoordinator.closeDisplayFrames()

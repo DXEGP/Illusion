@@ -35,11 +35,8 @@ class Illusion(modEventBus: IEventBus, modContainer: ModContainer) {
 
     init {
         modContainer.registerConfig(ModConfig.Type.CLIENT, IllusionConfig.SPEC)
-        // F3 里的 VRS 行是独立的 debug entry，由 F3+F6 的 DebugOptionsScreen 开关。
         D3D12VrsDebugEntry.register(modEventBus)
-        // 退出存档时把 VRS 诊断计数清零（属于一局的统计，不跨存档累加）。
         D3D12VariableShadingRate.register()
-        // Construct log level before initialize the logger.
         IllusionLogger.applyDefaults()
         modEventBus.addListener<ModConfigEvent.Loading> {
             IllusionLogger.applyFromConfig()
@@ -54,8 +51,6 @@ class Illusion(modEventBus: IEventBus, modContainer: ModContainer) {
             applyGpuCaptureConfig()
         }
         LOGGER.info("[$MODID] $MOD_NAME is constructing...")
-        // 一行构建标记：任何一份日志都能自己回答"跑的是不是刚编出来的代码"。
-        // To probe exact backend setting before loading the mod, the only way to achieve this is to read it from file.
         val preferredGraphics = preferredGraphicsSettingFromOptionsFile()
         LOGGER.info(
             if (preferredGraphics == D3D12GraphicsApi.SERIALIZED_NAME) {
@@ -67,16 +62,10 @@ class Illusion(modEventBus: IEventBus, modContainer: ModContainer) {
     }
 
     /**
-     * Direct3D feature level the game is going to run on, as far as it can be known this early.
-     *
-     * The live device does not exist yet at mod construction — [D3D12AdapterInfo.current] is only
-     * filled once [io.github.dxegp.d3d12.device.D3D12Device] created it — so this asks the
-     * native side to enumerate the adapters instead (DXGI/DXCore walk plus a throw-away probe
-     * device per adapter, no persistent device is created). Selection matches native P66: the
-     * first adapter that can create a 12_2 device, otherwise the first D3D12-capable one.
-     *
-     * Returns `"unknown"` when the native library is unavailable or the query fails: this line is
-     * diagnostics, it must never break mod construction.
+     * Direct3D feature level the game is going to run on, as far as it can be known this early — the live device does
+     * not exist yet at mod construction, so the native side enumerates adapters instead of asking
+     * [D3D12AdapterInfo]. Returns `"unknown"` when the native library is unavailable or the query fails; this line is
+     * diagnostics and must never break mod construction.
      */
     private fun startupFeatureLevel(): String {
         D3D12AdapterInfo.current?.let { return@let it.featureLevel }
@@ -90,19 +79,11 @@ class Illusion(modEventBus: IEventBus, modContainer: ModContainer) {
     }
 
     /**
-     * The graphics backend the player selected, as saved in `<game dir>/options.txt`.
-     *
-     * Mod construction runs before the client exists, so there is no `Options` object to ask —
-     * `Minecraft.getInstance()` throws at this point (that is the same situation
-     * `io.github.dxegp.render.resolution.D3D12RenderScale` has to cope with when it asks the
-     * client to rebuild the main render target) — and the
-     * appended `PreferredGraphicsApi` Direct3D 12 constant is not installed yet either, because its
-     * `<clinit>` only runs once `Options` touches the enum. Vanilla persists the choice under the
-     * [OPTIONS_KEY_PREFERRED_GRAPHICS] key, written through the enum codec and therefore **quoted**
-     * (`preferredGraphicsBackend:"d3d12"`), so the file is the only honest source this early.
-     *
-     * Returns `null` when the key is absent — a fresh install, where the vanilla default applies and
-     * Direct3D 12 is by definition not selected.
+     * The graphics backend the player selected, as saved in `<game dir>/options.txt`. Mod construction runs before the
+     * client exists (`Minecraft.getInstance()` throws, and the appended `PreferredGraphicsApi` constant is not
+     * installed until `Options` touches the enum), and vanilla writes the choice under
+     * [OPTIONS_KEY_PREFERRED_GRAPHICS] through the enum codec, so the value is **quoted**
+     * (`preferredGraphicsBackend:"d3d12"`). Returns `null` when the key is absent.
      */
     private fun preferredGraphicsSettingFromOptionsFile(): String? {
         val file = FMLPaths.GAMEDIR.get().resolve("options.txt").toFile()
@@ -125,16 +106,10 @@ class Illusion(modEventBus: IEventBus, modContainer: ModContainer) {
     }
 
     /**
-     * Push `[debug] pixCapture` / `[debug] pixTimingCapture` to the native side.
-     *
-     * This is the one setting that cannot be applied late: PIX's capture layer hooks Direct3D 12
-     * from inside its own DLL, so it has to be loaded before the first device exists. The config
-     * is read during mod construction (well before the renderer starts), and the options carries
-     * `gameRestart()` so changing it asks for a restart instead of silently doing nothing.
-     *
-     * A self-driven timing capture needs the same layer (it is the ETW half of PIX), so either
-     * switch loads it; telling the native side `true` whenever one of them is on keeps the two
-     * from having to be enabled together by hand.
+     * Push `[debug] pixCapture` / `[debug] pixTimingCapture` to the native side. PIX hooks Direct3D 12 from inside its
+     * own DLL, so the layer has to load before the first device exists; a self-driven timing capture needs the same
+     * layer (the ETW half of PIX), so either switch reports `true` to native. Both options carry `gameRestart()`,
+     * so changing them asks for a restart instead of silently doing nothing.
      */
     private fun applyGpuCaptureConfig() {
         val enabled = IllusionConfig.PIX_CAPTURE.get() || IllusionConfig.PIX_TIMING_CAPTURE.get()

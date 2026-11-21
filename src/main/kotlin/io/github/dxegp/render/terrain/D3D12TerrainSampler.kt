@@ -13,7 +13,7 @@ import kotlin.math.log2
 
 /**
  * 地形图集专用的 mip LOD bias：`log2(renderScale) - 0.5` 夹到 [-16, 0]，只在超分开启时生效，否则必须为 0。
- * 只挂地形采样器，不能改全局 sampler cache（GUI / 实体 / 字体会一起糊）。见 docs/mesh&vrs/README.md §4.1。
+ * 只挂地形采样器，不能改全局 sampler cache（GUI / 实体 / 字体会一起糊）。
  */
 object D3D12TerrainSampler {
     private data class Key(
@@ -67,11 +67,9 @@ object D3D12TerrainSampler {
     @JvmStatic
     fun currentBias(): Float {
         if (D3D12AdapterInfo.current == null) return 0f
-        // 闸门是"任何一家超分"而不是只有 DLSS：FSR / XeSS 的输入同样是降分辨率的世界层。
         if (!SuperResolution.isEnabled()) return 0f
         val scale = D3D12RenderScale.current() / 100.0
         if (!(scale > 0.0 && scale <= 1.0)) return 0f
-        // 1:1（DLAA）时 FSR / XeSS 那条路径不跑（它们拒绝输入输出同资源），只有 DLSS 需要 bias。
         if (scale >= 1.0 && !DeepLearningSuperSampling.isEnabled()) return 0f
         return (log2(scale) - 0.5).toFloat().coerceIn(-16f, 0f)
     }

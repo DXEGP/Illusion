@@ -17,9 +17,8 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
 /**
- * Tier 2 的屏幕空间着色率图像（SRI）：每帧开画前跑一次 Work Graph，读上一帧深度与运动矢量，按硬件 tile 判定
- * 是否降采样并写入 `R8_UINT` 着率图，地形批次绑到命令列表（`RSSetShadingRateImage`）。任何一步失败只记一次
- * 日志并永久自关。见 docs/mesh&vrs/README.md §3.3。
+ * Tier 2 的屏幕空间着色率图像（SRI）：每帧开画前跑一次 Work Graph，读上一帧深度与运动矢量，按硬件 tile 写
+ * `R8_UINT` 着率图，地形批次绑到命令列表。任何一步失败只记一次日志并永久自关。
  */
 object D3D12ShadingRateImage {
     private val LOGGER: Logger = LoggerFactory.getLogger("dxrmc-vrs-sri")
@@ -36,9 +35,7 @@ object D3D12ShadingRateImage {
     /** 运动矢量阈值（像素）：超过它即判为"正在动"，不让它变粗。 */
     private const val MOTION_PIXELS: Int = 8
 
-    /**
-     * 着色率图像（两张 ping-pong）：Work Graph 不能同时读写同一张纹理，每帧写 A 读 B。
-     */
+    /** 着色率图像（两张 ping-pong）：Work Graph 不能同时读写同一张纹理，每帧写 A 读 B。 */
     private val images: LongArray = LongArray(2)
     private val candidates: LongArray = LongArray(2)
 
@@ -79,7 +76,6 @@ object D3D12ShadingRateImage {
     private var failed: Boolean = false
     private var lastNote: String? = null
     private var frames: Long = 0L
-
 
     /** 本帧强制全 1X1：相机跳变或世界切换后的那一帧。 */
     private var forceFine: Boolean = false
@@ -228,7 +224,6 @@ object D3D12ShadingRateImage {
         val encoder = D3D12Device.sharedCommandEncoder() ?: return
         check(owner === encoder) { "VRS preparation changed command owner" }
         try {
-            // 上一帧 submit 之后这条列表就关掉了 —— 每帧都要重新开一条。
             val clampBit = if (temporalClampEnabled()) 2 else 0
             val historyBit = if (historyValid) 8 else 0
             val compatibleBit = 1
@@ -327,9 +322,7 @@ object D3D12ShadingRateImage {
         return kotlin.math.abs(d)
     }
 
-    /**
-     * 把着率图像绑到当前命令列表；返回 true 时必须配对调用 [unbind]。
-     */
+    /** 把着率图像绑到当前命令列表；返回 true 时必须配对调用 [unbind]。 */
     @JvmStatic
     @Synchronized
     fun bind(ctx: Long): Boolean {
@@ -389,7 +382,6 @@ object D3D12ShadingRateImage {
             tx == tilesX && ty == tilesY && w == pixelW && h == pixelH) {
             return true
         }
-        // 只重建跟尺寸绑定的两张图与深度快照；Work Graph 状态由 native worker 持有。
         releaseImage()
         for (i in 0..1) {
             val img = MCDR_ABI.D3D12CreateShadingRateImage(tx, ty)
@@ -407,7 +399,6 @@ object D3D12ShadingRateImage {
             }
             candidates[i] = candidate
         }
-        // 快照必须与主深度**同格式**（D32_FLOAT）：CopyTextureToTexture 不做格式转换，`R32_FLOAT` 会报 "format mismatch"。
         val tex = MCDR_ABI.ID3D12CreateTexture(DEPTH_USAGE, checkNotNull(depthFormat).ordinal, w, h, 1, 1)
         if (tex == 0L) {
             releaseImage()
@@ -478,7 +469,7 @@ object D3D12ShadingRateImage {
         return IllusionConfig.VRS_SRI_MOTION_PIXELS.get().coerceIn(0, 256)
     }
 
-    /** `[vrs] sriTemporalClamp` —— 每帧现读；关掉等于回到无历史的逐帧行为。 */
+    /** `[vrs] sriTemporalClamp`，每帧现读。 */
     private fun temporalClampEnabled(): Boolean {
         if (!IllusionConfig.SPEC.isLoaded) return true
         return IllusionConfig.VRS_SRI_TEMPORAL_CLAMP.get()
@@ -494,5 +485,4 @@ object D3D12ShadingRateImage {
         LOGGER.warn("SRI disabled for this session: {}", message)
     }
 }
-
 

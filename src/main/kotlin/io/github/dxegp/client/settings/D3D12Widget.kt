@@ -80,7 +80,6 @@ class D3D12WidgetRenderer(private val extractor: GuiGraphicsExtractor) {
 
 /**
  * 自绘控件基类：位置、尺寸与鼠标回调都在这里，绘制统一走 [render]。
- *
  * 不注册到 `Screen` 的 `renderables`：`Screen.extractRenderState` 直接遍历自己的控件列表，顺序与裁剪由屏幕控制。
  */
 abstract class D3D12Widget(x: Int, y: Int, width: Int, height: Int) {

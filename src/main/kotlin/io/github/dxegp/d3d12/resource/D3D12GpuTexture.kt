@@ -63,10 +63,8 @@ class D3D12GpuTexture(usage: Int, label: String, format: GpuFormat, width: Int,
 
     companion object {
         /**
-         * 未映射到资源状态的 STORAGE / UAV 语义位（16 起是 DXRMC 自己的约定，这里取 32）。
-         *
-         * native 的 `textureFlags()` 判 `usage & 32` 才置 `ALLOW_UNORDERED_ACCESS`；
-         * 缺这一位，NGX 不会写进这张资源。
+         * 未映射到资源状态的 STORAGE / UAV 语义位（DXRMC 自己的约定）。
+         * native 的 `textureFlags()` 判 `usage & 32` 才置 `ALLOW_UNORDERED_ACCESS`；缺这一位，NGX 不会写进这张资源。
          */
         const val USAGE_STORAGE: Int = 32
     }
@@ -76,7 +74,6 @@ class D3D12GpuTexture(usage: Int, label: String, format: GpuFormat, width: Int,
         return this.handle
     }
 
-    /** 每个 TextureView 创建时 +1。 */
     fun addViews() {
         ++this.views
     }

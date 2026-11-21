@@ -84,7 +84,6 @@ internal object VanillaDepthOperationSource {
                 return output;
             }
         """.trimIndent()
-        // 原版水遮罩 PS 只写未绑定的颜色，无 discard、采样或深度输出；空 PS 保留其深度覆盖。
         val fragment = "void main() {}\n"
         val evaluation = D3D12OitTileVertexEvaluation(renamed + "\n" + """
             float4 McdrTileEvaluateClipV1(float3 $positionInput) {

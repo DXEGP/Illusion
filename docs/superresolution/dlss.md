@@ -41,7 +41,7 @@ SR Prepare 返回 int32 typed status 和独立 outToken。152 字节的 SR_DISPA
 
 `default` 现在由项目明确选择 M，native 值从 SDK 自选的 `0` 改为 `13`。UI 下标、`dxrMcDlssPreset` 键和磁盘中的 `default` 名称保持不变；显式 J/K/L/M 仍分别使用 `10/11/12/13`，读取旧数字配置时 `0` 仍表示 default、`13` 仍表示显式 M。推荐项与显式 M 共用同一个模型值，候选准备和冻结帧都通过 `DeepLearningSuperSampling.renderPreset` 映射。
 
-本版运行库的真实离线 DLAA 重放中，J/K 对部分颜色变化长时间保留旧色，L/M 能较快跟上，因此项目推荐 M。复现步骤、数值与适用场景集中记录在 [实施记录](../rendering/work-graph-implementation.md#abi13-局部颜色与模型对照)。L/M 的 GPU 耗时取舍需按实际显卡、分辨率与场景比较；用户对运行客户端的最新动态反馈见 [半透明固定残影确认](../rendering/work-graph-implementation.md#半透明固定残影确认)。
+本版运行库的真实离线 DLAA 重放中，J/K 对部分颜色变化长时间保留旧色，L/M 能较快跟上，因此项目推荐 M。L/M 的 GPU 耗时取舍需按实际显卡、分辨率与场景比较。
 
 preset 是 feature 创建输入，修改后随新候选准备和 Commit 生效；失败保留现役 feature。普通 SR 的候选 Streamline viewport 使用 2..4，现役 viewport 随候选 Commit 发布，FG 使用 viewport1。SR tags 与 FG tags 在各自 viewport 和对应真实帧中管理。
 
@@ -51,7 +51,7 @@ preset 是 feature 创建输入，修改后随新候选准备和 Commit 生效�
 
 native 从冻结帧生成 NGX/Streamline 常量。current/previous 使用同一当前相机参考原点，原点差先以 double 计算；jitter 为像素值 `(jx,-jy)`，motion 为去 jitter 的 current→previous 像素位移，scale=1。缺失真实 previous、motion 或镜头元数据时不伪造 SDK 输入。
 
-普通 vanilla 使用编码 LDR、preExposure=1；曝光为实际 `1×1 R32_FLOAT` 纹理。K 模型不支持 current-color bias，生产路径已移除该输入；官方依据和失败尝试见 [ABI12 实施记录](../rendering/work-graph-implementation.md#abi12-dlaa-局部历史拒绝)。相机跳变、世界/版本变化和帧不连续的历史判定由 native 统一拥有，SDK 成功后才推进重建历史。
+普通 vanilla 使用编码 LDR、preExposure=1；曝光为实际 `1×1 R32_FLOAT` 纹理。K 模型不支持 current-color bias，生产路径已移除该输入。相机跳变、世界/版本变化和帧不连续的历史判定由 native 统一拥有，SDK 成功后才推进重建历史。
 
 输出纹理归 `VanillaWorldOutput`，具有显示尺寸、与世界颜色兼容的格式和 STORAGE/纹理读取/拷贝/渲染用途。SDK 输出与 SceneDisplay 是独立纹理；原生把 DLSS 结果转入 SceneDisplay 时执行后置锐化，强度为 0 时普通 blit。GUI 只在独立 UiDisplay 绘制，DLSS 不再直接写 GUI，也没有 DLSSOutput 交接 owner。
 
@@ -63,7 +63,7 @@ native 能力查询给出适配器、运行库和 provider 的真实可用性及
 
 逐帧状态查询读取设备创建时的 RTX 能力结果和当前 DLSS 会话，不重置能力缓存、不重跑 `GetFeatureRequirements`。该接口在本机可能持续返回无法确定；实际启用继续由当前运行库与所选 provider 的准备结果决定。查询失败不会触发每帧重新登记运行库目录或重复输出设备初始化日志。
 
-构建、产物一致性与本次客户端覆盖集中记录在 [实施记录：当前构建与运行](../rendering/work-graph-implementation.md#当前构建与运行)。DLSS/SR 启用、resize 后的动态运动质量和性能仍按对应实际场景确认。
+DLSS/SR 启用、resize 后的动态运动质量和性能仍按对应实际场景确认。
 
 ## 文件导航
 

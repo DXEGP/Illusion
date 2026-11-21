@@ -56,7 +56,7 @@ flowchart TD
 
 世界颜色和已捕获深度不能在 GUI 前重新从已清空的主深度拼装。JVM `VanillaWorldOutput` 记录 velocity 并传递资源绑定，native 一次完成 PreparedFrame 发布、实际 evaluate 与输出。DLSS 通过统一 SR registry 执行；结果先写入 WorldOutput 拥有的独立显示尺寸纹理，再转入 SceneDisplay。DLSS 后置锐化保留在这次转入中。
 
-SR/TAA 的 depth/motion 由 `ReconstructionFrameInputs` 封闭为同源 pair，world-output 和 provider masks 共用。OIT 业务捕获真实云候选与普通贡献，无普通贡献冲突且云 previous 有效时选择云 pair；其他像素保留 capturedDepth/baseVelocity。完整输入、coverage 与混合来源边界见 [云/OIT 接线](../rendering/work-graph-implementation.md#云oit-输入调查2026-11-15)。
+SR/TAA 的 depth/motion 由 `ReconstructionFrameInputs` 封闭为同源 pair，world-output 和 provider masks 共用。OIT 业务捕获真实云候选与普通贡献，无普通贡献冲突且云 previous 有效时选择云 pair；其他像素保留 capturedDepth/baseVelocity。
 
 native 只在重建成功后推进历史。世界、资源/配置版本、historyGeneration、真实帧连续性以及相机位移超过 64 格或转角超过 90°会使历史失效。输入和输出由命令录制租约保活，关闭请求不能代替 GPU fence 完成。
 
@@ -70,11 +70,11 @@ native 只在重建成功后推进历史。世界、资源/配置版本、histor
 | composition | FSR | OIT 的透明/合成贡献；只有两张真实 OIT 来源时发布 |
 | responsive | XeSS | 结合透明、颜色变化及历史不相容的响应区域 |
 
-各家 mask 使用独立语义。输出 flags 为 reactive=1、composition=2、responsive=4；它们与 SR capability bits 分开解释。DLSS 当前模型不支持该次尝试使用的 current-color bias，接线已撤销，见 [ABI12 实施记录](../rendering/work-graph-implementation.md#abi12-dlaa-局部历史拒绝)。
+各家 mask 使用独立语义。输出 flags 为 reactive=1、composition=2、responsive=4；它们与 SR capability bits 分开解释。DLSS 当前模型不支持该次尝试使用的 current-color bias，接线已撤销。
 
 V2 保留 FSR/XeSS 的颜色和深度历史、真实像素 motion 以及去遮挡判断。历史须匹配 worldEpoch、configVersion、resourceVersion、紧邻真实帧、historyGeneration、尺寸和格式，并确认前帧已实际提交。缺失历史时按当前 availability 处理。生产路径没有 mask 均值/峰值 CPU 读回。
 
-mask 改善重建历史权重，FG 仍要求完整运动来源。天空/天体、混合贡献与未知 post 的支持边界集中见[实施记录](../rendering/work-graph-implementation.md#abi10-运动来源与像素贡献)；来源不足时跳过本帧 FG，普通帧继续绘制。
+mask 改善重建历史权重，FG 仍要求完整运动来源。天空/天体、混合贡献与未知 post 各有支持边界；来源不足时跳过本帧 FG，普通帧继续绘制。
 
 ## 与 AA、FG 和显示的关系
 
@@ -82,7 +82,7 @@ mask 改善重建历史权重，FG 仍要求完整运动来源。天空/天体�
 
 世界 PreparedFrame 只服务世界 AA/SR；显示输入在 GUI 前 Prepare 冻结并提交 guides，GUI 完成后 Submit 只补 UI/backdrop，等待准确 guide fence、通过有效性裁决后才接受 FG SDK。SceneDisplay、UiDisplay、完整 composite 各有独立角色；100% 与无 SR 也沿用同一顺序。普通 SR 的 Streamline viewport 来自成功发布的候选槽位 2..4，FG 使用 viewport1。
 
-显示 Prepare/Submit 两阶段已接线，最终阶段仍等待并回读同帧 validity 汇总，协议见 [FFM ABI](../misc/ffm-abi.md)。配套构建、实际运行、性能与 resize 后退出确认集中见[实施记录](../rendering/work-graph-implementation.md#当前构建与运行)。
+显示 Prepare/Submit 两阶段已接线，最终阶段仍等待并回读同帧 validity 汇总，协议见 [FFM ABI](../misc/ffm-abi.md)。
 
 ## 计时资源生命周期
 

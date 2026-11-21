@@ -7,10 +7,10 @@ import java.util.IdentityHashMap
 import java.util.WeakHashMap
 
 /**
- * Frontend registrations supply the reload inventory and the source for direct backend callers.
- * PipelineBuilderSourceMixin forwards each asynchronous job's exact pipeline/source separately;
- * a name-only registration cannot distinguish overlapping reloads. Native pipeline leases are
- * independent of source registrations and are shared by staging/device caches and frontends.
+ * Frontend registrations supply the reload inventory and the source for direct backend callers. Each asynchronous
+ * job's exact pipeline/source must be forwarded separately: a name-only registration cannot distinguish overlapping
+ * reloads. Native pipeline leases are independent of source registrations and shared by staging/device caches and
+ * frontends.
  */
 object D3D12PipelineBridge {
     internal class Entry(val pipeline: RenderPipeline, val source: ShaderSource)

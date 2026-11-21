@@ -9,10 +9,8 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * `Minecraft.renderFrame` 整体计时，帧尾触发分段报告。
- *
- * <p>必须用 RETURN 而不是 TAIL：renderFrame 在 surface 已 acquire 时会提前 return，RETURN 覆盖所有
- * 返回路径，保证 begin / end 严格配对。
+ * `Minecraft.renderFrame` 整体计时，帧尾触发分段报告。必须用 RETURN 而不是 TAIL：renderFrame 在 surface 已
+ * acquire 时会提前 return，RETURN 覆盖所有返回路径，保证 begin / end 严格配对。
  */
 @Mixin(Minecraft.class)
 public class MinecraftRenderFrameProfMixin {

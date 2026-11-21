@@ -345,7 +345,6 @@ provider 的关闭操作幂等，只释放加载资源和未领用窗口；已�
 此操作覆盖 `SeamlessWindowHost` 和普通呈现子窗口两条路径，随后才释放 host 或销毁子窗口，避免
 resize 后旧 backbuffer 在释放等待期间继续可见，也避免窗口重绘时露出父窗口残留的早期加载画面。
 
-resize 后退出的用户确认与问题关闭状态集中见[实施记录：当前构建与运行](../rendering/work-graph-implementation.md#当前构建与运行)。
 加载图像的实际视觉连续性、DPI/全屏变化和 RTSS 注入仍需单独实测。
 
 ## 6. 新增一个 mixin 的规范

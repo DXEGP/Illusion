@@ -1,7 +1,7 @@
 # Illusion 设计文档总览
 
-本文是 `Illusion\docs\` 的入口。源码里的注释只保留"读代码时立刻要用到的约束"，
-**用法、整条数据流、硬约束与已知缺陷**统一收在这里。
+本文是 `Illusion\docs\` 的入口。源码注释只保留调用方需要的用法（参数、返回值、调用顺序、单位），
+**机制、整条数据流、硬约束与已知缺陷**统一收在这里。
 
 > 阅读顺序建议：先看下面的「文档地图」，再按你要改的子系统点进去。
 > 每篇文档结尾都有「文件导航」表，用来在源码与文档之间来回跳。
@@ -50,10 +50,8 @@ early-service 独立 source set 与核心模组分开编译，窗口共享类型
 | 文档 | 主题 | 什么时候看 |
 | --- | --- | --- |
 | [`rendering/README.md`](rendering/README.md) | 集中渲染器目标契约：业务封装、世界增量、Kotlin mixin、FFM、能力/资产/生命周期；尚未实现 | 实施新渲染器的 JVM 接线 |
-| [`rendering/vanilla-work-graph-plan.md`](rendering/vanilla-work-graph-plan.md) | 原版光栅 Work Graph 架构方案：提交寿命、批量 ABI、GPU 地形工作分发、AA/SR 与呈现 | 实施当前光栅路径优化，不涉及光追 |
 | [`rendering/transmittance-tile-execution.md`](rendering/transmittance-tile-execution.md) | 四子样本透明 tile 的阶段顺序、内容租约、stage 输出映射与归一化输出契约 | 改 OIT terrain producer、Work Graph 分桶或 tile replay |
 | [`rendering/render-configuration.md`](rendering/render-configuration.md) | requested → prepared → applied 配置契约、FG/SR 提交与世界输出归属 | 改配置、尺寸、超分或帧生成接线 |
-| [rendering/redstone plan.md](<rendering/redstone plan.md>) | FSR RR/RC/SR/FG 调查、业务边界、输入契约与接入计划 | 接入 Redstone 与统一神经缓存 |
 | [`superresolution/README.md`](superresolution/README.md) | 超分总览：后端抽象、渲染比例、超分掩码 | 改升采样、加新超分后端 |
 | [`superresolution/dlss.md`](superresolution/dlss.md) | DLSS / DLAA 专项：NGX、preset、输出纹理 | 动 DLSS 路径、排查 NGX 初始化 |
 | [`framegen/README.md`](framegen/README.md) | 帧生成与 Reflex：晚期显示帧、UI 合成、限帧 | 改插帧、改呈现时序 |
@@ -68,6 +66,15 @@ early-service 独立 source set 与核心模组分开编译，窗口共享类型
 | [`misc/earlywindow-packaging.md`](misc/earlywindow-packaging.md) | 单文件早期服务容器、内嵌核心模组与开发启动 | 构建发布包、升级旧安装 |
 | [`misc/settingscreen/README.md`](misc/settingscreen/README.md) | 配置系统与设置界面 | 加开关、改界面 |
 
+## 计划文档
+
+计划类文档放在仓库根的 `plan\`，不属于设计文档：
+
+- [`plan/vanilla-work-graph.md`](../plan/vanilla-work-graph.md) —— 原版光栅 Work Graph 架构方案：提交寿命、批量 ABI、GPU 地形工作分发、AA/SR 与呈现；不涉及光追。
+- [`plan/redstone.md`](../plan/redstone.md) —— FSR RR/RC/SR/FG 调查、业务边界、输入契约与接入计划。
+
+尚未实现的目标契约（如 [`rendering/README.md`](rendering/README.md)）仍属设计文档，继续放在 `docs\` 下。
+
 ## 文档写作约定
 
 - **语言**：简体中文；技术名词保留英文原文（DLSS / FSR / XeSS / VRS / SMAA / TAA / PSO / SRV /
@@ -80,8 +87,8 @@ early-service 独立 source set 与核心模组分开编译，窗口共享类型
 - **源码导航**：每篇结尾的表格用相对 `Illusion\src\main\kotlin\io\github\dxegp\` 的路径。
 - **文档维护**：改了对应子系统的行为，同一次改动里更新文档；文档与代码冲突时以代码为准，
   并顺手把文档改对。
-- **注释与文档的分工**：源码注释只写"违反就会出错"的约束（一两行），解释性内容放这里，
-  注释里需要展开时给出指向本文档的路径。
+- **注释与文档的分工**：源码注释只保留调用方需要的用法——参数含义与单位、返回码、调用顺序、
+  所有权与生命周期；机制、数据流、设计取舍一律放这里，注释里不再复述。
 
 ## 相关文档
 

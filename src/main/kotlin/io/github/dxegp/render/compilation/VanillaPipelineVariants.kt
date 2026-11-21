@@ -126,8 +126,6 @@ internal class VanillaPipelineVariants : D3D12PipelineVariants {
                             D3D12RasterMotionSource.CAMERA_REPROJECTION, D3D12RasterMotionSource.CONTRIBUTION_ONLY)) {
                         "Opaque seed raster motion contract does not match $name"
                     }
-                    // 仅复用保留原 clip/varyings、先调用原 PS 的 motion 包装，避免丢失 discard。
-                    // 保留完整 motion desc，否则 seed 的 root 布局与实际源 PSO 会错配。
                     MCDR_ABI.D3D12CreateOpaqueSeedPipelineV1(motionDescriptor, pipeline.pushConstantSize(),
                         opaqueSeed.directVertexHlsl, opaqueSeed.fragmentHlsl, opaqueSeed.programGeneration)
                 } else MCDR_ABI.D3D12CreateGraphicsPipeline(motionDescriptor, pipeline.pushConstantSize())
@@ -223,7 +221,6 @@ internal class VanillaPipelineVariants : D3D12PipelineVariants {
             program.flipY == (compilation.orientation == D3D12PipelineOrientation.FLIPPED_Y)) {
             "OIT tile IA variant does not match $name"
         }
-        // guide/motion/capture 只追加导出；tile 复用基础 MRT，避免重放附加写入。
         check(MCDR_ABI.D3D12AttachOitTileIARouteV1(sourcePipeline, compilation.pipeline.handle())) {
             "OIT tile IA variant attachment failed for $name: ${MCDR_ABI.D3D12LastError()}"
         }

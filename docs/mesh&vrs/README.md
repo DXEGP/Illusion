@@ -228,8 +228,7 @@ MS 的顶点属性来自最终 naga manifest，由 `NagaVertexAdapter` 生成稳
   关闭剔除时仍由图生成可见记录和间接参数。
 - `EmitVisible` 使用 coalescing launch，每组接收最多 64 条存活记录，一个线程原子领取连续槽位，
   其余线程并行写入；不足 64 条时按实际数量领取。容量溢出设置错误位，参数终结阶段禁用该批绘制。
-- 三节点融合只保留在独立候选 shader；单列表连续派发的长尾尚未定位，生产继续使用五节点。
-  真实 GPU 验证和两组计时范围见[实施记录](../rendering/work-graph-implementation.md#地形节点融合与驻留编码)。
+- 三节点融合只保留在独立候选 shader，该候选经过真实 GPU 验证；单列表连续派发的长尾尚未定位，生产继续使用五节点。
 - 普通半透明及其它非 OIT 混合管线必须保持原版绘制顺序，沿有序 indexed indirect 路径执行；
   这是显式的排序契约，不是 Work Graph 失败后的自动回退。
 

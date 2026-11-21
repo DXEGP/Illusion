@@ -14,10 +14,8 @@ import net.minecraft.network.chat.Component
 
 /**
  * 原生 HDR 呈现（scRGB 交换链）的视频设置项，位于原版「显示」子页。
- *
- * <p>三档下标就是下发给 native 的模式编号（0=AUTO / 1=FORCE_ON / 2=FORCE_OFF），不要重排；
+ * 三档下标就是下发给 native 的模式编号（0=AUTO / 1=FORCE_ON / 2=FORCE_OFF），不要重排；
  * 交换链格式与色彩空间是建链参数，改动只在下一次创建交换链时生效。
- * 见 docs/misc/settingscreen/README.md §8.5。
  */
 object D3D12HdrPresentation {
 
@@ -98,7 +96,6 @@ object D3D12HdrPresentation {
         } catch (t: Throwable) {
             Illusion.LOGGER.warn("could not read $OPTIONS_KEY from $file", t)
         }
-        // `Options.load` 期间 `OptionInstance.set` 不触发回调，所以这里补一次 push。
         push(OPTION.get())
     }
 

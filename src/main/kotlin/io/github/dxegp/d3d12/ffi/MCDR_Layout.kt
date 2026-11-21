@@ -8,19 +8,14 @@ import java.lang.foreign.ValueLayout
 import java.util.*
 
 /**
- * Mirror of the C aggregates declared in `MCDR/include/mcdr_abi.h`; see docs/misc/ffm-abi.md §1.2.
- *
- * <p><b>[MemoryLayout.structLayout] inserts NO padding.</b> Every pad byte the C compiler would
- * insert must appear here explicitly — named `_padN` where the header names one, else
- * `MemoryLayout.paddingLayout(n)`. Trailing padding counts too: it is what makes `byteSize()`
- * a usable array stride.
- *
- * 互操作：标量布局与偏移常量必须 `@JvmField`（普通 `val` 生成 `MCDR.INSTANCE.getXxx()` 访问器，
- * Java 侧的 static import 解析不到）。
+ * Mirror of the C aggregates declared in `MCDR/include/mcdr_abi.h`.
+ * <p><b>[MemoryLayout.structLayout] inserts NO padding.</b> Every pad byte the C compiler would insert must appear
+ * here explicitly — named `_padN` where the header names one, else `MemoryLayout.paddingLayout(n)`; trailing padding
+ * counts too, it is what makes `byteSize()` a usable array stride.
+ * 互操作：标量布局与偏移常量必须 `@JvmField`（普通 `val` 生成 `MCDR.INSTANCE.getXxx()` 访问器，Java 侧 static import 解析不到）。
  */
 object MCDRLayout {
 
-    // ---- scalar layouts (JAVA_* already carry the native byte order on Windows x64) ----
     @JvmField
     val I32: ValueLayout.OfInt = ValueLayout.JAVA_INT
 
@@ -371,7 +366,6 @@ object MCDRLayout {
     @JvmField val VANILLA_USE_FINAL = offset(VANILLA_RESOURCE_USE, "finalState")
     @JvmField val VANILLA_USE_EXTERNAL = offset(VANILLA_RESOURCE_USE, "externalState")
 
-    // mcdr_binding_slot: type 0 = CBV (root descriptor), 1 = SRV (texture view), 2 = SRV (texel buffer).
     @JvmField
     val BINDING_SLOT: MemoryLayout = MemoryLayout.structLayout(
         I32.withName("type"),
@@ -382,7 +376,6 @@ object MCDRLayout {
         I64.withName("length")
     ).withByteAlignment(8).withName("mcdr_binding_slot")
 
-    // mcdr_partition_draw — one core's geometry + vertex/index binding.
     @JvmField
     val PARTITION_DRAW: MemoryLayout = MemoryLayout.structLayout(
         PTR.withName("indexBuffer"),
@@ -395,11 +388,8 @@ object MCDRLayout {
         I32.withName("vertexSlot"),
         I32.withName("vertexStride"),
         I32.withName("_pad0"),
-        MemoryLayout.paddingLayout(4)   // C: sizeof == 56 (align 8), member sum == 52
+        MemoryLayout.paddingLayout(4)
     ).withByteAlignment(8).withName("mcdr_partition_draw")
-
-    // Named field offsets, resolved from the layouts above — never literals: a field added on the
-    // C side would silently shift every later one, with no compile error.
 
     @JvmStatic
     fun offset(layout: MemoryLayout, field: String): Long {
@@ -427,7 +417,6 @@ object MCDRLayout {
     @JvmField val PARTITION_DRAW_VERTEX_SLOT: Long = offset(PARTITION_DRAW, "vertexSlot")
     @JvmField val PARTITION_DRAW_VERTEX_STRIDE: Long = offset(PARTITION_DRAW, "vertexStride")
     @JvmField val PARTITION_DRAW_PAD0: Long = offset(PARTITION_DRAW, "_pad0")
-    // mcdr_color_target_desc — format == -1 marks an unused attachment slot.
     @JvmField
     val COLOR_TARGET: MemoryLayout = MemoryLayout.structLayout(
         I32.withName("format"),
@@ -446,13 +435,9 @@ object MCDRLayout {
         I32.withName("depthFormat"),
         I8.withName("depthWrite"),
         I8.withName("depthCompareOp"),
-        // C: sizeof == 8 (align 4, member sum 6); these 2 bytes are also what keeps
-        // PIPELINE_DESC.topology at offset 56.
         MemoryLayout.paddingLayout(2)
     ).withByteAlignment(4).withName("mcdr_depth_state_desc")
 
-    // mcdr_input_element_desc — semanticName is caller-owned NUL-terminated UTF-8; NULL / ""
-    // makes the native side fall back to "TEXCOORD".
     @JvmField
     val INPUT_ELEMENT: MemoryLayout = MemoryLayout.structLayout(
         I32.withName("location"),
@@ -462,7 +447,7 @@ object MCDRLayout {
         I32.withName("stride"),
         I32.withName("stepRate"),
         I32.withName("_pad0"),
-        MemoryLayout.paddingLayout(4),  // C: the pointer lands at 32, not at 28
+        MemoryLayout.paddingLayout(4),
         PTR.withName("semanticName")
     ).withByteAlignment(8).withName("mcdr_input_element_desc")
 
@@ -472,7 +457,6 @@ object MCDRLayout {
         I8.withName("reg")
     ).withName("mcdr_pipeline_binding_desc")
 
-    // mcdr_pipeline_desc — field order must match the C typedef byte for byte.
     @JvmField
     val PIPELINE_DESC: MemoryLayout = MemoryLayout.structLayout(
         PTR.withName("vsData"),
@@ -495,8 +479,6 @@ object MCDRLayout {
         PTR.withName("bindings")
     ).withName("mcdr_pipeline_desc")
 
-    // mcdr_mesh_pipeline_desc — asData/msData/psData hold DXIL bytecode, not HLSL source:
-    // D3DCompile stops at SM 5.1. msData is required, asData/psData may be null.
     @JvmField
     val MESH_PIPELINE_DESC: MemoryLayout = MemoryLayout.structLayout(
         PTR.withName("asData"),
@@ -521,7 +503,6 @@ object MCDRLayout {
         I32.withName("_pad4")
     ).withName("mcdr_mesh_pipeline_desc")
 
-    // mcdr_abi_field — one record of the offset/size report returned by mcdrABILayout().
     @JvmField
     val ABI_FIELD: MemoryLayout = MemoryLayout.structLayout(
         PTR.withName("name"),
@@ -529,11 +510,6 @@ object MCDRLayout {
         I64.withName("size")
     ).withName("mcdr_abi_field")
 
-    // The size MSVC x64 produces for each aggregate below, asserted while this class initialises:
-    // a drifted mirror fails here, before any native call and even with no DLL present.
-    //
-    // mcdr_sr_caps — 字段名/顺序必须与 mcdr_abi.h 的 typedef 逐字一致（见 docs/misc/ffm-abi.md §1.2）。
-    // `note` 是 `char note[28]`：必须写成**一个有名字段**，拆成 28 个 I8 会让 describe() 的名字对不上。
     @JvmField
     val SR_CAPS: MemoryLayout = MemoryLayout.structLayout(
         I32.withName("backend"),
@@ -548,7 +524,6 @@ object MCDRLayout {
         I32.withName("maxRenderWidth"),
         I32.withName("maxRenderHeight"),
         I32.withName("nativeAA"),
-        // C 里叫 reserved（必须为 0）；留着是为了将来加 flags 时不改 sizeof。
         I32.withName("reserved"),
         MemoryLayout.sequenceLayout(28L, I8).withName("note")
     ).withName("mcdr_sr_caps")
@@ -568,8 +543,6 @@ object MCDRLayout {
     @JvmField val SR_CAPS_NATIVE_AA: Long = offset(SR_CAPS, "nativeAA")
     @JvmField val SR_CAPS_NOTE: Long = offset(SR_CAPS, "note")
 
-    // mcdr_fg_caps — 字段名/顺序必须与 typedef 逐字一致，verify() 双向比对 offset + size。
-    // `note`（char[28]）与 `latencyProvider` 都必须是有名字段：describe() 只枚举有名字的成员。
     @JvmField
     val FG_CAPS: MemoryLayout = MemoryLayout.structLayout(
         I32.withName("backend"),
@@ -583,10 +556,8 @@ object MCDRLayout {
         I32.withName("transitionsInputs"),
         I32.withName("maxGeneratedFrames"),
         I32.withName("chainOwner"),
-        // C 里叫 reserved（必须为 0）；留着是为了将来加 flags 时不改 sizeof。
         I32.withName("reserved"),
         MemoryLayout.sequenceLayout(28L, I8).withName("note"),
-        // 它占了原来那格尾填充，所以 sizeof 仍是 80 —— 换名字时别顺手加字段，会破 C 侧的断言。
         I32.withName("latencyProvider")
     ).withName("mcdr_fg_caps")
 
@@ -624,9 +595,6 @@ object MCDRLayout {
     @JvmField val FG_CAPS_NOTE: Long = offset(FG_CAPS, "note")
     @JvmField val FG_CAPS_LATENCY_PROVIDER: Long = offset(FG_CAPS, "latencyProvider")
 
-    // mcdr_fg_dispatch（C sizeof = 96 / align 8）：三个 int64 从 24 起，0..23 无隐式填充；
-    // 末尾 `int32_t _pad2[2]` 是**两个** int32，漏一个 java 侧算出 92 而 C 是 96。
-    // 以下为写偏移（接 Present 之后才会被真正写满）。
     @JvmField val FG_DISPATCH_DISPLAY_WIDTH: Long = offset(FG_DISPATCH, "displayWidth")
     @JvmField val FG_DISPATCH_DISPLAY_HEIGHT: Long = offset(FG_DISPATCH, "displayHeight")
     @JvmField val FG_DISPATCH_BACKEND: Long = offset(FG_DISPATCH, "backend")
@@ -642,288 +610,7 @@ object MCDRLayout {
     @JvmField val FG_DISPATCH_P_MOTION_VECTORS: Long = offset(FG_DISPATCH, "pMotionVectors")
     @JvmField val FG_DISPATCH_P_UI_COLOR: Long = offset(FG_DISPATCH, "pUiColor")
 
-    @JvmField
-    val OIT_EXECUTION_BEGIN: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), FRAME_IDENTITY.withName("identity"),
-        I64.withName("frameSerial"), I64.withName("historyGeneration"), I64.withName("programGeneration"),
-        I32.withName("maxEvents"), I32.withName("maxScopes"), I32.withName("maxResourceReferences"), I32.withName("reserved")
-    ).withName("mcdr_oit_execution_begin_v1")
-
-    @JvmField
-    val OIT_EXECUTION_INFO: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), FRAME_IDENTITY.withName("identity"),
-        I64.withName("streamId"), I64.withName("frameSerial"), I64.withName("programGeneration"),
-        I32.withName("nativeDrawCount"), I32.withName("appendedDrawCount"), I32.withName("eventCount"), I32.withName("openScopeCount"),
-        I32.withName("state"), I32.withName("unavailableReason"), MemoryLayout.sequenceLayout(2, I64).withName("reserved")
-    ).withName("mcdr_oit_execution_info_v1")
-
-    @JvmField
-    val OIT_DRAW_RECEIPT_QUERY: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I64.withName("receiptId"),
-        I64.withName("afterSequence"), I64.withName("producerScopeSerial"), MemoryLayout.sequenceLayout(2, I64).withName("reserved")
-    ).withName("mcdr_oit_draw_receipt_query_v1")
-
-    @JvmField
-    val OIT_DRAW_RECEIPT: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I64.withName("receiptId"), I64.withName("nativeSequence"),
-        I64.withName("frameSerial"), I64.withName("producerScopeSerial"), I64.withName("producerId"),
-        I64.withName("producerGeneration"), I64.withName("shaderGeneration"), I64.withName("programGeneration"),
-        FRAME_IDENTITY.withName("identity"), I32.withName("sectionBase"), I32.withName("sectionCount"),
-        I32.withName("primitiveBase"), I32.withName("primitiveCount"), I32.withName("contentState"), I32.withName("producerKind"),
-        MemoryLayout.sequenceLayout(2, I64).withName("reserved")
-    ).withName("mcdr_oit_draw_receipt_v1")
-
-    @JvmField
-    val OIT_TERRAIN_STAGE_BEGIN_V2: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("stage"), I32.withName("flags"),
-        I64.withName("frameSerial"), I64.withName("producerId"), I64.withName("producerScopeSerial"), I64.withName("sourcePassId"),
-        I64.withName("sourceDrawId"), I64.withName("parentSourceDrawId"), FRAME_IDENTITY.withName("identity"),
-        PTR.withName("pipeline"), MemoryLayout.sequenceLayout(2, I64).withName("reserved")
-    ).withName("mcdr_oit_terrain_stage_begin_v2")
-
-    @JvmField
-    val OIT_TERRAIN_STAGE_RECEIPT_V2: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("stage"), I32.withName("flags"),
-        I32.withName("producerKind"), I32.withName("contentState"), I32.withName("reserved0"), I32.withName("reserved1"),
-        I64.withName("receiptId"), I64.withName("nativeSequence"), I64.withName("frameSerial"), I64.withName("producerId"),
-        I64.withName("producerScopeSerial"), I64.withName("sourcePassId"), I64.withName("sourceDrawId"),
-        I64.withName("parentSourceDrawId"), FRAME_IDENTITY.withName("identity"), I64.withName("pipelineIdentity")
-    ).withName("mcdr_oit_terrain_stage_receipt_v2")
-
-    @JvmField
-    val OIT_TERRAIN_REPLAY_RANGE_V2: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("role"), I32.withName("commandIndex"),
-        I64.withName("generation"), I64.withName("ownerIdentity"), I64.withName("byteOffset"), I64.withName("byteLength"),
-        PTR.withName("object")
-    ).withName("mcdr_oit_terrain_replay_range_v2")
-
-    @JvmField
-    val OIT_TERRAIN_UPLOAD_READ_V2: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("role"), I32.withName("reserved"),
-        PTR.withName("object"), I64.withName("byteOffset"), I64.withName("byteLength"), I64.withName("contentVersion"),
-        I64.withName("resourceVersion"), I64.withName("ownerIdentity")
-    ).withName("mcdr_oit_terrain_upload_read_v2")
-
-    @JvmField
-    val OIT_TERRAIN_REPLAY_READ_SET_V2: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("flags"), I32.withName("geometryRangeCount"),
-        I32.withName("uploadBindingCount"), I32.withName("reserved0"), I32.withName("reserved1"), I32.withName("reserved2"),
-        I64.withName("receiptId"), I64.withName("frameSerial"), I64.withName("producerScopeSerial"),
-        I64.withName("programGeneration"), I64.withName("resourceVersion"), PTR.withName("geometryRanges"), PTR.withName("uploadBindings")
-    ).withName("mcdr_oit_terrain_replay_read_set_v2")
-
-    @JvmField
-    val OIT_EXECUTION_RESOURCE: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("role"), I32.withName("roleIndex"),
-        I32.withName("access"), I32.withName("source"), PTR.withName("object"), I64.withName("resourceIdentity"),
-        I64.withName("contentVersion"), I64.withName("resourceVersion"), I32.withName("firstSubresource"),
-        I32.withName("subresourceCount"), I64.withName("byteOffset"), I64.withName("byteLength"),
-        MemoryLayout.sequenceLayout(2, I64).withName("reserved")
-    ).withName("mcdr_oit_execution_resource_v1")
-
-    @JvmField
-    val OIT_EXECUTION_EVENT: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I64.withName("sequence"),
-        I32.withName("kind"), I32.withName("producerKind"), I32.withName("stage"), I32.withName("flags"),
-        I64.withName("producerId"), I64.withName("producerScopeSerial"), I64.withName("sourcePassId"),
-        I64.withName("sourceDrawId"), I64.withName("drawGroupId"), I64.withName("drawReceiptId"),
-        I64.withName("shaderGeneration"), I64.withName("programGeneration"), I32.withName("resourceCount"), I32.withName("reserved"),
-        PTR.withName("resources"), MemoryLayout.sequenceLayout(2, I64).withName("reservedTail")
-    ).withName("mcdr_oit_execution_event_v1")
-
-    @JvmField
-    val OIT_EXECUTION_SCOPE: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I64.withName("producerId"),
-        I64.withName("producerScopeSerial"), I64.withName("sourcePassId"), I32.withName("producerKind"), I32.withName("stage"),
-        I32.withName("eventCount"), I32.withName("nativeDrawCount"), I32.withName("flags"), I32.withName("reserved"), I64.withName("reservedTail")
-    ).withName("mcdr_oit_execution_scope_v1")
-
-    @JvmField
-    val OIT_EXECUTION_MANIFEST: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("eventCount"), I32.withName("scopeCount"),
-        I32.withName("nativeDrawCount"), I32.withName("flags"), I64.withName("lastSequence"), PTR.withName("scopes"),
-        MemoryLayout.sequenceLayout(2, I64).withName("reserved")
-    ).withName("mcdr_oit_execution_manifest_v1")
-
-    @JvmField
-    val OIT_EXECUTION_SEAL_RESULT: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("state"), I32.withName("unavailableReason"),
-        I64.withName("firstEventId"), I64.withName("drawReceiptId"), I32.withName("expected"), I32.withName("observed"),
-        MemoryLayout.sequenceLayout(2, I64).withName("reserved")
-    ).withName("mcdr_oit_execution_seal_result_v1")
-
-    @JvmField
-    val OIT_EXECUTION_BEGIN_V2: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), FRAME_IDENTITY.withName("identity"),
-        I64.withName("frameSerial"), I64.withName("historyGeneration"), I64.withName("programGeneration"),
-        I32.withName("maxEvents"), I32.withName("maxScopes"), I32.withName("maxPasses"), I32.withName("maxResources"),
-        I32.withName("maxReceipts"), I32.withName("flags"), I32.withName("reserved0"), I32.withName("reserved1")
-    ).withName("mcdr_oit_execution_begin_v2")
-
-    @JvmField
-    val OIT_EXECUTION_KEY_V2: MemoryLayout = MemoryLayout.structLayout(
-        I64.withName("producerId"), I64.withName("producerScopeSerial"), I64.withName("sourcePassId"),
-        I64.withName("sourceDrawId"), I64.withName("parentSourceDrawId"), I32.withName("producerKind"),
-        I32.withName("stage"), I32.withName("commandOrdinal"), I32.withName("reserved")
-    ).withName("mcdr_oit_execution_key_v2")
-
-    @JvmField
-    val OIT_EXECUTION_OPERATION_BEGIN_V1: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), FRAME_IDENTITY.withName("identity"),
-        I64.withName("frameSerial"), OIT_EXECUTION_KEY_V2.withName("key"),
-        I32.withName("kind"), I32.withName("expectedCommandFamily"),
-        I64.withName("programGeneration"), I64.withName("shaderGeneration"), PTR.withName("pipeline"),
-        I32.withName("flags"), I32.withName("reserved")
-    ).withName("mcdr_oit_execution_operation_begin_v1")
-
-    @JvmField
-    val OIT_EXECUTION_OPERATION_RECEIPT_V1: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("kind"), I32.withName("commandFamily"),
-        I64.withName("receiptId"), I64.withName("nativeSequence"), I64.withName("frameSerial"),
-        FRAME_IDENTITY.withName("identity"), OIT_EXECUTION_KEY_V2.withName("key"),
-        I64.withName("pipelineIdentity"), I64.withName("shaderGeneration"), I64.withName("programGeneration"),
-        I64.withName("resourceVersion"), I64.withName("packetId"), I64.withName("readSetId"),
-        I32.withName("recordState"), I32.withName("contentState"), I32.withName("adapterState"), I32.withName("reserved")
-    ).withName("mcdr_oit_execution_operation_receipt_v1")
-
-    @JvmField
-    val OIT_EXECUTION_RESOURCE_V2: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("role"), I32.withName("roleIndex"),
-        I32.withName("access"), I32.withName("contentRequirement"), I32.withName("firstSubresource"), I32.withName("subresourceCount"),
-        PTR.withName("object"), I64.withName("resourceIdentity"), I64.withName("ownerIdentity"), I64.withName("ownerGeneration"),
-        I64.withName("contentVersion"), I64.withName("resourceVersion"), I64.withName("byteOffset"), I64.withName("byteLength"),
-        MemoryLayout.sequenceLayout(2, I32).withName("reserved")
-    ).withName("mcdr_oit_execution_resource_v2")
-
-    @JvmField
-    val OIT_EXECUTION_EVENT_V2: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("kind"), I32.withName("flags"),
-        I64.withName("sequence"), OIT_EXECUTION_KEY_V2.withName("key"), I64.withName("drawGroupId"),
-        I64.withName("shaderGeneration"), I64.withName("programGeneration"), I64.withName("pipelineIdentity"),
-        I32.withName("resourceCount"), I32.withName("receiptCount"), I32.withName("payloadKind"), I32.withName("payloadBytes"),
-        PTR.withName("resources"), PTR.withName("receiptIds"), PTR.withName("payload"),
-        MemoryLayout.sequenceLayout(2, I64).withName("reserved")
-    ).withName("mcdr_oit_execution_event_v2")
-
-    @JvmField
-    val OIT_NORMALIZATION_PIPELINE_V1: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("certificationVersion"), I32.withName("targetCount"),
-        I64.withName("programGeneration"), MemoryLayout.sequenceLayout(32, I8).withName("fragmentSourceHash"),
-        MemoryLayout.sequenceLayout(32, I8).withName("vertexSourceHash"), MemoryLayout.sequenceLayout(32, I8).withName("contractHash"),
-        MemoryLayout.sequenceLayout(2, I64).withName("reserved")
-    ).withName("mcdr_oit_normalization_pipeline_v1")
-
-    @JvmField
-    val OIT_NORMALIZATION_PROGRAM_V1: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("targetCount"), I32.withName("reserved"),
-        I64.withName("programGeneration"), PTR.withName("laneDxil"), I64.withName("laneDxilBytes"),
-        PTR.withName("averageDxil"), I64.withName("averageDxilBytes"),
-    ).withName("mcdr_oit_normalization_program_v1")
-
-    @JvmField
-    val OIT_EXECUTION_TEXTURE_V1: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I64.withName("captureId"), PTR.withName("texture"),
-        I64.withName("ownerIdentity"), I64.withName("ownerGeneration"), I64.withName("contentVersion"),
-        I32.withName("firstSubresource"), I32.withName("subresourceCount"), I64.withName("resourceVersion")
-    ).withName("mcdr_oit_execution_texture_v1")
-
-    @JvmField
-    val OIT_EXECUTION_NORMALIZATION_V2: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("targetCount"), I32.withName("certificationVersion"),
-        I64.withName("certificationGeneration"), PTR.withName("pipeline"), PTR.withName("sampler"),
-        MemoryLayout.sequenceLayout(32, I8).withName("fragmentSourceHash"), MemoryLayout.sequenceLayout(32, I8).withName("vertexSourceHash"),
-        MemoryLayout.sequenceLayout(32, I8).withName("contractHash"), MemoryLayout.sequenceLayout(8, I64).withName("inputContentIds"),
-        I32.withName("outputWidth"), I32.withName("outputHeight"), MemoryLayout.sequenceLayout(2, I64).withName("reserved")
-    ).withName("mcdr_oit_execution_normalization_v2")
-
-    @JvmField
-    val OIT_EXECUTION_NORMALIZATION_V1: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("targetCount"), I32.withName("certificationVersion"),
-        I64.withName("certificationGeneration"), I64.withName("pipelineOwnerIdentity"), I64.withName("pipelineOwnerGeneration"),
-        I64.withName("samplerOwnerIdentity"), I64.withName("samplerOwnerGeneration"), PTR.withName("pipeline"), PTR.withName("sampler"),
-        MemoryLayout.sequenceLayout(32, I8).withName("fragmentSourceHash"), MemoryLayout.sequenceLayout(32, I8).withName("vertexSourceHash"),
-        MemoryLayout.sequenceLayout(32, I8).withName("contractHash"), MemoryLayout.sequenceLayout(8, I64).withName("inputViewIdentities"),
-        PREPARED_BINDING.withName("normalized"), PREPARED_BINDING.withName("corrected"), I32.withName("outputWidth"), I32.withName("outputHeight"),
-        MemoryLayout.sequenceLayout(2, I64).withName("reserved")
-    ).withName("mcdr_oit_execution_normalization_v1")
-
-    @JvmField
-    val OIT_EXECUTION_SCOPE_V2: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("producerKind"), I32.withName("stage"),
-        I64.withName("producerId"), I64.withName("producerScopeSerial"), I64.withName("sourcePassId"),
-        I32.withName("eventCount"), I32.withName("receiptCount"), I32.withName("flags"), I32.withName("reserved")
-    ).withName("mcdr_oit_execution_scope_v2")
-
-    @JvmField
-    val OIT_EXECUTION_PASS_V2: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("completion"), I32.withName("flags"),
-        I64.withName("sourcePassId"), I32.withName("eventCount"), I32.withName("reserved0"),
-        I32.withName("reserved1"), I32.withName("reserved2")
-    ).withName("mcdr_oit_execution_pass_v2")
-
-    @JvmField
-    val OIT_EXECUTION_MANIFEST_V2: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("eventCount"), I32.withName("scopeCount"),
-        I32.withName("passCount"), I32.withName("resourceCount"), I32.withName("receiptCount"), I32.withName("flags"),
-        I64.withName("lastSequence"), PTR.withName("scopes"), PTR.withName("passes"),
-        I32.withName("missingMask"), I32.withName("reserved0"), I32.withName("reserved1"), I32.withName("reserved2")
-    ).withName("mcdr_oit_execution_manifest_v2")
-
-    @JvmField
-    val OIT_EXECUTION_INFO_V2: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("state"), I32.withName("missingMask"),
-        FRAME_IDENTITY.withName("identity"), I64.withName("streamId"), I64.withName("frameSerial"), I64.withName("programGeneration"),
-        I32.withName("eventCount"), I32.withName("scopeCount"), I32.withName("passCount"), I32.withName("resourceCount"),
-        I32.withName("receiptCount"), I32.withName("consumedReceiptCount"), I32.withName("openScopeCount"), I32.withName("openPassCount"),
-        I64.withName("firstIssueSequence")
-    ).withName("mcdr_oit_execution_info_v2")
-
-    @JvmField
-    val OIT_EXECUTION_TERRAIN_RECEIPT_V2: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), OIT_TERRAIN_STAGE_RECEIPT_V2.withName("receipt"),
-        I64.withName("shaderGeneration"), I64.withName("programGeneration"), I64.withName("resourceVersion"),
-        I32.withName("readSetRegistered"), I32.withName("reserved")
-    ).withName("mcdr_oit_execution_terrain_receipt_v2")
-
-    @JvmField
-    val OIT_EXECUTION_SEAL_RESULT_V2: MemoryLayout = MemoryLayout.structLayout(
-        I32.withName("schemaVersion"), I32.withName("structSize"), I32.withName("state"), I32.withName("missingMask"),
-        I64.withName("firstEventId"), I64.withName("firstIssueSequence"), I64.withName("receiptId"),
-        I32.withName("expected"), I32.withName("observed"), I32.withName("reserved0"), I32.withName("reserved1")
-    ).withName("mcdr_oit_execution_seal_result_v2")
-
     private val EXPECTED_C_SIZES: Array<Array<Any>> = arrayOf(
-        arrayOf<Any>("mcdr_oit_execution_begin_v2", OIT_EXECUTION_BEGIN_V2, 96L),
-        arrayOf<Any>("mcdr_oit_execution_key_v2", OIT_EXECUTION_KEY_V2, 56L),
-        arrayOf<Any>("mcdr_oit_execution_operation_begin_v1", OIT_EXECUTION_OPERATION_BEGIN_V1, 144L),
-        arrayOf<Any>("mcdr_oit_execution_operation_receipt_v1", OIT_EXECUTION_OPERATION_RECEIPT_V1, 192L),
-        arrayOf<Any>("mcdr_oit_execution_resource_v2", OIT_EXECUTION_RESOURCE_V2, 104L),
-        arrayOf<Any>("mcdr_oit_execution_event_v2", OIT_EXECUTION_EVENT_V2, 168L),
-        arrayOf<Any>("mcdr_oit_execution_texture_v1", OIT_EXECUTION_TEXTURE_V1, 64L),
-        arrayOf<Any>("mcdr_oit_normalization_pipeline_v1", OIT_NORMALIZATION_PIPELINE_V1, 136L),
-        arrayOf<Any>("mcdr_oit_normalization_program_v1", OIT_NORMALIZATION_PROGRAM_V1, 56L),
-        arrayOf<Any>("mcdr_oit_execution_normalization_v2", OIT_EXECUTION_NORMALIZATION_V2, 224L),
-        arrayOf<Any>("mcdr_oit_execution_normalization_v1", OIT_EXECUTION_NORMALIZATION_V1, 288L),
-        arrayOf<Any>("mcdr_oit_execution_scope_v2", OIT_EXECUTION_SCOPE_V2, 56L),
-        arrayOf<Any>("mcdr_oit_execution_pass_v2", OIT_EXECUTION_PASS_V2, 40L),
-        arrayOf<Any>("mcdr_oit_execution_manifest_v2", OIT_EXECUTION_MANIFEST_V2, 72L),
-        arrayOf<Any>("mcdr_oit_execution_info_v2", OIT_EXECUTION_INFO_V2, 112L),
-        arrayOf<Any>("mcdr_oit_execution_terrain_receipt_v2", OIT_EXECUTION_TERRAIN_RECEIPT_V2, 176L),
-        arrayOf<Any>("mcdr_oit_execution_seal_result_v2", OIT_EXECUTION_SEAL_RESULT_V2, 56L),
-        arrayOf<Any>("mcdr_oit_execution_begin_v1", OIT_EXECUTION_BEGIN, 80L),
-        arrayOf<Any>("mcdr_oit_execution_info_v1", OIT_EXECUTION_INFO, 104L),
-        arrayOf<Any>("mcdr_oit_draw_receipt_query_v1", OIT_DRAW_RECEIPT_QUERY, 48L),
-        arrayOf<Any>("mcdr_oit_draw_receipt_v1", OIT_DRAW_RECEIPT, 144L),
-        arrayOf<Any>("mcdr_oit_terrain_stage_begin_v2", OIT_TERRAIN_STAGE_BEGIN_V2, 120L),
-        arrayOf<Any>("mcdr_oit_terrain_stage_receipt_v2", OIT_TERRAIN_STAGE_RECEIPT_V2, 136L),
-        arrayOf<Any>("mcdr_oit_terrain_replay_range_v2", OIT_TERRAIN_REPLAY_RANGE_V2, 56L),
-        arrayOf<Any>("mcdr_oit_terrain_upload_read_v2", OIT_TERRAIN_UPLOAD_READ_V2, 64L),
-        arrayOf<Any>("mcdr_oit_terrain_replay_read_set_v2", OIT_TERRAIN_REPLAY_READ_SET_V2, 88L),
-        arrayOf<Any>("mcdr_oit_execution_resource_v1", OIT_EXECUTION_RESOURCE, 96L),
-        arrayOf<Any>("mcdr_oit_execution_event_v1", OIT_EXECUTION_EVENT, 128L),
-        arrayOf<Any>("mcdr_oit_execution_scope_v1", OIT_EXECUTION_SCOPE, 64L),
-        arrayOf<Any>("mcdr_oit_execution_manifest_v1", OIT_EXECUTION_MANIFEST, 56L),
-        arrayOf<Any>("mcdr_oit_execution_seal_result_v1", OIT_EXECUTION_SEAL_RESULT, 56L),
         arrayOf<Any>("mcdr_provider_mask_input", PROVIDER_MASK_INPUT, 200L),
         arrayOf<Any>("mcdr_frame_identity", FRAME_IDENTITY, 32L),
         arrayOf<Any>("mcdr_raster_camera", RASTER_CAMERA, 256L),
@@ -964,10 +651,8 @@ object MCDRLayout {
         arrayOf<Any>("mcdr_pipeline_binding_desc", PIPELINE_BINDING,    2L),
         arrayOf<Any>("mcdr_pipeline_desc",        PIPELINE_DESC,       96L),
         arrayOf<Any>("mcdr_mesh_pipeline_desc",   MESH_PIPELINE_DESC, 104L),
-        // SR 抽象层：数字是 MSVC x64 实际 sizeof（改结构时两边一起改）。
         arrayOf<Any>("mcdr_sr_caps",             SR_CAPS,            80L),
         arrayOf<Any>("mcdr_sr_dispatch",         SR_DISPATCH,        152L),
-        // FG 抽象层：数字是 MSVC x64 实际 sizeof（改结构时两边一起改）。
         arrayOf<Any>("mcdr_fg_caps",             FG_CAPS,            80L),
         arrayOf<Any>("mcdr_fg_dispatch",         FG_DISPATCH,        96L),
         arrayOf<Any>("mcdr_abi_field",            ABI_FIELD,           24L),
@@ -991,7 +676,6 @@ object MCDRLayout {
     private val STRUCTS: MutableMap<String, MemoryLayout> = LinkedHashMap()
 
     init {
-        // describe() and verify() both enumerate this map, so a registered struct is always checked.
         STRUCTS["mcdr_binding_slot"] = BINDING_SLOT
         STRUCTS["mcdr_frame_identity"] = FRAME_IDENTITY
         STRUCTS["mcdr_present_receipt_v1"] = PRESENT_RECEIPT
@@ -1001,37 +685,6 @@ object MCDRLayout {
         STRUCTS["mcdr_vanilla_frame_input"] = VANILLA_FRAME_INPUT
         STRUCTS["mcdr_prepared_binding"] = PREPARED_BINDING
         STRUCTS["mcdr_oit_capture_pipeline_v1"] = OIT_CAPTURE_PIPELINE
-        STRUCTS["mcdr_oit_execution_begin_v1"] = OIT_EXECUTION_BEGIN
-        STRUCTS["mcdr_oit_execution_info_v1"] = OIT_EXECUTION_INFO
-        STRUCTS["mcdr_oit_draw_receipt_query_v1"] = OIT_DRAW_RECEIPT_QUERY
-        STRUCTS["mcdr_oit_draw_receipt_v1"] = OIT_DRAW_RECEIPT
-        STRUCTS["mcdr_oit_terrain_stage_begin_v2"] = OIT_TERRAIN_STAGE_BEGIN_V2
-        STRUCTS["mcdr_oit_terrain_stage_receipt_v2"] = OIT_TERRAIN_STAGE_RECEIPT_V2
-        STRUCTS["mcdr_oit_terrain_replay_range_v2"] = OIT_TERRAIN_REPLAY_RANGE_V2
-        STRUCTS["mcdr_oit_terrain_upload_read_v2"] = OIT_TERRAIN_UPLOAD_READ_V2
-        STRUCTS["mcdr_oit_terrain_replay_read_set_v2"] = OIT_TERRAIN_REPLAY_READ_SET_V2
-        STRUCTS["mcdr_oit_execution_resource_v1"] = OIT_EXECUTION_RESOURCE
-        STRUCTS["mcdr_oit_execution_event_v1"] = OIT_EXECUTION_EVENT
-        STRUCTS["mcdr_oit_execution_scope_v1"] = OIT_EXECUTION_SCOPE
-        STRUCTS["mcdr_oit_execution_manifest_v1"] = OIT_EXECUTION_MANIFEST
-        STRUCTS["mcdr_oit_execution_seal_result_v1"] = OIT_EXECUTION_SEAL_RESULT
-        STRUCTS["mcdr_oit_execution_begin_v2"] = OIT_EXECUTION_BEGIN_V2
-        STRUCTS["mcdr_oit_execution_key_v2"] = OIT_EXECUTION_KEY_V2
-        STRUCTS["mcdr_oit_execution_operation_begin_v1"] = OIT_EXECUTION_OPERATION_BEGIN_V1
-        STRUCTS["mcdr_oit_execution_operation_receipt_v1"] = OIT_EXECUTION_OPERATION_RECEIPT_V1
-        STRUCTS["mcdr_oit_execution_resource_v2"] = OIT_EXECUTION_RESOURCE_V2
-        STRUCTS["mcdr_oit_execution_event_v2"] = OIT_EXECUTION_EVENT_V2
-        STRUCTS["mcdr_oit_execution_texture_v1"] = OIT_EXECUTION_TEXTURE_V1
-        STRUCTS["mcdr_oit_normalization_pipeline_v1"] = OIT_NORMALIZATION_PIPELINE_V1
-        STRUCTS["mcdr_oit_normalization_program_v1"] = OIT_NORMALIZATION_PROGRAM_V1
-        STRUCTS["mcdr_oit_execution_normalization_v2"] = OIT_EXECUTION_NORMALIZATION_V2
-        STRUCTS["mcdr_oit_execution_normalization_v1"] = OIT_EXECUTION_NORMALIZATION_V1
-        STRUCTS["mcdr_oit_execution_scope_v2"] = OIT_EXECUTION_SCOPE_V2
-        STRUCTS["mcdr_oit_execution_pass_v2"] = OIT_EXECUTION_PASS_V2
-        STRUCTS["mcdr_oit_execution_manifest_v2"] = OIT_EXECUTION_MANIFEST_V2
-        STRUCTS["mcdr_oit_execution_info_v2"] = OIT_EXECUTION_INFO_V2
-        STRUCTS["mcdr_oit_execution_terrain_receipt_v2"] = OIT_EXECUTION_TERRAIN_RECEIPT_V2
-        STRUCTS["mcdr_oit_execution_seal_result_v2"] = OIT_EXECUTION_SEAL_RESULT_V2
         STRUCTS["mcdr_oit_begin_v1"] = OIT_BEGIN
         STRUCTS["mcdr_oit_begin_v2"] = OIT_BEGIN_V2
         STRUCTS["mcdr_oit_terrain_section_v2"] = OIT_TERRAIN_SECTION
@@ -1076,7 +729,7 @@ object MCDRLayout {
             for (member in (layout as GroupLayout).memberLayouts()) {
                 val nameOpt: Optional<String> = member.name()
                 if (nameOpt.isEmpty) {
-                    continue // implicit alignment padding — the C macro does not name it either
+                    continue
                 }
                 val field = nameOpt.get()
                 val offset = layout.byteOffset(PathElement.groupElement(field))
@@ -1087,9 +740,8 @@ object MCDRLayout {
     }
 
     /**
-     * Compare these mirrors against the offsets/sizes the running DLL reports; throws with every
-     * disagreement listed, not just the first.
-     *
+     * Compare these mirrors against the offsets/sizes the running DLL reports; throws with every disagreement listed,
+     * not just the first.
      * @param nativeFields what `mcdrABILayout()` published, as `name -> {offset, size}`
      */
     @JvmStatic

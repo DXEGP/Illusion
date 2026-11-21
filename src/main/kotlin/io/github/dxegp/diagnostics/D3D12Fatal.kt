@@ -21,7 +21,7 @@ import java.nio.file.Files
 /**
  * DXRMC 的失败策略：复位首选图形 API → 弹窗 → 抛带自定义报告的 [ReportedException]。
  * 抛的**不能**换成 `BackendCreationException`：那样 vanilla 的后端循环会吞掉它，失败就退化成
- * 一次静默的 OpenGL 启动。字段与顺序见 docs/misc/debug-and-crash.md §1.2、§2。
+ * 一次静默的 OpenGL 启动。
  */
 object D3D12Fatal {
     private val LOGGER = LoggerFactory.getLogger("backend")
@@ -133,7 +133,6 @@ object D3D12Fatal {
         showPopup(what, resetDetail)
         val report = CrashReport.forThrowable(cause ?: RuntimeException(what), TITLE)
         val category = report.addCategory("DXRMC / Direct3D 12")
-        // 五个字段各自回答什么问题见 docs/misc/debug-and-crash.md §2。
         category.setDetail("Failure", what)
         category.setDetail(
             "Fallback",
@@ -152,9 +151,9 @@ object D3D12Fatal {
     }
 
     /**
-     * 阻塞弹窗，且在写报告**之前**（与 vanilla"所有后端都失败"的顺序一致）；弹窗自身异常只记日志。
+     * 阻塞弹窗，且在写报告**之前**（顺序与 vanilla"所有后端都失败"一致）；弹窗自身异常只记日志。
      * 走原生 `MessageBoxW` 而非 `MessageBox.error`：tinyfd 遇到引号会把整条消息换成
-     * `INVALID MESSAGE WITH QUOTES`，而复位说明天然带引号。见 docs/misc/debug-and-crash.md §3.1、§3.4。
+     * `INVALID MESSAGE WITH QUOTES`，而复位说明天然带引号。
      */
     private fun showPopup(what: String, resetDetail: String) {
         if (D3D12Settings.noCrashPopup) {
@@ -162,7 +161,6 @@ object D3D12Fatal {
             return
         }
 
-        // 正文中英双语（每条关键词两种语言都能 grep 到）；弹窗路径见 docs/misc/debug-and-crash.md §3.2。
         val message = buildString {
             append("Direct3D 12 后端启动失败。\n")
             append("Direct3D 12 failed to start.\n\n")
@@ -179,7 +177,6 @@ object D3D12Fatal {
         }
         val fallbackMessage = sanitizeForTinyfd(message)
 
-        // 守护线程：没人点也不会拖住 JVM；自动化用 [debug] noCrashPopup 直接跳过。
         LOGGER.info("showing fatal error dialog (set [debug] noCrashPopup = true to suppress)")
         val dialog = Thread({
             try {
@@ -211,18 +208,17 @@ object D3D12Fatal {
     private fun showNativeMessageBox(text: String, caption: String): Boolean {
         val flags = MB_OK or MB_ICONERROR or MB_SETFOREGROUND or MB_TOPMOST
         return try {
-            // Arena 必须活过阻塞中的对话框：不能用 confined 临时区。
             Arena.ofShared().use { arena ->
                 val lookup = SymbolLookup.libraryLookup("user32", arena)
                 val address = lookup.find("MessageBoxW").orElse(null) ?: return false
                 val handle = Linker.nativeLinker().downcallHandle(
                     address,
                     FunctionDescriptor.of(
-                        ValueLayout.JAVA_INT,   // int  MessageBoxW(...)
-                        ValueLayout.ADDRESS,    // HWND hWnd
-                        ValueLayout.ADDRESS,    // LPCWSTR lpText
-                        ValueLayout.ADDRESS,    // LPCWSTR lpCaption
-                        ValueLayout.JAVA_INT))  // UINT uType
+                        ValueLayout.JAVA_INT,
+                        ValueLayout.ADDRESS,
+                        ValueLayout.ADDRESS,
+                        ValueLayout.ADDRESS,
+                        ValueLayout.JAVA_INT))
                 val textSegment = wideString(arena, text)
                 val captionSegment = wideString(arena, caption)
                 val result = handle.invokeExact(

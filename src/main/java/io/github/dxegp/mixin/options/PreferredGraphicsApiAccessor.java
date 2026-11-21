@@ -5,10 +5,8 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.gen.Invoker;
 
 /**
- * 造一个 {@code PreferredGraphicsApi} 枚举常量。
- *
- * <p>AT 救不了这条：javac 语言层禁止 {@code new} 枚举，{@code Constructor.newInstance} 对枚举直接抛异常。
- * 方法体只会在忘登记 dxr_mc.mixins.json 时被执行到。见 docs/misc/mixins-and-earlywindow.md §2.3</p>
+ * 造一个 {@code PreferredGraphicsApi} 枚举常量。AT 救不了这条：javac 语言层禁止 {@code new} 枚举，
+ * {@code Constructor.newInstance} 对枚举直接抛异常。方法体只会在忘登记 dxr_mc.mixins.json 时被执行到。
  */
 @Mixin(PreferredGraphicsApi.class)
 public interface PreferredGraphicsApiAccessor {

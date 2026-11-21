@@ -1,11 +1,9 @@
 # 原版光栅路径：Work Graph 架构优化方案
 
-状态：实施中，更新于 2026-11-15；本页保留完整目标契约，逐项进度以实施记录为准。范围是现有 Minecraft / RenderPearl 的 D3D12 光栅路径、mesh、AA/SR 与呈现，不包含光追、降噪器、辐射缓存和世界输运。
-现状与缺陷证据见 [原版 D3D12 架构审查](../misc/vanilla-d3d12-architecture.md)。本页规定重构后的职责和执行契约，不将这些能力描述为当前已经实现。
+状态：实施中；本页保留完整目标契约。范围是现有 Minecraft / RenderPearl 的 D3D12 光栅路径、mesh、AA/SR 与呈现，不包含光追、降噪器、辐射缓存和世界输运。
+现状与缺陷证据见 [原版 D3D12 架构审查](../docs/misc/vanilla-d3d12-architecture.md)。本页规定重构后的职责和执行契约，不将这些能力描述为当前已经实现。
 
 当前 TRANSMITTANCE tile 接线已推进到 shader 生产验证、JVM 16/32/64 mesh route 消费和 native root/signature/lease 注册；四 lane stage/depth 录制、精确内容冻结、GPU 分桶和最终 executor 仍是明确的未交付项。任何缺口都继续走 typed unavailable 并保留原版透明颜色。
-
-任务分工、依赖和实际完成情况见 [实施记录](work-graph-implementation.md)。
 
 ## 1. 确定的工程决策
 
@@ -80,11 +78,11 @@ flowchart TD
 
 `MCDR_ABI` 已移除配置读取；已有计时由 `diagnostics.RenderProfiling` 管理。Backend 组合 `VanillaPipelineCompiler`、变体编译器与录制工厂，提交模式从配置转成设备中立枚举。设备通过 `D3D12PipelineCompiler` 委托编译，pipeline 产物只持有并关闭变体；地形/motion/宽线规则归业务编译层。`checkD3D12Dependencies` 在编译前检查 device、command、编译产物/转换缓存和 FFM 核心，拒绝其直接依赖 render/config；唯一 FFM 出口保持不变。
 
-Kotlin 热路径明确选择内联编码作用域和 staging writer，分配器与业务编排保持普通函数。FFM 按实际目标大小和布局分配，小数组有界复用，大数组使用调用内 arena；GPU 上传沿实际 fence 退休。大小、对齐、空数组与释放规则统一见 [FFM ABI](../misc/ffm-abi.md#24-数组与结构体数组)，各业务不能另建无上限的临时内存缓存。
+Kotlin 热路径明确选择内联编码作用域和 staging writer，分配器与业务编排保持普通函数。FFM 按实际目标大小和布局分配，小数组有界复用，大数组使用调用内 arena；GPU 上传沿实际 fence 退休。大小、对齐、空数组与释放规则统一见 [FFM ABI](../docs/misc/ffm-abi.md#24-数组与结构体数组)，各业务不能另建无上限的临时内存缓存。
 
 ## 4. 跨模块输入契约
 
-配置统一使用 [requested → prepared → applied 契约](render-configuration.md)。RenderConfiguration 拥有 requested、applied 和 persistent；PreparedRenderConfiguration 真实创建候选世界附件和 provider，按 FG Prepare → SR Prepare → 组合 Commit → 世界附件发布推进。完整 Published 才更新 persistent，save 读取 settingsToSave；同尺寸失败保留旧配置。主菜单等待世界返回 AwaitingWorld，结束 UI 回调并保留 requested/pending；resize 先确保新尺寸的临时 NONE 配置可渲染，同尺寸 SDK 拒绝后暂停自动重试。小窗口可抬高实际输入比例，用户存储的质量档位保持原值。
+配置统一使用 [requested → prepared → applied 契约](../docs/rendering/render-configuration.md)。RenderConfiguration 拥有 requested、applied 和 persistent；PreparedRenderConfiguration 真实创建候选世界附件和 provider，按 FG Prepare → SR Prepare → 组合 Commit → 世界附件发布推进。完整 Published 才更新 persistent，save 读取 settingsToSave；同尺寸失败保留旧配置。主菜单等待世界返回 AwaitingWorld，结束 UI 回调并保留 requested/pending；resize 先确保新尺寸的临时 NONE 配置可渲染，同尺寸 SDK 拒绝后暂停自动重试。小窗口可抬高实际输入比例，用户存储的质量档位保持原值。
 
 以下名称是目标类型，不表示已有导出函数。
 
@@ -116,7 +114,7 @@ FG 稳定原点与历史回执由现有 native FG 业务持有，明确区分待
 
 jitter 的矩阵规则固定为 `Pj = Tclip(2*jx/W, 2*jy/H) * P`，保留实际变换后的投影与深度约定。上传、velocity 和 VRS 已共用该计算。raster predecessor 在外层 `LevelRenderer.render` 成功返回后提交；该方法的几何准备、天空、main-pass 和后续清理异常均撤销当前帧候选，下一帧 previous 失效。provider 历史仍按各自成功评价提交。
 
-完整帧与 `PreparedFrame` 已按 schema2/ABI8 同时接入 C、FFM、native owner 和实际消费者。准备入口仅发布一次真实输入，native 构造 TAA/SR/DLSS/FG 私有参数；原独立每帧 SDK 入口、JVM 相机常量和并行布局已删除。FG 由 native 保存 pending、SDK 已接受和实际 Present 成功的历史；包装型 FG 在新输入准备前结算上一 Present，保持相机与输入资源对应。构建与客户端覆盖状态见 [实施记录](work-graph-implementation.md#当前构建与运行)。
+完整帧与 `PreparedFrame` 已按 schema2/ABI8 同时接入 C、FFM、native owner 和实际消费者。准备入口仅发布一次真实输入，native 构造 TAA/SR/DLSS/FG 私有参数；原独立每帧 SDK 入口、JVM 相机常量和并行布局已删除。FG 由 native 保存 pending、SDK 已接受和实际 Present 成功的历史；包装型 FG 在新输入准备前结算上一 Present，保持相机与输入资源对应。
 
 ### 4.1 世界、第一人称与最终场景
 
@@ -151,9 +149,9 @@ flowchart TD
 
 新增不可变 `DisplayFrameInputs`，携带与世界相同的 identity/historyGeneration、scene/resource/viewport 版本、最终 scene color、显示尺寸、各层 depth/coverage/motion、真实 current/previous 投影和 post 变换契约。第一人称、屏幕效果、outline、透明混合与 custom 来源分别拥有 provenance；数据缺失表达为具体 availability。SDK adapter 从这些真实事实构造所需格式和深度/运动约定，不能把混合 HUD depth 直接标成世界深度，也不能把零 motion 伪报成真实 guide。
 
-世界重建发布一次，显示输入按 GUI 前 Prepare、GUI 后 Submit 两阶段接线。SR evaluate 与 DLSS evaluate 中的两处 FG 自动 tag 已移除；最终场景在 post 完成、GUI 前封闭，FG 在 GUI 完成后接收最终场景与实际 UI，同一帧禁止再次推进 pendingCamera。SDK 接受、提交和实际 Present 成功继续分别记录，生成帧不成为世界或 viewmodel 前驱。当前源码 ABI 和新增 OIT 描述见 [FFM ABI](../misc/ffm-abi.md)；显示与世界输入继续使用 schema2，显示帧 672 字节，mesh 描述符保留显式 raw MRT 标记，大小为 104 字节。
+世界重建发布一次，显示输入按 GUI 前 Prepare、GUI 后 Submit 两阶段接线。SR evaluate 与 DLSS evaluate 中的两处 FG 自动 tag 已移除；最终场景在 post 完成、GUI 前封闭，FG 在 GUI 完成后接收最终场景与实际 UI，同一帧禁止再次推进 pendingCamera。SDK 接受、提交和实际 Present 成功继续分别记录，生成帧不成为世界或 viewmodel 前驱。当前源码 ABI 和新增 OIT 描述见 [FFM ABI](../docs/misc/ffm-abi.md)；显示与世界输入继续使用 schema2，显示帧 672 字节，mesh 描述符保留显式 raw MRT 标记，大小为 104 字节。
 
-FG 同帧提前提交已接线：`beforeGui` 在现有 GuiReady 后 Prepare，native 深复制 scene/layers/posts/cameras，先提交 world + guides、保存准确 `guideFence` 并换 ring，CPU 随后录制 GUI；`afterGui` Submit 只补 UI/backdrop，核对冻结值并等待同帧 guide 结果，有效性通过后才接受 SDK。中间提交不创建最终 Present ticket，输入/输出及描述符租约跨阶段保留。世界与手部分别提供独立 R8 coverage，SR/AA 继续只读有限值 RG16F motion。当前实现与配套构建、运行确认分开记录，见[实施记录](work-graph-implementation.md#当前构建与运行)；等待缩短和吞吐收益尚未测量。
+FG 同帧提前提交已接线：`beforeGui` 在现有 GuiReady 后 Prepare，native 深复制 scene/layers/posts/cameras，先提交 world + guides、保存准确 `guideFence` 并换 ring，CPU 随后录制 GUI；`afterGui` Submit 只补 UI/backdrop，核对冻结值并等待同帧 guide 结果，有效性通过后才接受 SDK。中间提交不创建最终 Present ticket，输入/输出及描述符租约跨阶段保留。世界与手部分别提供独立 R8 coverage，SR/AA 继续只读有限值 RG16F motion。等待缩短和吞吐收益尚未测量。
 
 SceneDisplay 在异步 FG 消费期间保持内容稳定，GUI 使用独立目标；wrapper 保活与纹理内容不再被覆盖分别由资源租约及轮转/完成依赖保证。resize、world/config/source/history 变化同时撤销未提交的世界和 display 候选。100% 和无 SR 也使用相同角色与顺序，缺失必需资源或已选能力的输入协议时通过明确错误通道报告，不添加隐式旧路径。
 
@@ -173,7 +171,7 @@ motion 不拆散原有批次：同一 PSO/布局的连续 draw 共享一次准�
 4. 调度器按 context、实际 resource 与 subresource 保存访问前沿并合并重复只读访问；不追加逐 draw 的完整历史与长生命周期 token，也不对每个 draw 扫描本帧全部旧 uses。资源保活继续服从实际 recording/fence。
 5. 在 SRV transition 前拒绝与实际 color/depth/motion attachment 重叠；UPLOAD 保持 `GENERIC_READ`，READBACK 不能作为 draw 读取。terrain/SDK 已有声明保留其 owner；生产拒绝通过既有错误出口终止本次录制，不重放已录 draw。
 
-普通输入导入已按这些约束接入，native/JVM 构建和隔离世界运行结果见 [实施记录](work-graph-implementation.md)；完整帧业务所有权、所有资源布局和性能仍按各自实际证据记录。
+普通输入导入已按这些约束接入；完整帧业务所有权、所有资源布局和性能仍按各自实际证据记录。
 
 动态视觉验证由用户观察具体场景的拖影、闪烁、轮廓残影和稳定性；代理提交已构建产物、观察项及可量化证据，静态截图不作为动态画质验收。必要的验证实现与生产模块隔离，不新增启动行为自检或验收专用业务分支。
 
@@ -220,7 +218,7 @@ JVM 从实际 MDI 批次生成每 section 40 字节的候选范围，复用批�
 - `MeshletCull` 沿用保守包围盒、方向掩码和相机数据。双面/非轴向和无界几何保留现有放行规则。
 - `EmitVisible` 以 coalescing 收集最多 64 个存活项，每组一次领取连续 visible 槽位，写入原 descriptor/section 对；容量溢出设置错误位，由参数终结阶段禁用整批绘制。
 
-三节点融合候选保存在 `src/probes/terrain_nodes/fused-candidate.hlsl`。它通过真实 GPU 输出检查，逐轮提交的均值更低，但单列表连续派发出现约 8.4 ms 长尾，dense/sparse 平均耗时升高。工程决定保留五节点生产图，融合候选不进入发布资源；两组原始计时与范围见实施记录。
+三节点融合候选保存在 `src/probes/terrain_nodes/fused-candidate.hlsl`。它通过真实 GPU 输出检查，逐轮提交的均值更低，但单列表连续派发出现约 8.4 ms 长尾，dense/sparse 平均耗时升高。工程决定保留五节点生产图，融合候选不进入发布资源。
 
 WG 承担细粒度剔除，后续 MS 消费压紧工作项，不重复运行同一套 AS 细剔除。复用 MS 顶点解码与 PS 输出，新增直接读取可见工作表的 MS 入口；16/32/64 变体仍由明确的 pipeline 配置选择。
 
@@ -287,15 +285,13 @@ FEATURE 复用现有 model Key/cube、item Slot/stack/quads/topology 和 particl
 
 BORDER 复用真实成功上传的 16 个顶点、mesh generation、dynamic ModelView/TextureMat/offset/color 和实际毫秒相位。原版集合出口逐项调用 backend.drawIndexed，按真实 firstIndex 选择 side，保留原排序。3 秒 UV 周期只有在 sampler 为 repeat 且实际变换认证通过时展开。
 
-ABI21 的真实 Present 历史回执、terrain records 与配套接线修正已进入生产循环；用户在 DLAA/M、FG 关闭、无采集的客户端确认固定残影消失。FEATURE/BORDER 的源码接线已完成，capture 缓存 schema 为 `/5`；JVM 完整构建和包检查已经通过，当前 JAR 与 Release DLL 的哈希、运行资源和关键 class 见[实施记录](work-graph-implementation.md#当前构建与运行)。运行窗口仍保留此前 terrain 版本，因此新 `/5` capture、完整 vertex 闭包认证、terrain lightmap identity 和 legacy guide 延迟分配尚未获得实机动态确认。完整透明任务继续覆盖 TRANSMITTANCE alpha/coverage AA、未认证 FEATURE 来源和多贡献 FG guides。连续全图采集曾把帧率降到约 3 FPS，现有序列仅供离线分析，动态画质确认由用户在正常运行条件下完成。
+ABI21 的真实 Present 历史回执、terrain records 与配套接线修正已进入生产循环；用户在 DLAA/M、FG 关闭、无采集的客户端确认固定残影消失。FEATURE/BORDER 的源码接线已完成，capture 缓存 schema 为 `/5`；JVM 完整构建和包检查已经通过。运行窗口仍保留此前 terrain 版本，因此新 `/5` capture、完整 vertex 闭包认证、terrain lightmap identity 和 legacy guide 延迟分配尚未获得实机动态确认。完整透明任务继续覆盖 TRANSMITTANCE alpha/coverage AA、未认证 FEATURE 来源和多贡献 FG guides。连续全图采集曾把帧率降到约 3 FPS，现有序列仅供离线分析，动态画质确认由用户在正常运行条件下完成。
 
 未产生 records 的真实 ACCUMULATE draw 必须写独立 R8/MAX 覆盖图，按原 discard/depth 后存活的片元标记，包含 q 为零和 additive alpha 为零的片元。Resolve V3 将非零覆盖像素标为 unknown，保留完整当前 accumulate；若实际 draw 无法生成覆盖，提交明确的 UNAVAILABLE，整帧保留 unknown。空 draw、仅 setPipeline 或失败的 draw 事务不登记缺失；EMPTY 与零覆盖不能抵消已声明的 unknown。覆盖图按帧清零，归 OIT 域与原 encoder 所有，不用当前颜色或“记录数为零”猜测完整性。ABI19 已接入正常循环、材质 RGB 历史与分阶段世界输出；TRANSMITTANCE alpha/coverage AA 和未认证 producer 的完整 records 继续列为确定的实施项。
 
-该工作包的当前调查与源码范围见 [实施记录](work-graph-implementation.md#云oit-输入调查2026-11-15)，生产接入状态按该记录更新。
-
 #### 5.5.1 四子样本 tile 流式覆盖
 
-完整 alpha/coverage AA 固定采用 tile 流式执行，详细执行契约见 [TRANSMITTANCE 四子样本 tile 执行契约](transmittance-tile-execution.md)。每 tile 的四个当前子样本分别保存 bounds、coeff 和 Q，按真实 producer 顺序完成 DEPTH_BOUNDS → TRANSMITTANCE → ACCUMULATE，再各自执行原版 normalization/composite 数学，平均四个已归一化的透明结果。tile 完成后复用临时存储，不把整屏四子样本 fragment 塞进全局 records 池。当前 262144 条 records 在 4K 单层四子样本下仅覆盖约 0.79%，其职责限定为有界稀疏材质历史，容量不限制当前完整覆盖或 overdraw。
+完整 alpha/coverage AA 固定采用 tile 流式执行，详细执行契约见 [TRANSMITTANCE 四子样本 tile 执行契约](../docs/rendering/transmittance-tile-execution.md)。每 tile 的四个当前子样本分别保存 bounds、coeff 和 Q，按真实 producer 顺序完成 DEPTH_BOUNDS → TRANSMITTANCE → ACCUMULATE，再各自执行原版 normalization/composite 数学，平均四个已归一化的透明结果。tile 完成后复用临时存储，不把整屏四子样本 fragment 塞进全局 records 池。当前 262144 条 records 在 4K 单层四子样本下仅覆盖约 0.79%，其职责限定为有界稀疏材质历史，容量不限制当前完整覆盖或 overdraw。
 
 draw 输入由真实生产调用捕获：普通 IA 保留实际 VB/IB/instance，terrain 保留已生成的 WG visible/arguments、真实静态 VBO、globals/atlas 范围和 DISPATCH_MESH signature。packet 还保存原 producer/stage 序号、pipeline/root generation、绑定、push constants、viewport/scissor 和资源租约。原 draw 仍执行一次，tile 消费捕获的事实；不重新运行 Minecraft producer，不建第二套静态几何 atlas。
 
@@ -313,7 +309,7 @@ CPU submit handshake 只归还 command context 的录制所有权；allocator、
 
 `FrameResources` 按在途提交槽持有资源；CPU 帧号取模不证明可复用。跨真实帧历史与 FG 长期消费单独持有租约，不能在本帧 direct fence 完成时释放仍被 SDK 消费的资源。
 
-资源内容重载成功发布时推进帧 `resourceVersion`，附件对象没有替换也必须撤销旧内容的时域兼容；失败或撤销的重载不推进。版本 owner 与发布接线见 [着色器缓存与错误](../shaders/README.md#7-缓存与错误)。
+资源内容重载成功发布时推进帧 `resourceVersion`，附件对象没有替换也必须撤销旧内容的时域兼容；失败或撤销的重载不推进。版本 owner 与发布接线见 [着色器缓存与错误](../docs/shaders/README.md#7-缓存与错误)。
 
 ### 6.2 上传、描述符与绑定
 
@@ -324,7 +320,7 @@ CPU submit handshake 只归还 command context 的录制所有权；allocator、
 - readback 回调绑定 context/submission/fence 与 lease，由完成队列触发；禁止任意 encoder submit 清空全局回调队列。
 - 格式元信息、深度/模板 plane 与 `GetCopyableFootprints` 统一，修正当前深度格式分类缺口，避免帧输入拷贝建立在错误步长上。
 
-A2 的当前接线见 [实施记录](work-graph-implementation.md#a2-当前接线)：上传页按实际提交 fence 退休，图形与 compute 描述符页按 command context 保留并安全扩容，SRV 缓存包含布局与 view 序列。单 plane、单 sample 的深度 buffer 拷贝使用 API footprint；texture-to-texture 完整 depth/stencil subresource 遍历全部 plane。当前 SPI 无法表达的多 plane buffer 布局或部分 depth/stencil 拷贝明确拒绝。
+A2 当前接线如下：上传页按实际提交 fence 退休，图形与 compute 描述符页按 command context 保留并安全扩容，SRV 缓存包含布局与 view 序列。单 plane、单 sample 的深度 buffer 拷贝使用 API footprint；texture-to-texture 完整 depth/stencil subresource 遍历全部 plane。当前 SPI 无法表达的多 plane buffer 布局或部分 depth/stencil 拷贝明确拒绝。
 
 ### 6.3 Work Graph 专用状态
 
@@ -398,9 +394,9 @@ WG 调度不是免费操作，CPU 减负可能换来 GPU 瓶颈。记录粒度�
 | `render/terrain/mesh/D3D12MeshletShader.kt` | 保留解码，新增可见表消费入口 |
 | `render/frame/vanilla/VanillaWorldOutput.kt`、`render/reconstruction/ReconstructionFrameInputs.kt` | 世界资源事实；历史由 native 拥有 |
 
-native 对应相邻 MCDR 的 `src/backend/device/d3d12_device.cpp`、`src/backend/shader/d3d12_shader.cpp`、`src/render/reconstruction` 和 `src/render/presentation`。新增的 `src/backend/workgraph/d3d12_workgraph.cpp` 已承担 capability 校验、state object 与 DispatchGraph；`src/render/terrain/d3d12_terrain_workgraph.cpp` 承担地形可见表与间接参数业务。消费者接线与验证状态见实施记录。
+native 对应相邻 MCDR 的 `src/backend/device/d3d12_device.cpp`、`src/backend/shader/d3d12_shader.cpp`、`src/render/reconstruction` 和 `src/render/presentation`。新增的 `src/backend/workgraph/d3d12_workgraph.cpp` 已承担 capability 校验、state object 与 DispatchGraph；`src/render/terrain/d3d12_terrain_workgraph.cpp` 承担地形可见表与间接参数业务。
 
-API 依据核对于 2026-11-11：
+API 依据：
 
 - [Microsoft Work Graphs 规范](https://microsoft.github.io/DirectX-Specs/d3d/WorkGraphs.html)：能力、记录、backing memory、UAV 可见性、跨节点 join、SetProgram/DispatchGraph。
 - [D3D12 Work Graphs 官方发布说明](https://devblogs.microsoft.com/directx/d3d12-work-graphs/)：基础 compute 工作图与 PIX 调试。
@@ -408,12 +404,12 @@ API 依据核对于 2026-11-11：
 - [D3D12 间接绘制规范](https://microsoft.github.io/DirectX-Specs/d3d/IndirectDrawing.html)：command signature、参数缓冲与间接执行边界。
 - [D3D12 Mesh Shader 规范](https://microsoft.github.io/DirectX-Specs/d3d/MeshShader.html)：mesh 输出、派发限制和光栅顺序。
 
-本页的提交、资源与帧业务基础也服务 [Redstone Plan](<redstone plan.md>) 中的 SR/FG；RR/RC 不属于本次光栅优化的实施范围。
+本页的提交、资源与帧业务基础也服务 [Redstone Plan](redstone.md) 中的 SR/FG；RR/RC 不属于本次光栅优化的实施范围。
 
 ## 当前确定边界
 
-完整 A–K 目标尚未完成，已交付部分以 `work-graph-implementation.md` 和 `graphics-bindings.md` 的实际记录为准。当前 world-post/普通 raster/terrain/GUI/surface source 资源声明、完整帧与 PreparedFrame、第一人称独立输入、业务编译所有权及版本化预热均已接线。provider 私有资源和 backbuffer/Present 继续由各自 native owner 管理；GPU-input 接口已有独立验证，游戏接入须对应明确生产者。实现缺口集中于完整 guides，内容变更/重叠重载、最新配套版本的 SDK 场景及 PIX/Nsight 性能比较仍待各自证据。编译、独立 GPU 探针、游戏运行与性能结论分别报告。
+完整 A–K 目标尚未完成，已交付部分以 [graphics-bindings.md](../docs/rendering/graphics-bindings.md) 的实际记录为准。当前 world-post/普通 raster/terrain/GUI/surface source 资源声明、完整帧与 PreparedFrame、第一人称独立输入、业务编译所有权及版本化预热均已接线。provider 私有资源和 backbuffer/Present 继续由各自 native owner 管理；GPU-input 接口已有独立验证，游戏接入须对应明确生产者。实现缺口集中于完整 guides，内容变更/重叠重载、最新配套版本的 SDK 场景及 PIX/Nsight 性能比较仍待各自证据。编译、独立 GPU 探针、游戏运行与性能结论分别报告。
 
-显示 `DisplayFrameGuides` 已加入版本化预热；世界运动完整性、实际像素 coverage 和透明/OIT availability 已在显示 Prepare/Submit 中汇合，缺少真实 previous/provenance 时跳过本帧 FG 并清理 provider 输入。静态相机能力按实际展开源码和受控 defines 确认，天体 previous 与实际颜色贡献判定已接入；partial/additive/OIT 的实际贡献仍保守无效，多运动透明尚未完成，未知 post 跳过本帧 FG。mesh 批次去重列表已接入源码，三节点仅保留为独立融合候选；构建与性能证据见实施记录。当前来源规则集中记录在 [实施记录：ABI10 运动来源与像素贡献](work-graph-implementation.md#abi10-运动来源与像素贡献)，旧检查点构建保留其原版本范围。
+显示 `DisplayFrameGuides` 已加入版本化预热；世界运动完整性、实际像素 coverage 和透明/OIT availability 已在显示 Prepare/Submit 中汇合，缺少真实 previous/provenance 时跳过本帧 FG 并清理 provider 输入。静态相机能力按实际展开源码和受控 defines 确认，天体 previous 与实际颜色贡献判定已接入；partial/additive/OIT 的实际贡献仍保守无效，多运动透明尚未完成，未知 post 跳过本帧 FG。mesh 批次去重列表已接入源码，三节点仅保留为独立融合候选。旧检查点构建保留其原版本范围。
 
-构建、客户端覆盖与 resize 后退出确认集中记录在 [实施记录：当前构建与运行](work-graph-implementation.md#当前构建与运行)。mask V2 将 FSR reactive/composition 与 XeSS responsive 分开生成，采用真实颜色/深度历史、motion 和 OIT 来源，不保留旧均值读回。SR Streamline viewport 随候选发布，使用 2..4，FG 使用 viewport1。§4.1 的提前提交已接线，最终阶段仍保留同帧 validity 等待/回读，性能没有实测。
+mask V2 将 FSR reactive/composition 与 XeSS responsive 分开生成，采用真实颜色/深度历史、motion 和 OIT 来源，不保留旧均值读回。SR Streamline viewport 随候选发布，使用 2..4，FG 使用 viewport1。§4.1 的提前提交已接线，最终阶段仍保留同帧 validity 等待/回读，性能没有实测。

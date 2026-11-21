@@ -14,11 +14,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 
 /**
- * 把 vanilla 的 `RenderPipeline`（连同 GLSL 源）登记进 `D3D12PipelineBridge`。
- *
- * <p>本后端的编译链要 GLSL 源码与 `shaderDefines`，而 `GpuDeviceBackend.compilePipeline` 只收到
- * SPIR-V + 状态；`ShaderSource` 是逐次传入的，`createDevice` 已经不收它了 —— 只登记管线的话首帧
- * 编译拿不到源码。只读两个参数，不改变 vanilla 行为。
+ * 把 vanilla 的 `RenderPipeline`（连同 GLSL 源）登记进 `D3D12PipelineBridge`。本后端的编译链要 GLSL 源码与
+ * `shaderDefines`，而 `GpuDeviceBackend.compilePipeline` 只收到 SPIR-V + 状态、`ShaderSource` 是逐次传入的，
+ * 只登记管线的话首帧编译拿不到源码。只读两个参数，不改变 vanilla 行为。
  */
 @Mixin(FrontendGpuDevice.class)
 public class FrontendGpuDeviceCompilePipelineMixin {

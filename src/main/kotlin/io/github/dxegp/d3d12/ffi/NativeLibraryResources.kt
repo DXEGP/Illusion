@@ -20,7 +20,7 @@ internal object NativeLibraryResources {
         }
         return target.toAbsolutePath()
     }
-    /** Copy MCDR.dll to `<user.dir>/dxrmc/` and return the path; refreshed on a byte difference, not on timestamps (JAR entries are pinned to 1980 and two DLLs can share a size). */
+    /** Copy MCDR.dll to `<user.dir>/dxrmc/` and return the path; refreshed on a byte difference, not on timestamps (JAR entries are pinned to 1980). */
     fun extractLibrary(): Path {
         val dir = Path.of(System.getProperty("user.dir"), EXTRACT_DIR)
         Files.createDirectories(dir)

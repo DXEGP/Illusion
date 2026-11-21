@@ -15,21 +15,13 @@ import org.slf4j.LoggerFactory
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-/**
- * Temporal (TAAU) base state: sub-pixel jitter, previous-frame/history management, per-object records.
- *
- * Jitter translates clip-space x/y in the **level** projection only, never into the 3D
- * HUD; history must always keep the **unjittered** matrix or the velocity field is polluted. Halton(2,3)
- * in pixels, `[-0.5, +0.5)`, injected only when something consumes it ([hasJitterConsumer]).
- * See docs/antialiasing/README.md §3.
- */
 object D3D12Temporal {
     private val LOGGER: Logger = LoggerFactory.getLogger("dxrmc-temporal")
 
-    /** Samples per jitter cycle (a power of two keeps it aligned with the 8/16-sample TAAU presets). */
+    /** Samples per jitter cycle; a power of two keeps it aligned with the 8/16-sample TAAU presets. */
     const val DEFAULT_JITTER_SAMPLES: Int = 16
 
-    /** GPU readback of the object/chunk UBOs. **Must stay false**: it turns the whole frame into the clear colour. */
+    /** Object/chunk UBO capture by readback. **Must stay false**: it turns the whole frame into the clear colour. */
     private const val CAPTURE_UNIFORMS_BY_READBACK: Boolean = false
 
     /** vanilla `ProjectionMatrixBuffer` label of the level instance; only this one gets the jitter. */
@@ -43,8 +35,8 @@ object D3D12Temporal {
     var enabled: Boolean = D3D12Settings.temporalChain
 
     /**
-     * Whether the temporal data plane must roll; TAA or DLSS/DLAA needs the jitter sequence and the history
-     * roll even with the dev switch [enabled] off, or TAA degrades into a static blur.
+     * Whether the temporal data plane must roll. TAA/DLSS/DLAA needs the jitter sequence and the history
+     * roll even with [enabled] off, or TAA degrades into a static blur.
      */
     @JvmStatic
     fun isActive(): Boolean = enabled || D3D12TAA.isSelected() || DeepLearningSuperSampling.isEnabled() ||
@@ -53,8 +45,8 @@ object D3D12Temporal {
         io.github.dxegp.render.vrs.D3D12VariableShadingRate.isEnabled()
 
     /**
-     * Whether any temporal resolve really consumes the sub-pixel jitter; injecting it without a consumer
-     * makes the whole image wobble. The velocity/history rolls still follow [isActive].
+     * Whether any temporal resolve consumes the sub-pixel jitter; injecting it without a consumer wobbles
+     * the whole image. The velocity/history rolls still follow [isActive].
      */
     private fun hasJitterConsumer(): Boolean =
         D3D12TAA.isSelected() ||
@@ -137,12 +129,11 @@ object D3D12Temporal {
     var negotiatedPhaseCount: Int = 0
         private set
 
-    /** Last reported length, so the conclusion is logged once. */
     private var loggedPhaseCount: Int = -1
 
     /**
-     * Adopts a backend-reported phase length; never touches the injection switch. DLSS keeps 16 (it only
-     * needs `jitterOffset` to match); FSR/XeSS would switch to their own sequence.
+     * Adopts a backend-reported phase length; never touches the injection switch. DLSS keeps the caller's
+     * count (it only needs `jitterOffset` to match); FSR/XeSS switch to their own sequence.
      */
     fun adoptPhaseCount(backend: Int, reported: Int) {
         if (reported <= 0) {
@@ -178,10 +169,7 @@ object D3D12Temporal {
     private var previousJitterX: Double = 0.0
     private var previousJitterY: Double = 0.0
 
-    /**
-     * This frame's projection offset in pixels, `[-0.5, 0.5)`; velocity removes this offset and
-     * consumers account for jittered history sampling separately.
-     */
+    /** This frame's projection offset in pixels, `[-0.5, 0.5)`; velocity must remove this offset. */
     val currentJitterX: Double
         get() = jitterX
 
@@ -192,12 +180,11 @@ object D3D12Temporal {
     /** This frame's **unjittered** level projection (column-major, 16 floats, byte-identical to the uniform). */
     private var projection: FloatArray? = null
 
-    /** Previous frame's unjittered level projection. */
     private var previousProjection: FloatArray? = null
 
     /**
-     * This frame's unjittered level projection from vanilla's CPU render state ([captureProjection]); the UBO
-     * bytes are no projection matrix (no `m32 = -1`), which kills `w = -view.z` and every motion vector.
+     * This frame's unjittered projection from vanilla's CPU state ([captureProjection]); the UBO bytes are
+     * not a projection matrix (no `m32 = -1`), which kills every motion vector.
      */
     private var stateProjection: FloatArray? = null
 
@@ -220,7 +207,6 @@ object D3D12Temporal {
     @Volatile
     private var previousChunkSections: List<ChunkSection> = emptyList()
 
-    /** Camera world position this frame / previous frame. */
     private var cameraPosition: FloatArray? = null
     private var previousCameraPosition: FloatArray? = null
     private var cameraPositionDouble: DoubleArray? = null
@@ -230,13 +216,12 @@ object D3D12Temporal {
     private var stateCameraView: FloatArray? = null
     private var previousStateCameraView: FloatArray? = null
 
-    /** Cached Halton(2) / Halton(3) values, generated lazily. */
     private var halton2: DoubleArray = DoubleArray(0)
     private var halton3: DoubleArray = DoubleArray(0)
 
     /**
-     * History generation, bumped by [reset]; consumers must drop their cross-frame history when it changes,
-     * or a teleport smears for dozens of frames.
+     * Bumped by [reset]; consumers must drop their cross-frame history when it changes, or a teleport
+     * smears for dozens of frames.
      */
     @Volatile
     var historyGeneration: Long = 0L
@@ -256,7 +241,6 @@ object D3D12Temporal {
         injectedFrameId = Long.MIN_VALUE
         lastSizeWidth = 0
         lastSizeHeight = 0
-        // Bump the generation first: even if a release below throws, consumers already know not to blend.
         historyGeneration++
         jitterX = 0.0
         jitterY = 0.0
@@ -282,9 +266,7 @@ object D3D12Temporal {
         D3D12ObjectMotion.reset()
     }
 
-    /**
-     * Rolls history and advances the jitter; must run at the frame start, before any uniform upload.
-     */
+    /** Rolls history and advances the jitter; must run at the frame start, before any uniform upload. */
     @Synchronized
     fun beginFrame() {
         val minecraft = Minecraft.getInstance()
@@ -295,8 +277,6 @@ object D3D12Temporal {
         uploadFrameNs = renderFrameTimeNanos
         previousCameraPosition = cameraPosition
         previousCameraPositionDouble = cameraPositionDouble
-        // Camera position comes straight from `Camera` at the frame start. Deriving it from the Global
-        // Settings UBO gave garbage, and garbage there means a zero motion field and permanent ghosting.
         captureCameraFromCamera()
         previousJitterX = jitterX
         previousJitterY = jitterY
@@ -306,17 +286,14 @@ object D3D12Temporal {
         modelViews = ArrayList(previousModelViews.size + 8)
         previousChunkSections = chunkSections
         chunkSections = ArrayList(previousChunkSections.size + 8)
-        // CPU-side camera model-view rolls in the same frame as the rest.
         previousStateCameraView = stateCameraView
         stateCameraView = null
-        // Same for the CPU-side level projection.
         previousStateProjection = stateProjection
         stateProjection = null
 
         val n = jitterSamples
         ensureHalton(n)
         val index = (frameIndex % n).toInt()
-        // Halton (0,1) -> centred pixel offset [-0.5, +0.5); without a consumer the jitter must be exactly 0.
         if (hasJitterConsumer() && jitterEnabled) {
             jitterX = halton2[index] - 0.5
             jitterY = halton3[index] - 0.5
@@ -325,10 +302,7 @@ object D3D12Temporal {
             jitterY = 0.0
         }
         frameIndex++
-        // Velocity textures roll on the same beat.
         D3D12Velocity.beginFrame()
-        // So does the TAA history ping-pong.
-        // Per-object snapshots: entity positions are final after tick(), the velocity pass records at frame end.
         D3D12ObjectMotion.beginFrame()
         D3D12ObjectMotion.harvestVisible()
     }
@@ -344,7 +318,6 @@ object D3D12Temporal {
         if (pristine.size != 16) {
             return pristine
         }
-        // Advance at most once per frame (see [uploadFrameNs]).
         if (Minecraft.getInstance().level == null || width <= 0 || height <= 0) return pristine.copyOf()
         if (!isActive()) return pristine.copyOf()
         if (lastSizeWidth != 0 && (lastSizeWidth != width || lastSizeHeight != height)) reset()
@@ -352,7 +325,6 @@ object D3D12Temporal {
         lastSizeWidth = width
         lastSizeHeight = height
         projection = pristine.copyOf()
-        // Only a real temporal consumer gets jittered (SMAA/OFF must stay pristine).
         if (!hasJitterConsumer() || !jitterEnabled) {
             return pristine.copyOf()
         }
@@ -361,9 +333,7 @@ object D3D12Temporal {
         return jitterProjection(pristine, clipJitterX(width), clipJitterY(height))
     }
 
-    /**
-     * Applies a clip-space translation to the projection while preserving its depth and homogeneous rows.
-     */
+    /** Applies a clip-space translation to the projection, preserving its depth and homogeneous rows. */
     fun jitterProjection(pristine: FloatArray, clipX: Double, clipY: Double): FloatArray {
         val out = pristine.copyOf()
         for (column in 0 until 4) {
@@ -419,8 +389,6 @@ object D3D12Temporal {
         if (buffer !is D3D12GpuBuffer) {
             return null
         }
-        // Injection is the default: TAA and DLSS share one sequence. The old "do not replace while frozen"
-        // branch was a misdiagnosis — the real bug was the byte order in [readFloats].
         return when (buffer.label()) {
             LEVEL_PROJECTION_LABEL -> interceptLevelProjectionWrite(destination, data)
             else -> null
@@ -441,7 +409,6 @@ object D3D12Temporal {
         captureCamera(pos.x.toFloat(), pos.y.toFloat(), pos.z.toFloat())
     }
 
-    /** Jitter injection for the level projection (called from [interceptWrite] only). */
     private fun interceptLevelProjectionWrite(destination: GpuBufferSlice, data: ByteBuffer): ByteBuffer? {
         discardLevelProjectionUpload(destination)
         if (data.remaining() != 64) {
@@ -465,15 +432,12 @@ object D3D12Temporal {
             width, height, uploadJitterX, uploadJitterY, pristine, jittered)
         lastRollFrameId = retiredDisplayFrameId
 
-        // Rewrite the caller's buffer in place (offsets relative to `position`): a fresh buffer breaks the
-        // caller's length/lifetime assumptions.
         val payload = try {
             val view = data.duplicate().order(ByteOrder.LITTLE_ENDIAN)
             view.position(data.position())
             view.asFloatBuffer().put(jittered, 0, 16)
             data
         } catch (t: Throwable) {
-            // Read-only buffer: fall back to a new buffer, which carries the full 64 B payload.
             val out = ByteBuffer.allocate(data.remaining()).order(ByteOrder.LITTLE_ENDIAN)
             out.asFloatBuffer().put(jittered, 0, 16)
             out
@@ -483,21 +447,18 @@ object D3D12Temporal {
     }
 
     /**
-     * Per-object UBO capture hook (`D3D12RenderPassBackend.setUniform`), keyed by uniform name. Currently
-     * inert: [CAPTURE_UNIFORMS_BY_READBACK] stays false, the write-map readback of vanilla's UBO rings
-     * (usage 130, no MAP_READ) collapses the frame into the clear colour.
+     * Per-object UBO capture hook (`D3D12RenderPassBackend.setUniform`), keyed by uniform name. Inert while
+     * [CAPTURE_UNIFORMS_BY_READBACK] stays false.
      */
     fun captureUniform(name: String, value: GpuBufferSlice) {
         if (!isActive()) {
             return
         }
-        // GPU readback is off (see above): the per-object history has no data yet.
         if (CAPTURE_UNIFORMS_BY_READBACK) {
             captureUniformByReadback(name, value)
         }
     }
 
-    /** Disabled readback path, kept for when native supports MAP_READ. */
     private fun captureUniformByReadback(name: String, value: GpuBufferSlice) {
         try {
             when (name) {
@@ -518,7 +479,6 @@ object D3D12Temporal {
                 }
             }
         } catch (e: Exception) {
-            // Unmappable or closed buffer: skip the capture (it is purely additive data).
         }
     }
 
@@ -538,15 +498,11 @@ object D3D12Temporal {
     /** Reads `count` little-endian floats at [offset] bytes from the caller's current position. */
     private fun readFloats(data: ByteBuffer, offset: Int, count: Int): FloatArray? {
         val fb = data.duplicate().order(ByteOrder.LITTLE_ENDIAN)
-        // The offset is relative to the caller's current position (`uploadStaging` copies position..limit);
-        // an absolute offset reads misaligned bytes and the projection comes back as garbage.
         val base = data.position() + offset
         if (offset < 0 || fb.limit() - base < count * 4) {
             return null
         }
         fb.position(base)
-        // `slice()` returns a BIG_ENDIAN view (JDK contract): the byte order must be set again after
-        // slicing, or every float comes back byte-swapped.
         val slice = fb.slice().order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
         if (slice.remaining() < count) {
             return null
@@ -575,8 +531,7 @@ object D3D12Temporal {
 
     /**
      * Maps a buffer slice and reads floats. vanilla's dynamic UBO rings are usage 130 (MAP_WRITE, no
-     * MAP_READ) and native's `mapBuffer` warns on every call — tens of thousands of stderr lines stall the
-     * render thread. So check the bit here, map for write and read the CPU-visible UPLOAD memory.
+     * MAP_READ), so the MAP_WRITE bit is checked here before mapping for write.
      */
     private fun mapFloats(buffer: GpuBuffer, offset: Long, count: Int): FloatArray? {
         if (!isHostVisible(buffer)) {
@@ -618,7 +573,6 @@ object D3D12Temporal {
         }
     }
 
-    /** Previous frame's jitter in pixels. */
     @Synchronized
     fun previousJitter(): DoubleArray = doubleArrayOf(previousJitterX, previousJitterY)
 
@@ -626,7 +580,6 @@ object D3D12Temporal {
     @Synchronized
     fun clipJitterX(width: Int): Double = if (width <= 0) 0.0 else 2.0 * jitterX / width
 
-    /** This frame's jitter as a clip-space Y offset. */
     @Synchronized
     fun clipJitterY(height: Int): Double = if (height <= 0) 0.0 else 2.0 * jitterY / height
 
@@ -639,7 +592,6 @@ object D3D12Temporal {
         stateProjection = matrix.copyOf()
     }
 
-    /** This frame's unjittered projection. */
     @Synchronized
     fun currentProjection(): FloatArray? = projection?.copyOf() ?: stateProjection?.copyOf()
 
@@ -660,7 +612,6 @@ object D3D12Temporal {
     @Synchronized
     fun previousViewProj(): FloatArray? = previousViewProj?.copyOf()
 
-    /** This frame's captured view-projection. */
     @Synchronized
     fun currentViewProj(): FloatArray? = viewProj?.copyOf()
 
@@ -683,11 +634,9 @@ object D3D12Temporal {
         return list[index].copyOf()
     }
 
-    /** Number of model matrices recorded this frame. */
     @Synchronized
     fun modelViewCount(): Int = modelViews.size
 
-    /** Number of model matrices recorded last frame. */
     @Synchronized
     fun previousModelViewCount(): Int = previousModelViews.size
 
@@ -711,21 +660,18 @@ object D3D12Temporal {
         return ChunkSection(s.modelView.copyOf(), s.x, s.y, s.z)
     }
 
-    /** Number of chunks recorded this frame. */
     @Synchronized
     fun chunkSectionCount(): Int = chunkSections.size
 
-    /** Number of chunks recorded last frame. */
     @Synchronized
     fun previousChunkSectionCount(): Int = previousChunkSections.size
 
     /**
-     * This frame's camera model-view. vanilla writes the same matrix into every chunk's `ChunkSection`, so
-     * any record holds it — chunks first, they draw first.
+     * This frame's camera model-view. vanilla writes the same matrix into every `ChunkSection`, so chunks
+     * are probed first — they draw first.
      */
     @Synchronized
     fun currentCameraView(): FloatArray? {
-        // Prefer the CPU render state; the UBO readback is gone.
         stateCameraView?.let { return it.copyOf() }
         if (chunkSections.isNotEmpty()) {
             return chunkSections[0].modelView.copyOf()
@@ -790,7 +736,6 @@ object D3D12Temporal {
         cameraPosition = floatArrayOf(x, y, z)
     }
 
-    /** This frame's camera world position. */
     @Synchronized
     fun currentCameraPosition(): FloatArray? = cameraPosition?.copyOf()
 

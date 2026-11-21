@@ -23,12 +23,9 @@ internal class FfmScratch {
     }
 
     /**
-     * Runs one synchronous FFM encoding/downcall scope.
-     *
-     * Cached slots are only used by the outermost scope. Nested calls receive a confined arena,
-     * so a helper that performs another ABI call cannot overwrite an address still owned by its
-     * caller. If the caller's estimate is smaller than a later target, a confined arena is
-     * created lazily by [allocate] and remains valid until this scope returns.
+     * Runs one synchronous FFM encoding/downcall scope. Cached slots are only used by the outermost scope; nested
+     * calls get a confined arena, so a helper that performs another ABI call cannot overwrite an address still owned
+     * by its caller. A later larger target gets a confined arena lazily in [allocate], valid until this scope returns.
      */
     @Suppress("NOTHING_TO_INLINE")
     inline fun <Result> withScope(

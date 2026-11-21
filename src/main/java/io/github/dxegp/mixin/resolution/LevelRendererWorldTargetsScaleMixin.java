@@ -11,12 +11,9 @@ import org.spongepowered.asm.mixin.injection.At;
 
 /**
  * 世界层辅助渲染目标（半透明 / 物品实体 / 粒子 / 天气 / 云）也按渲染尺寸分配。
- *
- * <p>必须与 `MainTargetRenderScaleMixin` 成对存在：主目标的逻辑尺寸仍是窗口尺寸，只有附件被缩小；
- * 辅助目标若停在窗口尺寸就会比源大，而 `copyDepthFrom` 拿**目标**尺寸当拷贝矩形却从源读，直接抛
- * `Source texture (1920x1000) is not large enough to read a rectangle of 2560x1334 at 0x0`。
- * 不能改用「夹取拷贝矩形」：目标比源大时只会拷左上角，深度与颜色错位。
- * 见 docs/misc/mixins-and-earlywindow.md §3.4
+ * 必须与 `MainTargetRenderScaleMixin` 成对存在：辅助目标若停在窗口尺寸就会比源大，而 `copyDepthFrom` 拿**目标**
+ * 尺寸当拷贝矩形却从源读，直接抛 `Source texture (1920x1000) is not large enough to read a rectangle of
+ * 2560x1334 at 0x0`。不能改用「夹取拷贝矩形」：目标比源大时只会拷左上角，深度与颜色错位。
  */
 @Mixin(LevelRenderer.class)
 public class LevelRendererWorldTargetsScaleMixin {

@@ -8,10 +8,8 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 
 /**
- * 标题界面的全景图也要画到 GUI 自己的目标上。
- *
- * <p>`CubeMap.render()` 比换目标那一刻更早；不拦这处，全景图进主目标、界面进 GUI 目标，标题界面
- * 只剩一片底色。
+ * 标题界面的全景图也要画到 GUI 自己的目标上。`CubeMap.render()` 比换目标那一刻更早，不拦这处，全景图进主
+ * 目标、界面进 GUI 目标，标题界面只剩一片底色。
  */
 @Mixin(CubeMap.class)
 public class CubeMapTargetMixin {

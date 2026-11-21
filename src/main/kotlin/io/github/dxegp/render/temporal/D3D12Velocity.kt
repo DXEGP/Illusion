@@ -27,24 +27,6 @@ import net.minecraft.client.Minecraft
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
-/**
- * Full-screen velocity composition: covered CPU entity models use raster guides; remaining pixels
- * use camera reprojection. The legacy path without a raster target uses entity translation in AABBs.
- *
- * Raw ABI pipeline (`MCDRPipelineDesc` takes HLSL directly; SM 6.9 / DXIL required, no SM 5.1
- * fallback). Bindings: entry 0 = CBV `register(b0)`, 256 B; entry 1 = depth SRV + static sampler
- * `register(t1)` / `register(s1)` (native remaps the depth format to `R32_FLOAT` or
- * `R32_FLOAT_X8X24_TYPELESS`); entry 2 = object rows as an `R32_FLOAT` texel buffer `register(t2)`,
- * no sampler.
- *
- * Output: `RG16_FLOAT` ping-pong, xy = screen-space motion in **pixels**, direction "this frame ->
- * previous frame" (DLSS convention; inverting it drags a ghost that never converges). The "previous"
- * half is not consumed yet — it is the history target of the TAA resolve.
- *
- * Per pixel: depth -> world with the *jittered* inverted current view-projection, project with the
- * previous frame's, motion = `(prevUv - uv) * ScreenSize`, then add the jitter and camera-translation
- * terms below. See docs/antialiasing/README.md §3.3.
- */
     /** [abandonedSteps] bit: the velocity textures or the parameter block failed to allocate/upload. */
 private const val STEP_RESOURCES: Int = 1
 
@@ -82,14 +64,11 @@ object D3D12Velocity {
     /** Two half floats of pixel motion (native ordinal 41). */
     val FORMAT: GpuFormat = GpuFormat.RG16_FLOAT
 
-    // RTV (written here) + SRV (read by the TAA resolve) + COPY_SRC (readback diagnostics).
-    // Must stay a single expression: K2 rejects a continuation line that starts with an operator.
     private val USAGE: Int = GpuTexture.USAGE_RENDER_ATTACHMENT or GpuTexture.USAGE_TEXTURE_BINDING or GpuTexture.USAGE_COPY_SRC
 
     /** MC `PrimitiveTopology.TRIANGLES` ordinal (native `toPrimitiveTopology` maps 4 -> TRIANGLELIST). */
     private const val TOPOLOGY_TRIANGLES: Int = 4
 
-    /** Write mask: both RG channels. */
     private const val WRITE_MASK_RG: Int = 0x3
 
     /** 256 B: D3D12 wants constant-buffer sizes 256-aligned even though only 172 B are used. */
@@ -98,7 +77,6 @@ object D3D12Velocity {
     /** Object rows as a texel `Buffer<float>` (native `pushDescriptors` accepts texel buffers only here), 16 floats per row. */
     private val OBJECT_FORMAT: GpuFormat = GpuFormat.R32_FLOAT
 
-    /** Object buffer size: [D3D12ObjectMotion.MAX_OBJECTS] rows of [D3D12ObjectMotion.ROW_FLOATS] floats. */
     private const val OBJECT_BYTES: Long = D3D12ObjectMotion.MAX_OBJECTS.toLong() * D3D12ObjectMotion.ROW_FLOATS * 4L
 
     /** AABB margin in blocks: swinging limbs briefly leave the box, and without it they drop out. */
@@ -107,7 +85,6 @@ object D3D12Velocity {
     /** Per-object motion cap in pixels; a larger delta means the row matched the wrong object (fall back). */
     private const val OBJECT_MAX_MOTION_PIXELS: Float = 128.0f
 
-    /** [recordedFrame] sentinel: nothing recorded yet. */
     private const val FRAME_NONE: Long = -1L
 
     /** Master switch, seeded from `[debug] temporalChain`; without a resolve it only writes another texture. */
@@ -137,7 +114,7 @@ object D3D12Velocity {
 
     private var pipeline: Long = 0L
 
-    /** Pipeline creation error (recorded once: no per-frame retry, no log spam). */
+    /** Pipeline creation error (recorded once: no per-frame retry). */
     private var pipelineError: String? = null
 
     /** Parameter block (own buffer; the label shows up in native diagnostics). */
@@ -146,7 +123,6 @@ object D3D12Velocity {
     /** Object row buffer (UPLOAD heap, bound as `t2` every frame). */
     private var objects: GpuBufferSlice? = null
 
-    /** Reused array so the per-frame row write allocates nothing. */
     private val objectScratch: FloatArray = FloatArray(D3D12ObjectMotion.MAX_OBJECTS * D3D12ObjectMotion.ROW_FLOATS)
 
     /** Rows actually bound this frame (0 = no per-object correction). */
@@ -161,13 +137,11 @@ object D3D12Velocity {
     /** Last recorded frame. DLSS records early, so the later call from `blitFromTexture` must short-circuit. */
     private var recordedFrame: Long = FRAME_NONE
 
-    /** Reason of the last failure (used when closing itself). */
     private var disabledReason: String? = null
 
     /**
      * Build steps already given up on: [STEP_RESOURCES], [STEP_DEPTH_VIEW], [STEP_PIPELINE].
-     * [forceEnable] clears these bits and [disabledReason] so the next [record] retries — without that
-     * one failed allocation would cost the motion vectors forever.
+     * [forceEnable] clears these bits so the next [record] retries.
      */
     private var abandonedSteps: Int = 0
 
@@ -297,11 +271,9 @@ object D3D12Velocity {
         if (!isActive()) {
             return false
         }
-        // While latched: short-circuit. A failed step leaves no residue, since a successful step stops creating.
         if (abandonedSteps != 0) {
             return false
         }
-        // Already recorded this frame (DLSS' hook runs before the blit): the earlier data is the valid one.
         val frame = sources.frame
         check(frame === VanillaFrameCoordinator.currentFrame()) { "Motion inputs belong to another world frame" }
         if (sources.phase == MotionPhase.FINAL && this.recordedFrame == frame.identity.realFrameId) {
@@ -395,23 +367,16 @@ object D3D12Velocity {
             MotionPhase.OPAQUE -> opaqueDepthView
         } ?: return false
 
-        // Use the same jittered matrix the depth was rendered with, else half a pixel of systematic error.
         val jittered = camera.rasterProjection()
         val currViewProj = D3D12Temporal.multiply(jittered, view)
         val prevViewProj = D3D12Temporal.multiply(prevProjection, previousView)
         val invCurr = invert(currViewProj) ?: return false
-        // Object rows: the pass answers "where was this pixel last frame", and the snapshot taken by this
-        // frame's extract is exactly that "previous frame" (which is why the roll happens in writeWorldRows).
         val rows = if (sources.raster != null) {
             objectCount = 0
             0
         } else uploadObjects()
-        // The shader emits an unjittered vector: it compensates the current projection jitter and does
-        // not add previous jitter. The previous value remains in the ABI block for diagnostics/consumers.
         val jitter = doubleArrayOf(camera.jitterX, camera.jitterY)
         val prevJitter = doubleArrayOf(previousCamera.jitterX, previousCamera.jitterY)
-        // Camera-translation term: the reprojected position is relative to this frame's camera while
-        // PrevViewProj carries rotation only, so without it all parallax from moving is lost.
         val camDelta = floatArrayOf((camera.originX - previousCamera.originX).toFloat(),
             (camera.originY - previousCamera.originY).toFloat(), (camera.originZ - previousCamera.originZ).toFloat())
         if (!writeParameters(uniformBuffer, prevViewProj, invCurr, w, h, rows,
@@ -444,7 +409,6 @@ object D3D12Velocity {
             MCDR_ABI.D3D12BeginRenderPass(ctx, longArrayOf(color.handle(), coverage.handle()), intArrayOf(0, 0),
                 byteArrayOf(1, 1), FloatArray(8),
                 0L, 0, 0.toByte(), 0.0, 0, 0, w, h)
-            // Viewport / scissor are command-list state and must be set for every pass.
             MCDR_ABI.D3D12SetViewport(ctx, 0, 0, w, h)
             MCDR_ABI.D3D12SetScissor(ctx, 0, 0, w, h)
             if (!MCDR_ABI.D3D12SetPipeline(ctx, this.pipeline, false)) {
@@ -452,7 +416,6 @@ object D3D12Velocity {
                 MCDR_ABI.D3D12EndRenderPass(ctx)
                 return@declaredPass false
             }
-            // `t2` = object rows; the array order matches register(t1)/register(t2) through the binding table.
             val pushed = MCDR_ABI.D3D12PushDescriptors(ctx,
                 intArrayOf(0, 1, 2, 1),
                 longArrayOf((uniformBuffer.buffer() as D3D12GpuBuffer).handle(), 0L,
@@ -475,7 +438,6 @@ object D3D12Velocity {
             true
         }
         if (!recorded) return false
-        // Remember the recording so the second call in the same frame short-circuits (see [recordedFrame]).
         when (sources.phase) {
             MotionPhase.FINAL -> recordedFrame = frame.identity.realFrameId
             MotionPhase.OPAQUE -> opaqueSources = sources
@@ -483,7 +445,6 @@ object D3D12Velocity {
         return true
     }
 
-    /** Allocates the ping-pong textures plus their views, the parameter block and the object rows. */
     private fun ensureResources(device: D3D12Device, w: Int, h: Int): Boolean {
         if (this.current != null && this.previous != null && currentCoverage != null && previousCoverage != null &&
             this.width == w && this.height == h) {
@@ -497,10 +458,8 @@ object D3D12Velocity {
             previousCoverage = D3D12GpuTexture(USAGE, "World motion coverage (previous)", GpuFormat.R8_UNORM, w, h, 1, 1)
             this.currentView = D3D12GpuTextureView(this.current!!, 0, 1)
             this.previousView = D3D12GpuTextureView(this.previous!!, 0, 1)
-            // Declared as returning `GpuBuffer`; cast back to the implementation for the native handle.
             this.width = w
             this.height = h
-            // Success: clear the "given up" bit, or it would short-circuit every later frame.
             abandonedSteps = abandonedSteps and STEP_RESOURCES.inv()
             LOGGER.info("velocity: allocated {}x{} {} (ping-pong)", w, h, FORMAT)
             true
@@ -533,7 +492,6 @@ object D3D12Velocity {
             this.depthView = D3D12GpuTextureView(depth, 0, 1)
             this.depthViewFor = handle
             abandonedSteps = abandonedSteps and STEP_DEPTH_VIEW.inv()
-            // SLF4J only understands `{}`; `{:#x}` degrades into a placeholder-count warning.
             LOGGER.info("velocity: depth SRV view created for texture {} (fmt={})",
                 handle.toULong().toString(16), depth.format)
             true
@@ -557,9 +515,9 @@ object D3D12Velocity {
                 .format(FORMAT.ordinal)
                 .writeMask(WRITE_MASK_RG))
             .addColorTarget(MCDRPipelineDesc.ColorTarget().format(GpuFormat.R8_UNORM.ordinal).writeMask(1))
-            .addBinding(0, 0)   // CBV -> register(b0)
-            .addBinding(1, 1)   // SRV + static sampler -> register(t1)/(s1)
-            .addBinding(2, 2)   // object rows -> register(t2) (texel buffer, no sampler)
+            .addBinding(0, 0)
+            .addBinding(1, 1)
+            .addBinding(2, 2)
             .addBinding(1, 3)
         val handle = MCDR_ABI.D3D12CreateGraphicsPipeline(desc)
         if (handle == 0L) {
@@ -583,7 +541,6 @@ object D3D12Velocity {
             this.objectCount = 0
             return 0
         }
-        // Rows are world-space: subtract *this* frame's camera (another frame's would bake camera motion in).
         val camera = VanillaFrameCoordinator.currentFrame()?.current ?: return 0
         val rows = try {
             D3D12ObjectMotion.writeWorldRows(this.objectScratch, camera.originX, camera.originY, camera.originZ)
@@ -598,7 +555,6 @@ object D3D12Velocity {
         return try {
             buffer.map(false, true).use { view ->
                 val fb: FloatBuffer = view.data().order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
-                // Only the real rows are written; HLSL iterates `ObjectParams.x - 1` rows anyway.
                 fb.put(this.objectScratch, 0, rows * D3D12ObjectMotion.ROW_FLOATS)
             }
             rows
@@ -610,10 +566,10 @@ object D3D12Velocity {
     }
 
     /**
-     * Writes the parameter block: floats 0..15 `PrevViewProj`, 16..31 `InvCurrViewProj`, 32 `ScreenSize`,
+     * Writes the parameter block: 0..15 `PrevViewProj`, 16..31 `InvCurrViewProj`, 32 `ScreenSize`,
      * 34 `ObjectParams` (x = rows + 1, y = motion cap in pixels), 36 `JitterPixels`, 38 `PrevJitterPixels`,
-     * 40..42 `CameraDelta`; 172 B used, padded to 256. Mapped write, not `writeToBuffer` (it detours
-     * through [D3D12Temporal.interceptWrite]).
+     * 40..42 `CameraDelta`; 172 B used, padded to 256. Map directly — `writeToBuffer` detours through
+     * [D3D12Temporal.interceptWrite].
      */
     private fun writeParameters(buffer: GpuBufferSlice, prevViewProj: FloatArray,
         invCurrViewProj: FloatArray, w: Int, h: Int, rows: Int,
@@ -636,7 +592,6 @@ object D3D12Velocity {
                 fb.put(camDeltaY)
                 fb.put(camDeltaZ)
                 fb.put(if (raster != null) 1f else 0f)
-                // Pad to 256 B = 64 floats.
                 while (fb.position() < 64) {
                     fb.put(0.0f)
                 }
@@ -650,15 +605,13 @@ object D3D12Velocity {
 
     /**
      * Column-major 4x4 inverse (double precision, Gauss-Jordan); null when singular or non-finite.
-     *
      * Do not swap in JOML: `set()` reads row-major while `get()` writes column-major, so set-then-invert
-     * silently yields the transpose and the reprojection turns to garbage.
+     * silently yields the transpose.
      */
     private fun invert(matrix: FloatArray): FloatArray? {
         if (matrix.size < 16) {
             return null
         }
-        // Augmented matrix: A (as rows) on the left, identity on the right.
         val augmented = Array(4) { r ->
             DoubleArray(8) { c ->
                 when {
@@ -712,7 +665,6 @@ object D3D12Velocity {
         return out
     }
 
-    /** Closes for good on error, with a reason. */
     private fun disable(reason: String) {
         disable(reason, 0)
     }
@@ -762,8 +714,6 @@ object D3D12Velocity {
         this.height = 0
     }
 
-    // ---------------- HLSL: native entry point is always `main`; DXC, SM 6.9 / DXIL only ----------------
-
     /** Full-screen triangle: `SV_VertexID` 0/1/2 -> uv (0,0)/(2,0)/(0,2); an empty input layout is legal. */
     private val VERTEX_HLSL: String = """
         struct VsOut {
@@ -780,11 +730,7 @@ object D3D12Velocity {
 
     /**
      * Depth reprojection -> screen-space motion in pixels, plus the per-object correction.
-     *
      * `SV_Position.xy` is the pixel centre, so the uv needs no extra interpolation.
-     *
-     * Per-object rows carry only the AABB and the two positions: a rigid body translates, so
-     * `world + (prev - cur)` is exact — an object-centre screen delta would move static objects.
      */
     private val PIXEL_HLSL: String = """
         cbuffer DXRMVelocity : register(b0, space0) {

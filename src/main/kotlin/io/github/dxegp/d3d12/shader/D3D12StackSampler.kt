@@ -74,7 +74,6 @@ object D3D12StackSampler {
                 Thread.currentThread().interrupt()
                 return
             } catch (ignored: Throwable) {
-                // 诊断线程绝不干扰游戏。
             }
         }
     }
@@ -119,7 +118,6 @@ object D3D12StackSampler {
                 val e = entries[i]
                 append(' ').append(e.key).append('=').append(e.value.sum())
             }
-            // top3 调用链：热点 <- 调用者 <- 再上层（定位真实归属）。
             val nt = 3.coerceAtMost(entries.size)
             for (i in 0 until nt) {
                 val key = entries[i].key

@@ -9,7 +9,6 @@ import io.github.dxegp.d3d12.shader.NagaVertexAdapter
  * 地形 MS/AS 生成器（meshlet 版）：每组 = 1 meshlet（16 quad / 64 顶点 / 32 三角形），索引按 `SV_GroupThreadID`
  * 算术展开、不读索引缓冲；`cull=true` 额外生成 `as_main`（6 向背面 + 视锥）。契约 t14 顶点池（28 B/顶点）/
  * t15 SectionDesc / t16 MeshletDesc / b8；VS 矩阵必须 row_major（`mul(float4, M)`，不要 `mul(M, v)`）。
- * 见 docs/mesh&vrs/README.md §2.5 / §2.5.4。
  */
 object D3D12MeshletShader {
 
@@ -68,7 +67,6 @@ object D3D12MeshletShader {
                     element != null ->
                         append(D3D12MeshVertexDecode.decodeField(field, element.format().name,
                             element.offset(), stride))
-                    // 逐段属性：不在 28 B 顶点流里（属 slot 1），从 SectionDesc 填。
                     input.name == "ChunkPosition" ->
                         appendLine("        vin.${field.name} = int3(s.chunkX, s.chunkY, s.chunkZ);")
                     input.name == "ChunkVisibility" ->
@@ -79,7 +77,6 @@ object D3D12MeshletShader {
             }
         }
 
-        // 可选的 amplification shader：组大小 32 = payload 槽位数。
         val asBlock = if (cu == null) "" else """
 
 // ===== amplification shader（6 向背面 + 视锥）：见 docs/mesh&vrs/README.md §2.5 =====
@@ -171,7 +168,6 @@ void as_main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
         val globalsExtra = if (visibleWork) "cbuffer TerrainDrawSlice : register(b9) { uint gVisibleBase; };" else ""
         val meshletLimit = if (visibleWork) "gSections.Load(0u)" else "gMeshletCount"
 
-        // 逐图元着色率只在解析出 CameraBlockPos/CameraOffset 时生成（距离用相机相对坐标）；不写 SV_ShadingRate 时组合器的 MIN 会把粗档位压回 1X1（安全失败）。
         val primitiveFields = buildString {
             if (camera != null) append("uint shadingRate : SV_ShadingRate;")
             if (capture != null) append("nointerpolation uint2 oitSurface : MCDR_OIT_TERRAIN;")
@@ -374,9 +370,7 @@ $vrsStore    }
         return CameraUniforms(cameraBlockPos, cameraOffset)
     }
 
-    /**
-     * 从 VS 源码解析 AS 需要的 uniform；缺任何一个返回 null（判据全 0 的 AS 会把地形成片剔掉）。
-     */
+    /** 从 VS 源码解析 AS 需要的 uniform；缺任何一个返回 null（判据全 0 的 AS 会把地形成片剔掉）。 */
     private fun resolveCullUniforms(uniforms: Map<String, String>): CullUniforms? {
         val cbp = uniforms["CameraBlockPos"] ?: return null
         val coff = uniforms["CameraOffset"] ?: return null

@@ -9,8 +9,7 @@ import kotlin.math.floor
 /**
  * meshlet 生成器（CPU 纯函数，不碰 GPU）：切分 + 量化 AABB + 方向掩码。
  * 顶点是 `DefaultVertexFormat.BLOCK`（28 B，无法线），朝向只能由绕序现算后静态写进 [Meshlet.directionMask]。
- * 默认每 [QUADS_PER_MESHLET] 个 Quad 一个 meshlet；AABB 量化 `[0,16] -> [0,255]`（x15.9375）。
- * 见 docs/mesh&vrs/README.md §2.2。
+ * AABB 量化 `[0,16] -> [0,255]`（x15.9375）。
  */
 object D3D12MeshletBuilder {
 
@@ -62,7 +61,7 @@ object D3D12MeshletBuilder {
             (quantMaxX and 0xFF) or ((quantMaxY and 0xFF) shl 8) or
                 ((quantMaxZ and 0xFF) shl 16) or ((directionMask and 0xFF) shl 24)
 
-        /** 写一条 16 B 静态 descriptor；布局见 docs/mesh&vrs/README.md §2.5.3。 */
+        /** 写一条 16 B 静态 descriptor。 */
         fun pack(dst: ByteBuffer) {
             dst.putInt(packedAabbMin())
             dst.putInt(packedAabbMax())
@@ -71,7 +70,6 @@ object D3D12MeshletBuilder {
         }
     }
 
-    /** 一次切分的结果。 */
     data class Result(
         val quads: Int,
         val vertices: Int,
@@ -116,7 +114,6 @@ object D3D12MeshletBuilder {
                 val z0 = buf.getFloat(v0 + 8)
                 val v1 = v0 + stride
                 val v2 = v0 + 2 * stride
-                // cross(p1-p0, p2-p0)：顶点里没法线，只能用绕序反推面朝向。
                 val ax = buf.getFloat(v1) - x0
                 val ay = buf.getFloat(v1 + 4) - y0
                 val az = buf.getFloat(v1 + 8) - z0

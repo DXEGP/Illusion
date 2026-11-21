@@ -223,4 +223,3 @@ internal class OitCompositeDisplayConfirmation(
     }
 }
 
-

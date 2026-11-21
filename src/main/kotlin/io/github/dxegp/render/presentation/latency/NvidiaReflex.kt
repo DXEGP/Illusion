@@ -15,7 +15,6 @@ import net.minecraft.network.chat.Component
 /**
  * Reflex（Streamline `sl.reflex`）：`off` / `on` / `boost`，下标即下发给 native 的模式值，不得重排。
  * 关闭时仍每帧发 sleep 与 PCL 标记（mode = `eOff`），不发会让 PCL 统计断链。
- * 模式与持久化见 docs/framegen/README.md §3。
  */
 object NvidiaReflex {
 
@@ -63,7 +62,6 @@ object NvidiaReflex {
     private var forcedByFrameGeneration: Boolean = false
 
     private fun push(mode: Int) {
-        // 帧生成开着时 Reflex 必须为 on：模式 0 在这里被提升成 1。
         val effective = if (mode == 0 && FrameGeneration.isEnabled()) 1 else mode
         currentMode = effective
         MCDR_ABI.D3D12SetReflexMode(effective)
@@ -113,9 +111,7 @@ object NvidiaReflex {
         } catch (t: Throwable) {
             Illusion.LOGGER.warn("could not read $OPTIONS_KEY from $file", t)
         }
-        // Options.load 跑在 Minecraft 构造期，set 不触发回调，这里补一次 push。
         push(OPTION.get())
-        // 帧生成强制开着时也纠正选项值，免得界面显示「关」而 native 是「开」。
         if (OPTION.get() != currentMode) {
             OPTION.set(currentMode)
         }
@@ -131,7 +127,6 @@ object NvidiaReflex {
             val eol = System.lineSeparator()
             val kept = file.readLines(StandardCharsets.UTF_8)
                 .filterNot { line -> line.startsWith("$OPTIONS_KEY:") }
-            // 用 currentMode 而非 OPTION.get()：vanilla 会把选项重置回默认值，写文件就成了默认值。
             val text = (kept + "${OPTIONS_KEY}:${MODE_NAMES[currentMode]}").joinToString(eol) + eol
             file.writeText(text, StandardCharsets.UTF_8)
         } catch (t: Throwable) {

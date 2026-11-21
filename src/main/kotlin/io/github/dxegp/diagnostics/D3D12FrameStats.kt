@@ -5,11 +5,9 @@ import io.github.dxegp.render.presentation.framegen.FrameGeneration
 import kotlin.math.roundToInt
 
 /**
- * F3 帧率行的 `rendered/output` 双数值与 `(FG n.nx)` 倍率。
- * rendered 取 vanilla fps；output 是本类在 present 里累加的提交帧数 —— 生成帧由 native 一次提交多帧，
- * 所以增量只能来自 native 的 `frames` 参数，不能在本类里加 N。
+ * F3 帧率行的 `rendered/output` 双数值与 `(FG n.nx)` 倍率。rendered 取 vanilla fps；output 是本类在 present 里
+ * 累加的提交帧数 —— 生成帧由 native 一次提交多帧，所以增量只能来自 native 的 `frames` 参数，不能在本类里加 N。
  * FG 关着、非 D3D12 后端、还没有样本时整行原样返回：不显示相等的双数值、假的 0，也不显示遗留倍率。
- * 见 docs/misc/debug-and-crash.md §6。
  */
 object D3D12FrameStats {
     /** output 的统计窗口：与原版 fps 相同的 1 秒粒度，两个数字的抖动幅度才对得上。 */
@@ -18,11 +16,9 @@ object D3D12FrameStats {
     /** 原版那行的形状：`123 fps T: inf (fifo)`。 */
     private val FPS_LINE = Regex("^(\\d+) fps(.*)$")
 
-    // 只在渲染线程上访问（present() 与 F3 绘制同线程）。
     private var windowStartNanos = 0L
     private var windowFrames = 0
     private var outputFps = 0
-
 
     /**
      * output/rendered 的指数平滑值：`presented` 每帧会在 1/2/3 之间跳，直接用单帧值会闪。
@@ -64,7 +60,6 @@ object D3D12FrameStats {
         val output = if (outputFps > 0) outputFps else rendered
         val instant = if (rendered > 0) output.toDouble() / rendered else 1.0
         smoothedMultiplier = smoothedMultiplier * 0.8 + instant * 0.2
-        // 刚打开 FG、Streamline 还没真正开始插帧的头几帧，比值仍是 1 —— 不显示 `(FG 1.0x)`。
         val frameGen = if (smoothedMultiplier >= 1.25) {
             val tenths = (smoothedMultiplier * 10.0).roundToInt()
             " (FG ${tenths / 10}.${tenths % 10}x)"

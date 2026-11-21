@@ -8,9 +8,8 @@ import org.slf4j.LoggerFactory
 
 /**
  * D3D12 后端下把原版「改进的透明（OIT）」强制常开：mesh 管线只保留了 OIT 半透明路径，关掉之后
- * 没有任何能把半透明地形正确合成的路径（见 docs/misc/settingscreen/README.md §8.8）。
- *
- * 判据是 `D3D12AdapterInfo.current != null`（设备真的建起来了）；回退到原版后端时不锁、不改值。
+ * 没有任何能把半透明地形正确合成的路径。判据是 `D3D12AdapterInfo.current != null`（设备真的建起来了）；
+ * 回退到原版后端时不锁、不改值。
  */
 object ImprovedTransparencyLock {
     private val logger = LoggerFactory.getLogger("dxrmc/gui")
@@ -47,7 +46,6 @@ object ImprovedTransparencyLock {
                 logger.info("improvedTransparency forced on (D3D12 has no IMR transparency fallback)")
             }
         } catch (t: Throwable) {
-            // 首帧还没有 level，选项回调里的 allChanged 可能抛异常；降级成 debug，下一帧再试。
             logger.debug("improvedTransparency not forced yet: {}", t.toString())
         }
     }

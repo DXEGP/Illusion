@@ -8,10 +8,9 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 
 /**
- * 把界面的渲染目标从「与世界共用的主渲染目标」换成 GUI 自己的窗口尺寸目标。
- *
- * <p>`draw()` 只在开头取一次 `mainRenderTarget()`，后面两个 draw range、清深度、模糊都用这个局部变量，
- * 所以一处 `@ModifyExpressionValue` 就覆盖整段界面绘制。未启用时返回原值。
+ * 把界面的渲染目标从「与世界共用的主渲染目标」换成 GUI 自己的窗口尺寸目标。`draw()` 只在开头取一次
+ * `mainRenderTarget()`，后面两个 draw range、清深度、模糊都用这个局部变量，所以一处 `@ModifyExpressionValue`
+ * 就覆盖整段界面绘制。未启用时返回原值。
  */
 @Mixin(GuiRenderer.class)
 public class GuiRendererTargetMixin {

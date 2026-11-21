@@ -7,7 +7,7 @@ internal enum class MotionCoverage {
 }
 
 /**
- * Facts available for an object motion guide. An entity row can improve camera
+ * Facts available for an object motion guide: an entity row can improve camera
  * reprojection without being a complete per-pixel guide.
  */
 internal enum class MotionGuideCoverage {

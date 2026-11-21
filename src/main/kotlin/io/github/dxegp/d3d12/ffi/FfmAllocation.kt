@@ -13,10 +13,9 @@ internal enum class FfmEmptyAllocation {
 
 /**
  * Allocate an FFM array with the native element stride and alignment.
- *
- * Native contracts normally use a NULL pointer when the count is zero. A few legacy entry points
- * still require a non-null address, so that choice is explicit at the call site. The byte count is
- * checked before allocation; no caller may silently truncate a variable-size target.
+ * Native contracts normally use a NULL pointer when the count is zero; a few legacy entry points still require a
+ * non-null address, so that choice is explicit at the call site. The byte count is checked before allocation; no
+ * caller may silently truncate a variable-size target.
  */
 @Suppress("NOTHING_TO_INLINE")
 internal inline fun Arena.allocateFfmArray(

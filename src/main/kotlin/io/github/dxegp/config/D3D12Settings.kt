@@ -7,10 +7,8 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 渲染开关的唯一解析处：NeoForge 配置优先，旧来源（环境变量 / `-D` 属性 / marker 文件）只作弃用逃生口。
- *
- * <p>快照不可变、经 `@Volatile` 发布，渲染线程与录制 worker 并发读；[reload] 由配置加载/重载事件调用。
- * 读配置在每帧路径上，所以必须缓存 —— 但在配置读进来**之前**建的快照绝不缓存（渲染器比 toml 早启动）。
- * 见 docs/misc/settingscreen/README.md §3。
+ * <p>快照不可变、经 `@Volatile` 发布，渲染线程与录制 worker 并发读；配置读入**之前**建的快照不缓存。
+ * [reload] 由配置加载/重载事件调用。
  */
 object D3D12Settings {
     private const val LEGACY_DLSS_IMPL = "MCDR_DLSS_IMPL"
@@ -48,7 +46,6 @@ object D3D12Settings {
         val allowTearing: Boolean,
         val presentChildWindow: Boolean,
 
-
     /** 帧生成（0=off 1=on 2=dynamic）与每帧生成张数。 */
     val dlssgMode: Int,
     val dlssgFrames: Int,
@@ -84,7 +81,7 @@ object D3D12Settings {
     val srMask: Boolean get() = snapshot().srMask
     /** `[dlss] reflexFrameLimitUs` — Reflex 自己的限帧器（微秒/帧，0 = 关）。 */
     val reflexFrameLimitUs: Int get() = snapshot().reflexFrameLimitUs
-    /** `[mesh] terrain` — 地形走 mesh 管线（已无 IMR 回退，这是唯一的地形光栅化路径）。 */
+    /** `[mesh] terrain` — 地形走 mesh 管线，是唯一的地形光栅化路径。 */
     val meshTerrain: Boolean get() = snapshot().meshTerrain
 
     /** `[mesh] terrainCull` —— 用 AS 剔除地形 meshlet（依赖 `[mesh] terrain`）。 */
@@ -110,8 +107,7 @@ object D3D12Settings {
 
     val nativeLogFile: String get() = snapshot().nativeLogFile
 
-
-    /** 由游戏自己驱动 PIX 捕获：PIX 的连续录制从不落盘，只有进程内调 PIXBeginCapture 才写进 `run/pix`。 */
+    /** PIX 捕获由游戏进程内驱动：连续录制不落盘，只有进程内捕获写进 `run/pix`。 */
     val pixTimingCapture: Boolean get() = snapshot().pixTimingCapture
 
     /** 一次按键捕获录多少帧（按下热键那一刻读，属热切换）。 */
@@ -128,7 +124,7 @@ object D3D12Settings {
     /**
      * 把开关交给 DLL。幂等：比较用的字符串必须包含每一个推下去的值，漏一个就漏推。
      *
-     * <p>配置加载时 ABI 可能还不可用（那次推送被丢掉），所以设备建好后要再调一次。见 docs/misc/settingscreen/README.md §3.5。
+     * <p>配置加载时 ABI 可能还不可用（那次推送被丢掉），所以设备建好后必须再调一次。
      */
     fun pushToNative() {
         if (!MCDR_ABI.isAvailable()) return
@@ -158,14 +154,11 @@ object D3D12Settings {
             if (s.dlssImplementation == DlssImplementation.STREAMLINE) "1" else null,
         )
         MCDR_ABI.D3D12SetEnvironment("DX12_NATIVE_LOG_FILE", s.nativeLogFile.ifEmpty { null })
-        // 下面这些走专用 ABI：配置是唯一来源，没有环境变量入口（见 docs/misc/settingscreen/README.md §3.6）。
         MCDR_ABI.D3D12SetPIXDirectory(s.pixDirectory)
         MCDR_ABI.D3D12SetReflexFrameLimit(s.reflexFrameLimitUs)
-        // 0/1/2 = AUTO/FORCE_ON/FORCE_OFF。HDR 与交换链选项都是建链参数，下一次建链才有用。
         MCDR_ABI.D3D12SetHdrMode(s.hdrMode)
         MCDR_ABI.D3D12SetSwapchainOptions(s.allowTearing, s.presentChildWindow)
         MCDR_ABI.D3D12SetRaytracingMode(s.rtMode)
-        // 动态模式（2）只能配 1 张额外帧，实际张数由驱动决定 —— ABI 约束，不是界面逻辑。
     MCDR_ABI.D3D12SetDlssgMode(s.dlssgMode, if (s.dlssgMode == 2) 1 else s.dlssgFrames)
     }
 
@@ -177,7 +170,6 @@ object D3D12Settings {
         fun <T> config(fallback: T, read: () -> T): T = try {
             read()
         } catch (t: Throwable) {
-            // 配置还没读进来（模组构造、DLL 初始化）：用出厂默认值，且**不写回缓存**。
             configAvailable = false
             fallback
         }
@@ -242,7 +234,6 @@ object D3D12Settings {
             pixTimingCapture = config(false) { IllusionConfig.PIX_TIMING_CAPTURE.get() },
             pixCaptureFrames = config(600) { IllusionConfig.PIX_CAPTURE_FRAMES.get() },
             pixDirectory = config("") { IllusionConfig.PIX_DIRECTORY.get() },
-            // 0 = AUTO / 1 = FORCE_ON / 2 = FORCE_OFF：native 只认序号，不要在这里重排。
             hdrMode = config(HdrMode.AUTO) { IllusionConfig.HDR.get() }.ordinal,
             allowTearing = config(true) { IllusionConfig.ALLOW_TEARING.get() },
             presentChildWindow = config(false) { IllusionConfig.PRESENT_CHILD_WINDOW.get() },
@@ -260,7 +251,7 @@ object D3D12Settings {
         return s
     }
 
-    /** 旧来源命中时 warn 一次；调用点只在配置仍是出厂默认值时看它（见 docs/misc/settingscreen/README.md §3.7）。 */
+    /** 旧来源命中时 warn 一次；调用点只在配置仍是出厂默认值时看它。 */
     private inline fun legacy(key: String, check: () -> Boolean): Boolean {
         if (!check()) return false
         if (warned.add(key)) {
